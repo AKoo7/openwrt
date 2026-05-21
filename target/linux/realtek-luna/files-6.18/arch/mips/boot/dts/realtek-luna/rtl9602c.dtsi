@@ -1,0 +1,81 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+/*
+ * Realtek RTL9602C "Europa" GPON ONU SoC (RLX "Taroko" core).
+ *
+ * Clean-room device description derived from observed hardware facts
+ * (register bases, IRQ numbers and clocks read from a running unit); no
+ * vendor source was used.
+ */
+
+/ {
+	#address-cells = <1>;
+	#size-cells = <1>;
+	compatible = "realtek,rtl9602c";
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		cpu@0 {
+			device_type = "cpu";
+			compatible = "realtek,rlx-taroko";
+			reg = <0>;
+		};
+	};
+
+	cpuintc: interrupt-controller {
+		#address-cells = <0>;
+		#interrupt-cells = <1>;
+		interrupt-controller;
+		compatible = "mti,cpu-interrupt-controller";
+	};
+
+	/*
+	 * SoC clocks (fixed): CPU 625 MHz, MEM 525 MHz, LX (bus) 200 MHz,
+	 * SPI-F 50 MHz. The 16550 UART is fed from a 197.2352 MHz reference
+	 * (base_baud 12327200 x 16).
+	 */
+	uart_clk: uart-clk {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <197235200>;
+	};
+
+	intc: interrupt-controller@18003000 {
+		compatible = "realtek,rtl9602c-intc";
+		reg = <0x18003000 0x100>;
+		interrupt-controller;
+		#interrupt-cells = <1>;
+		interrupt-parent = <&cpuintc>;
+		/* SoC interrupt aggregator feeds CP0 HW IRQ line 2 */
+		interrupts = <2>;
+	};
+
+	uart0: serial@18002000 {
+		compatible = "ns16550a";
+		reg = <0x18002000 0x100>;
+		reg-shift = <2>;
+		reg-io-width = <1>;
+		clocks = <&uart_clk>;
+		interrupt-parent = <&intc>;
+		interrupts = <49>;
+		status = "okay";
+	};
+
+	timer@18003100 {
+		/* SoC "rlx timer" (CP0 Count is unreliable on this core) */
+		compatible = "realtek,rtl9602c-timer";
+		reg = <0x18003100 0x40>;
+		interrupt-parent = <&intc>;
+		interrupts = <43>;
+	};
+
+	spi_nor: flash@14000000 {
+		/* 16 MB SPI-NOR, memory-mapped (physmap) at 0x14000000 */
+		compatible = "mtd-rom";
+		reg = <0x14000000 0x1000000>;
+		bank-width = <2>;
+		#address-cells = <1>;
+		#size-cells = <1>;
+	};
+};

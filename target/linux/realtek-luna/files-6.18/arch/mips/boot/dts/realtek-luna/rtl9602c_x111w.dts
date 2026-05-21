@@ -1,0 +1,74 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+/*
+ * HSGQ X111W (X111WF1) GPON ONU — Realtek RTL9602C.
+ * 128 MB DDR2, 16 MB SPI-NOR (dual-bank), 1x GE + 1x FE, 2.4 GHz Wi-Fi
+ * (RTL8192F, PCIe), GPON MAC RTL8686.
+ *
+ * Clean-room: board description from observed hardware only.
+ */
+
+/dts-v1/;
+
+#include "rtl9602c.dtsi"
+
+/ {
+	model = "HSGQ X111W (RTL9602C)";
+	compatible = "hsgq,x111w", "realtek,rtl9602c";
+
+	chosen {
+		stdout-path = "serial0:115200n8";
+		bootargs = "console=ttyS0,115200";
+	};
+
+	aliases {
+		serial0 = &uart0;
+	};
+
+	memory@0 {
+		device_type = "memory";
+		reg = <0x00000000 0x08000000>; /* 128 MB DDR2 */
+	};
+};
+
+&spi_nor {
+	partitions {
+		compatible = "fixed-partitions";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		/* Dual-bank layout, matching the vendor mtdparts. */
+		partition@0 {
+			label = "boot";
+			reg = <0x000000 0x040000>;	/* 256K */
+			read-only;
+		};
+		partition@40000 {
+			label = "env";
+			reg = <0x040000 0x002000>;	/* 8K */
+		};
+		partition@42000 {
+			label = "env2";
+			reg = <0x042000 0x002000>;	/* 8K */
+		};
+		partition@44000 {
+			label = "config";
+			reg = <0x044000 0x03c000>;	/* 240K (jffs2) */
+		};
+		partition@80000 {
+			label = "k0";
+			reg = <0x080000 0x300000>;	/* 3M kernel bank 0 */
+		};
+		partition@380000 {
+			label = "r0";
+			reg = <0x380000 0x4c0000>;	/* 4864K rootfs bank 0 */
+		};
+		partition@840000 {
+			label = "k1";
+			reg = <0x840000 0x300000>;	/* 3M kernel bank 1 */
+		};
+		partition@b40000 {
+			label = "r1";
+			reg = <0xb40000 0x4c0000>;	/* 4864K rootfs bank 1 */
+		};
+	};
+};
