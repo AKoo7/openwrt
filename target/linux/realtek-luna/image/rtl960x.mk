@@ -1,6 +1,15 @@
 # SPDX-License-Identifier: GPL-2.0-only
 #
 # Per-board image definitions for the rtl960x subtarget.
-# Each board is a Device/ entry referencing its own device tree; the SoC
-# support and DTS are added in later commits. First target board: the
-# HSGQ X111W (RTL9602C). Devices are added as their DTS lands.
+# Boards are brought up run-from-RAM first: the initramfs uImage is TFTP'd
+# into RAM and bootm'd by the vendor U-Boot (no flash write during bring-up).
+
+define Device/hsgq_x111w
+  DEVICE_VENDOR := HSGQ
+  DEVICE_MODEL := X111W
+  DEVICE_DTS := rtl9602c_x111w
+  DEVICE_DTS_DIR := $(DTS_DIR)/realtek-luna
+  SOC := rtl9602c
+  DEVICE_PACKAGES :=
+endef
+TARGET_DEVICES += hsgq_x111w
