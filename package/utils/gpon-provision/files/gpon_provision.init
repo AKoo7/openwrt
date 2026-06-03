@@ -85,6 +85,18 @@ provision() {
 		echo "OMCI_OLT_MODE=$olt"
 		echo "PON_VENDOR_ID=$vid"
 	} > "$ENVFILE"
+
+	# Push the per-ONU serial number into the live GPON driver so PLOAM ranging
+	# uses the factory value. The driver boots with a placeholder and re-parses
+	# onu_sn on write (writable module param), so this takes effect on the next
+	# ranging cycle even though we run after module init. START=09 makes this land
+	# well before the OLT completes ranging.
+	if [ -n "$sn" ]; then
+		for p in /sys/module/gpon_rtl9602c/parameters/onu_sn \
+			 /sys/module/gpon/parameters/onu_sn; do
+			[ -w "$p" ] && { printf '%s' "$sn" > "$p"; break; }
+		done
+	fi
 	log "provisioned: MAC=$mac SN=${sn:-?} OLT_MODE=${olt:-?} (source=$source)"
 
 	apply_mac "$base" "$mac"

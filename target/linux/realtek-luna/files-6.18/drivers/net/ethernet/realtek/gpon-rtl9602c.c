@@ -349,10 +349,27 @@ static void __iomem *ponip_base;
 
 /* PLOAM activation FSM state (the FSM itself is defined below the proc dump).
  * onu_sn is a placeholder default; the real per-ONU serial number is provisioned
- * at runtime (onu_sn= module param, or the userspace provisioning service that
- * reads it from the board's factory configuration). */
+ * at runtime by writing the value read from the board's factory configuration to
+ * /sys/module/gpon_rtl9602c/parameters/onu_sn (the userspace provisioning service
+ * does this early in boot). The param is writable and re-parses on write, so the
+ * factory value takes effect on the next ranging cycle; the FSM re-reads the
+ * parsed serial each time it sends its Serial_Number_ONU upstream. */
+static void gpon_parse_sn(const char *s);	/* defined below; re-parses onu_sn */
 static char *onu_sn = "XPON00000000";
-module_param(onu_sn, charp, 0444);
+
+static int onu_sn_set(const char *val, const struct kernel_param *kp)
+{
+	int ret = param_set_charp(val, kp);
+
+	if (!ret)
+		gpon_parse_sn(onu_sn);
+	return ret;
+}
+static const struct kernel_param_ops onu_sn_ops = {
+	.set = onu_sn_set,
+	.get = param_get_charp,
+};
+module_param_cb(onu_sn, &onu_sn_ops, &onu_sn, 0644);
 MODULE_PARM_DESC(onu_sn, "ONU serial number (G.984.3 ONU-SN): 4 ASCII ID chars + 8 hex digits");
 /* Diagnostic: skip BOSA cold-init so that, on a warm boot where the BOSA is
  * already in a working state, the SoC datapath/FSM runs on top of it. */
