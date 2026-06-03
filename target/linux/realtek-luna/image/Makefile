@@ -12,8 +12,10 @@ KERNEL_LOADADDR:=0x80000000
 define Device/Default
   PROFILES := Default
   KERNEL_NAME := vmlinux
-  KERNEL_INITRAMFS := kernel-bin | lzma | uImage lzma
-  KERNEL := kernel-bin | lzma | uImage lzma
+  # Legacy vendor U-Boot passes no DT, so append the board DTB to the kernel
+  # (CONFIG_MIPS_RAW_APPENDED_DTB); head.S finds it and sets fw_passed_dtb.
+  KERNEL_INITRAMFS := kernel-bin | append-dtb | lzma | uImage lzma
+  KERNEL := kernel-bin | append-dtb | lzma | uImage lzma
   IMAGE_NAME = $$(IMAGE_PREFIX)-$$(2)
   IMAGES :=
 endef

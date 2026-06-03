@@ -1,0 +1,120 @@
+#!/bin/sh /etc/rc.common
+# Per-board GPON ONU provisioning. Reads THIS unit's identity from the factory
+# (apmib) config partition and applies it before the network starts, so one
+# identical image self-provisions an entire fleet. Factory flash is read-only.
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+START=09
+USE_PROCD=1
+
+RTK=/usr/sbin/rtk_factory
+ENVFILE=/var/run/gpon.env
+
+log() { logger -t gpon_provision "$@"; }
+
+# Locally-administered fallback MAC, derived from the SoC id, when no factory MAC
+# is present (per CLAUDE.md: surface that provisioning is missing on this unit).
+derive_laa() {
+	local cid h
+	cid=$(sed -n 's/.*[Ss]erial.*: *//p' /proc/cpuinfo | head -n1)
+	[ -n "$cid" ] || cid=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)
+	h=$(printf '%s' "$cid" | md5sum | cut -c1-10)
+	printf '02:%s:%s:%s:%s:%s\n' "${h%????????}" "$(echo $h | cut -c3-4)" \
+		"$(echo $h | cut -c5-6)" "$(echo $h | cut -c7-8)" "$(echo $h | cut -c9-10)"
+}
+
+apply_mac() {
+	local ifname="$1" mac="$2"
+	[ -n "$mac" ] || return 1
+	if [ ! -d "/sys/class/net/$ifname" ]; then
+		log "iface $ifname absent; MAC $mac not applied yet"
+		return 1
+	fi
+	# Idempotent: skip if already set.
+	[ "$(cat /sys/class/net/$ifname/address 2>/dev/null)" = "$mac" ] && return 0
+	ip link set dev "$ifname" down 2>/dev/null
+	ip link set dev "$ifname" address "$mac" && log "set $ifname MAC $mac"
+	ip link set dev "$ifname" up 2>/dev/null
+}
+
+provision() {
+	local source part base mac oui sn loid loid_pw ploam olt vid
+
+	config_load gpon
+	config_get source identity source factory
+	config_get part   storage  config_part config
+	config_get base   storage  base_ifname eth0
+	config_get mac    identity mac
+	config_get oui    identity oui
+	config_get sn     identity sn
+	config_get loid    identity loid
+	config_get loid_pw identity loid_passwd
+	config_get ploam   identity ploam_passwd
+	config_get olt     identity omci_olt_mode
+	config_get vid     identity pon_vendor_id
+
+	if [ "$source" = "factory" ] && [ -x "$RTK" ]; then
+		mac=$("$RTK" -p "$part" mac 2>/dev/null)
+		oui=$("$RTK" -p "$part" oui 2>/dev/null)
+		sn=$("$RTK"  -p "$part" sn  2>/dev/null)
+		[ -n "$vid" ]     || vid=$("$RTK"     -p "$part" vendor_id 2>/dev/null)
+		# SW-block params: adopt the factory value only where the installer left UCI empty.
+		[ -n "$loid" ]    || loid=$("$RTK"    -p "$part" loid 2>/dev/null)
+		[ -n "$loid_pw" ] || loid_pw=$("$RTK" -p "$part" loid_passwd 2>/dev/null)
+		[ -n "$ploam" ]   || ploam=$("$RTK"   -p "$part" ploam_passwd 2>/dev/null)
+		[ -n "$olt" ]     || olt=$("$RTK"     -p "$part" olt_mode 2>/dev/null)
+	fi
+
+	if [ -z "$mac" ]; then
+		mac=$(derive_laa)
+		log "NO factory MAC on '$part' - using random LAA $mac; PROVISIONING MISSING on this unit"
+	fi
+
+	# Hand the GPON identity to the OMCI/GPON stack (Phase 1C consumer) FIRST,
+	# before touching netifd/uci (which can be slow/incomplete at START=09) — the
+	# env file is the authoritative per-board data and must always be written.
+	umask 077
+	mkdir -p "$(dirname "$ENVFILE")" 2>/dev/null
+	{
+		echo "GPON_MAC=$mac"
+		echo "GPON_OUI=$oui"
+		echo "GPON_SN=$sn"
+		echo "GPON_LOID=$loid"
+		echo "GPON_LOID_PASSWD=$loid_pw"
+		echo "GPON_PLOAM_PASSWD=$ploam"
+		echo "OMCI_OLT_MODE=$olt"
+		echo "PON_VENDOR_ID=$vid"
+	} > "$ENVFILE"
+	log "provisioned: MAC=$mac SN=${sn:-?} OLT_MODE=${olt:-?} (source=$source)"
+
+	apply_mac "$base" "$mac"
+
+	# netifd builds br-lan AFTER this early (START=09) script and resets the
+	# bridge port to the driver default, so also pin the per-board MAC in UCI on
+	# bridge device sections for netifd to apply (best-effort; the GPON identity
+	# exported below is the authoritative per-board data for the ONU stack).
+	if [ -n "$mac" ] && [ -f /etc/config/network ]; then
+		local sec
+		for sec in $(uci -q show network 2>/dev/null | \
+			     sed -n "s/^network\.\([^.=]*\)\.type='bridge'\$/\1/p"); do
+			uci -q set "network.$sec.macaddr=$mac"
+		done
+		uci -q commit network 2>/dev/null
+	fi
+
+}
+
+start_service() {
+	provision
+}
+
+# LuCI 'Save & Apply' (Phase 1E): procd calls reload_service when /etc/config/gpon
+# changes -> re-provision live, no reboot.
+reload_service() {
+	provision
+	[ -x /etc/init.d/omci ] && /etc/init.d/omci reload 2>/dev/null
+}
+
+service_triggers() {
+	procd_add_reload_trigger "gpon"
+}

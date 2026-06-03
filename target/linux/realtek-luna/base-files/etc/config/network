@@ -1,0 +1,51 @@
+#
+# RTL9602C "Luna" GPON ONU — fixed network layout for the X111W bring-up image.
+#
+# Topology: the on-chip switch core bridges both Ethernet jacks (port0 = FE/100M,
+# port1 = GE/1000M) behind the single CPU GMAC netdev (eth0), so eth0 carries
+# the whole wired LAN. WAN is the GPON datapath, presented to the CPU on VLAN 2
+# (eth0.2) once the ONU activates (O5/OMCI). LAN and WAN are deliberately kept
+# on separate L3 interfaces so the ONU ROUTES + NATs between them (firewall
+# lan->wan zone forwarding + masq do the rest).
+#
+# This file is shipped verbatim; config_generate(8) leaves an existing
+# /etc/config/network untouched, so the layout below is authoritative and the
+# per-board MAC (gpon_provision) is applied onto br-lan/eth0 at START=09.
+
+config interface 'loopback'
+	option device 'lo'
+	option proto 'static'
+	option ipaddr '127.0.0.1'
+	option netmask '255.0.0.0'
+
+config globals 'globals'
+	option ula_prefix 'fdca:9602::/48'
+
+# LAN bridge over the Ethernet jack(s). Today only the CPU GMAC (eth0) is a
+# Linux netdev — the switch hardware-bridges FE+GE behind it — so eth0 is the
+# sole bridge port. When per-port netdevs land (directed-TX datapath work),
+# add 'eth1' (the GE jack) here for an explicit two-port bridge.
+config device
+	option name 'br-lan'
+	option type 'bridge'
+	list ports 'eth0'
+
+config interface 'lan'
+	option device 'br-lan'
+	option proto 'static'
+	option ipaddr '192.168.1.1'
+	option netmask '255.255.255.0'
+	option ip6assign '60'
+
+# WAN = GPON upstream (IPoE/DHCP). Pulls 192.168.158.x from the OLT once the
+# ONU reaches O5; stays down at O1 (harmless retry). eth0.2 = the CPU-facing
+# WAN service VLAN the PON datapath is wired to in the OMCI/PON-IP phase.
+config interface 'wan'
+	option device 'eth0.2'
+	option proto 'dhcp'
+
+config interface 'wan6'
+	option device 'eth0.2'
+	option proto 'dhcpv6'
+	option reqaddress 'try'
+	option reqprefix 'auto'

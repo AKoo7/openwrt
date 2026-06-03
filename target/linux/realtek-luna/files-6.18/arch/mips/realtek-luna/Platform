@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Realtek "Luna" GPON ONU (RTL960xC / RLX Taroko)
+#
+# Run-from-RAM kernel: U-Boot bootm's an LZMA uImage loaded at 0x80000000.
+load-$(CONFIG_REALTEK_LUNA)	+= 0xffffffff80000000

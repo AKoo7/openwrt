@@ -23,7 +23,7 @@ Signed-off-by: Confiared <contact@confiared.com>
  
  #define PRID_IMP_UNKNOWN	0xff00
  
-@@ -298,6 +299,9 @@
+@@ -298,6 +299,9 @@ enum cpu_type_enum {
  	CPU_R2000, CPU_R3000, CPU_R3000A, CPU_R3041, CPU_R3051, CPU_R3052,
  	CPU_R3081, CPU_R3081E,
  
@@ -35,7 +35,7 @@ Signed-off-by: Confiared <contact@confiared.com>
  	 */
 --- a/arch/mips/kernel/cpu-probe.c
 +++ b/arch/mips/kernel/cpu-probe.c
-@@ -1041,6 +1041,21 @@
+@@ -1041,6 +1041,21 @@ static inline void cpu_probe_vz(struct c
  static inline void cpu_probe_legacy(struct cpuinfo_mips *c, unsigned int cpu)
  {
  	switch (c->processor_id & PRID_IMP_MASK) {

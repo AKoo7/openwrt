@@ -1,0 +1,16 @@
+--- a/arch/mips/pthread_arch.h
++++ b/arch/mips/pthread_arch.h
+@@ -1,11 +1,8 @@
+ static inline uintptr_t __get_tp()
+ {
+ 	register uintptr_t tp __asm__("$3");
+-#if __mips_isa_rev < 2
+-	__asm__ (".word 0x7c03e83b" : "=r" (tp) );
+-#else
+-	__asm__ ("rdhwr %0, $29" : "=r" (tp) );
+-#endif
++	/* RLX/Taroko (Lexra MIPS-I, no rdhwr): tp is in LXC0 $8, mflxc0 $3,$8 */
++	__asm__ (".word 0x40634000" : "=r" (tp) );
+ 	return tp;
+ }
+ 

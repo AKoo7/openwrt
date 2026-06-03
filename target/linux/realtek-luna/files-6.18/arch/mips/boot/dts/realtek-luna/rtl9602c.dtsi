@@ -41,6 +41,13 @@
 		clock-frequency = <197235200>;
 	};
 
+	/* LX (peripheral) bus clock, 200 MHz; feeds the SoC TC timer. */
+	lx_clk: lx-clk {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <200000000>;
+	};
+
 	intc: interrupt-controller@18003000 {
 		compatible = "realtek,rtl9602c-intc";
 		reg = <0x18003000 0x100>;
@@ -63,9 +70,16 @@
 	};
 
 	timer@18003100 {
-		/* SoC "rlx timer" (CP0 Count is unreliable on this core) */
+		/*
+		 * SoC "rlx timer" channel TC0 (CP0 Count is unreliable on this
+		 * core, so this drives the system tick). Base observed on the
+		 * RTL9602C unit at 0x18003100; the RTL9607C documents the TC
+		 * block at 0x18003200 — if the tick never fires on first boot,
+		 * try 0x18003200 here.
+		 */
 		compatible = "realtek,rtl9602c-timer";
-		reg = <0x18003100 0x40>;
+		reg = <0x18003100 0x10>;
+		clocks = <&lx_clk>;
 		interrupt-parent = <&intc>;
 		interrupts = <43>;
 	};

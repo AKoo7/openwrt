@@ -1,0 +1,14 @@
+{
+	"luci-app-gpon": {
+		"description": "Grant access to GPON ONU provisioning",
+		"read": {
+			"uci": [ "gpon" ],
+			"file": {
+				"/usr/sbin/rtk_factory": [ "exec" ]
+			}
+		},
+		"write": {
+			"uci": [ "gpon" ]
+		}
+	}
+}

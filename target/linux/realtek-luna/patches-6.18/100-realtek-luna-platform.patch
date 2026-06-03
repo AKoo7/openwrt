@@ -1,0 +1,43 @@
+Subject: [PATCH] mips: add Realtek Luna GPON ONU (RTL960xC) platform
+
+--- a/arch/mips/Kbuild.platforms
++++ b/arch/mips/Kbuild.platforms
+@@ -22,6 +22,7 @@ platform-$(CONFIG_MIPS_MALTA)		+= mti-ma
+ platform-$(CONFIG_MACH_NINTENDO64)	+= n64/
+ platform-$(CONFIG_PIC32MZDA)		+= pic32/
+ platform-$(CONFIG_RALINK)		+= ralink/
++platform-$(CONFIG_REALTEK_LUNA)	+= realtek-luna/
+ platform-$(CONFIG_MIKROTIK_RB532)	+= rb532/
+ platform-$(CONFIG_SGI_IP22)		+= sgi-ip22/
+ platform-$(CONFIG_SGI_IP27)		+= sgi-ip27/
+--- a/arch/mips/Kconfig
++++ b/arch/mips/Kconfig
+@@ -676,6 +676,20 @@ config MACH_NINTENDO64
+ 	select DMA_NONCOHERENT
+ 	select IRQ_MIPS_CPU
+
++config REALTEK_LUNA
++	bool "Realtek Luna GPON ONU (RTL960xC / RLX Taroko)"
++	select BOOT_RAW
++	select COMMON_CLK
++	select DMA_NONCOHERENT
++	select IRQ_MIPS_CPU
++	select IRQ_DOMAIN
++	select USE_OF
++	select TIMER_OF
++	select SYS_HAS_CPU_MIPS32_R1
++	select SYS_HAS_EARLY_PRINTK
++	select SYS_SUPPORTS_32BIT_KERNEL
++	select SYS_SUPPORTS_BIG_ENDIAN
++	select CPU_R3K_TLB
++	select CPU_R4K_CACHE_TLB
++	select HAVE_PCI
++	help
++	  Realtek "Luna" GPON ONU SoCs (RTL9602C/RTL9603C/RTL9607C) built
++	  on the RLX "Taroko" core. Big-endian MIPS, run-from-RAM bring-up.
++	  The RLX uses an R3000-style (single-EntryLo) TLB and PTE bit layout
++	  (CPU_R3K_TLB) with an r4k-style cache and DIVEC interrupt vector.
++
+ config RALINK
+ 	bool "Ralink based machines"
+ 	select CEVT_R4K

@@ -3,7 +3,7 @@
 ARCH:=mips
 SUBTARGET:=rtl960x
 BOARD:=realtek-luna
-BOARDNAME:=Realtek RTL960xC / RTL8672 "Europa" (RLX/Taroko)
+BOARDNAME:=Realtek RTL960xC / RTL8672 Europa (RLX/Taroko)
 CPU_TYPE:=mips32
 
 define Target/Description
