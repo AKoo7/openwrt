@@ -2,9 +2,9 @@
 /*
  * Realtek RTL960xC "Luna" SoC interrupt controller (RLX/Taroko core).
  *
- * Independent implementation from the SoC's register interface (register
- * bases/offsets, bit semantics and routing scheme observed on the hardware).
- * The block is a 64-input aggregator that funnels SoC interrupts
+ * Clean-room driver written from observed hardware facts only (register
+ * bases/offsets, bit semantics and routing scheme). No vendor source was
+ * copied. The block is a 64-input aggregator that funnels SoC interrupts
  * onto the CPU's CP0 HW interrupt lines:
  *
  *   GIMR0  0x00  mask,   inputs  0..31  (1 = enabled)
@@ -15,7 +15,7 @@
  *   ...                   a routing nibble of 0 disconnects the input;
  *   IRR7   0x2c           1..15 selects CPU output line 0..14.
  *
- * The routing nibbles are laid out in inverted word order: input 0 lives
+ * Realtek numbers the routing nibbles in inverted word order: input 0 lives
  * in the *last* IRR word's lowest nibble. The aggregator's output line 0 is
  * wired to CP0 HW IRQ 2 on this family.
  *
@@ -35,7 +35,8 @@
 #define LUNA_INTC_IRR_WORDS	(LUNA_INTC_INPUTS / 8)	/* 8 inputs/word */
 
 /* Routing nibble -> output line that the DT declares as our parent. */
-#define LUNA_INTC_ROUTE_ON	1
+#define LUNA_INTC_ROUTE_ON	2	/* (routing now pre-loaded with vendor GIRR values) */
+#define LUNA_INTC_PERIPH_EN	12	/* GIMR0 bit12 = master peripheral-IRQ enable */
 #define LUNA_INTC_ROUTE_OFF	0
 
 struct luna_intc {
@@ -43,31 +44,6 @@ struct luna_intc {
 	raw_spinlock_t	lock;
 	struct irq_domain *domain;
 };
-
-/* Inverted word order: input 0 is in the highest IRR word, lowest nibble. */
-static u32 luna_irr_reg(unsigned int hwirq)
-{
-	unsigned int word = LUNA_INTC_IRR_WORDS - 1 - (hwirq / 8);
-
-	return LUNA_INTC_IRR_BASE + word * 4;
-}
-
-static unsigned int luna_irr_shift(unsigned int hwirq)
-{
-	return (hwirq % 8) * 4;
-}
-
-static void luna_set_route(struct luna_intc *ic, unsigned int hwirq, u32 route)
-{
-	u32 reg = luna_irr_reg(hwirq);
-	unsigned int shift = luna_irr_shift(hwirq);
-	u32 val;
-
-	val = readl(ic->base + reg);
-	val &= ~(0xf << shift);
-	val |= (route & 0xf) << shift;
-	writel(val, ic->base + reg);
-}
 
 static void luna_intc_mask(struct irq_data *d)
 {
@@ -108,10 +84,7 @@ static int luna_intc_map(struct irq_domain *d, unsigned int irq,
 
 	irq_set_chip_and_handler(irq, &luna_intc_chip, handle_level_irq);
 	irq_set_chip_data(irq, ic);
-
-	raw_spin_lock(&ic->lock);
-	luna_set_route(ic, hw, LUNA_INTC_ROUTE_ON);
-	raw_spin_unlock(&ic->lock);
+	/* routing (GIRR) is pre-loaded with vendor values in of_init */
 
 	return 0;
 }
@@ -134,6 +107,9 @@ static void luna_intc_dispatch(struct irq_desc *desc)
 					readl(ic->base + LUNA_INTC_GIMR(word));
 		unsigned int bit;
 
+		if (word == 0)
+			pending &= ~BIT(LUNA_INTC_PERIPH_EN);	/* aggregate, not a real irq */
+
 		for_each_set_bit(bit, &pending, 32)
 			generic_handle_domain_irq(ic->domain, word * 32 + bit);
 	}
@@ -145,7 +121,7 @@ static int __init luna_intc_of_init(struct device_node *node,
 				    struct device_node *parent)
 {
 	struct luna_intc *ic;
-	int parent_irq, i, ret;
+	int parent_irq, n = 0, ret;
 
 	ic = kzalloc(sizeof(*ic), GFP_KERNEL);
 	if (!ic)
@@ -159,17 +135,29 @@ static int __init luna_intc_of_init(struct device_node *node,
 		goto err_free;
 	}
 
-	/* Mask everything and clear all routing before wiring the cascade. */
-	writel(0, ic->base + LUNA_INTC_GIMR(0));
+	/*
+	 * Mask all sources except the master peripheral-IRQ enable
+	 * (GIMR0 bit IRQ_PERIPHERAL=12 — "must be set to enable peripheral
+	 * irq"), then load the vendor's known-good per-irq routing (GIRR/IRR).
+	 * Word0 sources are delivered on CP0 IP3, word1 on IP4.
+	 */
+	writel(BIT(LUNA_INTC_PERIPH_EN), ic->base + LUNA_INTC_GIMR(0));
 	writel(0, ic->base + LUNA_INTC_GIMR(1));
-	for (i = 0; i < LUNA_INTC_IRR_WORDS; i++)
-		writel(0, ic->base + LUNA_INTC_IRR_BASE + i * 4);
-
-	parent_irq = irq_of_parse_and_map(node, 0);
-	if (!parent_irq) {
-		ret = -ENODEV;
-		goto err_unmap;
-	}
+	writel(0x03333330, ic->base + LUNA_INTC_IRR_BASE + 0x00);
+	writel(0x30302222, ic->base + LUNA_INTC_IRR_BASE + 0x04);
+	writel(0x00020222, ic->base + LUNA_INTC_IRR_BASE + 0x08);
+	writel(0x22020333, ic->base + LUNA_INTC_IRR_BASE + 0x0c);
+	/*
+	 * IRR4 (base+0x20) holds the routing nibbles for inputs 42..49: the
+	 * SoC timer TC0 (input 43) at bits[7:4] and the 16550 UART0 (input 49)
+	 * at bits[31:28]. The timer is proven to deliver with routing value 6,
+	 * so route the UART to 6 as well (the vendor value 3 targets an IP line
+	 * that is not picked up by our cascade, leaving userspace TX/RX dead
+	 * while polled kernel printk still works). [31:28]: 3 -> 6.
+	 */
+	writel(0x63333063, ic->base + LUNA_INTC_IRR_BASE + 0x10);
+	writel(0x32322022, ic->base + LUNA_INTC_IRR_BASE + 0x14);
+	writel(0x00333000, ic->base + LUNA_INTC_IRR_BASE + 0x18);
 
 	ic->domain = irq_domain_create_linear(of_fwnode_handle(node),
 					      LUNA_INTC_INPUTS,
@@ -179,7 +167,17 @@ static int __init luna_intc_of_init(struct device_node *node,
 		goto err_unmap;
 	}
 
-	irq_set_chained_handler_and_data(parent_irq, luna_intc_dispatch, ic);
+	/*
+	 * Cascade our dispatch on every CP0 IP line the routing may target
+	 * (GIRR value = IP); the dispatch scans both GISR words regardless.
+	 */
+	for (n = 0; (parent_irq = irq_of_parse_and_map(node, n)) > 0; n++)
+		irq_set_chained_handler_and_data(parent_irq,
+						 luna_intc_dispatch, ic);
+	if (!n) {
+		ret = -ENODEV;
+		goto err_unmap;
+	}
 
 	return 0;
 

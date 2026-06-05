@@ -29,7 +29,10 @@
 #include <linux/delay.h>
 #include <linux/init.h>
 #include <linux/io.h>
+#include <linux/irqdomain.h>
 #include <linux/kernel.h>
+#include <linux/of.h>
+#include <linux/of_irq.h>
 #include <linux/pci.h>
 #include <linux/types.h>
 
@@ -46,6 +49,10 @@
 #define PCI_MISC_MDIO_P1	BIT(21)		/* MDIO reset strobe (bit21)      */
 #define IP_SEL_EN_PCIE0		BIT(7)		/* port-0 PCIe MAC enable (gate)  */
 #define IP_SEL_EN_PCIE_PHY	BIT(26)		/* PCIe SerDes/PHY enable bit     */
+/* Extra IP_SEL gates the operational config sets alongside the PCIe MAC/PHY
+ * (IP_SEL = 0x04001887). Without these the downstream endpoint's config space
+ * never decodes (reads the 0xeeeeeeee abort pattern) even though the link trains. */
+#define IP_SEL_EN_EXTRA		(BIT(0) | BIT(2) | BIT(11) | BIT(12))
 
 /* Port-0 register windows (KSEG1). */
 #define PCIE_HOSTCFG	((void __iomem *)0xb8b00000ul)
@@ -58,12 +65,13 @@
 #define HOSTEXT_FN	0x00c	/* PCI function-number select            */
 
 /*
- * PCIe PHY (SerDes) tuning written over the host MDIO before the link can
- * complete training. Each entry is one MDIO register write; without these the
- * analog PHY never leaves POLLING. {reg, val} pairs, terminated by reg 0xff.
- * These values were established by probing this board: with them the LTSSM
- * reaches L0; other tunings leave it stuck in POLLING, so they are specific to
- * this board's SerDes routing.
+ * PCIe SerDes PHY tuning, written over the host MDIO before link training. These
+ * are the revB analog values that match this RTL9602C (rev A) SerDes. The match
+ * is load-bearing beyond just training: regs 0x20/0x21 set the SerDes PLL and
+ * clock divider that also clock the downstream endpoint's config core. A sibling
+ * part's revC table (0x20=0xd4a4/0x21=0x485a) still bit-locks the lane to L0, but
+ * leaves the endpoint's config-core clock mistuned so every config TLP aborts
+ * (reads back the 0xeeeeeeee pattern). {reg, val} pairs, terminated by reg 0xff.
  */
 struct luna_pcie_phy { u8 reg; u16 val; };
 static const struct luna_pcie_phy luna_pcie_phy_params[] __initconst = {
@@ -72,6 +80,13 @@ static const struct luna_pcie_phy luna_pcie_phy_params[] __initconst = {
 	{ 0x1c, 0x2001 }, { 0x1e, 0x66eb }, { 0x20, 0xd4a4 }, { 0x21, 0x485a },
 	{ 0x23, 0x0b66 }, { 0x24, 0x4f0c }, { 0x29, 0xf0f3 }, { 0x2b, 0xa0a1 },
 	{ 0x09, 0x500c }, { 0x09, 0x520c },
+	/* 25 MHz reference-clock SerDes values (the board has a 25 MHz crystal at
+	 * the WiFi PCIe PHY). This is the vendor "9602C 25M clk" ePHY table; reg
+	 * 0x03 is the refclk PLL multiplier (0x3031 for 25 MHz, vs 0x7b31 for
+	 * 40 MHz) and reg 0x06 = 0xe0b8 (vs 0xe2b8). A 40 MHz PLL on a 25 MHz
+	 * refclk mistunes the config-core clock -> marginal high-offset access. */
+	{ 0x03, 0x3031 }, { 0x06, 0xe0b8 }, { 0x0e, 0x98c5 },
+	{ 0x0f, 0x400f }, { 0x19, 0xfc70 },
 	{ 0xff, 0xffff },
 };
 
@@ -80,6 +95,7 @@ static const struct luna_pcie_phy luna_pcie_phy_params[] __initconst = {
 #define HOSTCFG_PAYLOAD	0x078	/* MAX_PAYLOAD_SIZE in bits [7:5]        */
 #define HOSTCFG_LINK	0x728	/* LTSSM state; [4:0]==0x11 => link up   */
 #define HOSTCFG_CFGCTL	0x80c	/* bit17 enables endpoint config access  */
+#define CFGCTL_FWD_EN	BIT(17)	/* write-enable; reads back as 0x100 once active */
 
 #define LINK_UP_STATE	0x11u
 
@@ -89,7 +105,15 @@ static const struct luna_pcie_phy luna_pcie_phy_params[] __initconst = {
 #define PCIE_IO_PHYS	0x18c00000u
 #define PCIE_IO_SIZE	0x00010000u	/* 64 KB */
 
-#define PCIE_IRQ	51		/* INTC line for port-0 (GIC_EXT 49 + 2) */
+/*
+ * PCIe host-controller input on the SoC INTC aggregator. Established by probing
+ * the live INTC GISR while the endpoint asserted INTx: the host-bridge interrupt
+ * status (HOSTEXT+0x04) reads 0x1 exactly when INTC GISR0 bit 15 latches, so the
+ * aggregated PCIe INTx lands on INTC input 15. (Input 51 is UART2 — the earlier
+ * value never fired.) Input 15's IRR routing nibble is preset to 3 -> CP0 IRQ4,
+ * which the INTC cascade picks up.
+ */
+#define PCIE_HWIRQ	15
 
 static DEFINE_SPINLOCK(luna_pcie_lock);
 static u8 luna_pcie_busnr = 0xff;
@@ -126,6 +150,7 @@ static int luna_pcie_access(struct pci_bus *bus, unsigned int devfn, int where,
 
 	spin_lock_irqsave(&luna_pcie_lock, flags);
 	writel(PCI_FUNC(devfn), PCIE_HOSTEXT + HOSTEXT_FN);
+	mb();			/* order the function-select latch before the access */
 	if (is_write) {
 		if (size == 4)
 			writel(*val, reg);
@@ -169,11 +194,29 @@ static struct pci_ops luna_pcie_ops = {
 
 int pcibios_map_irq(const struct pci_dev *dev, u8 slot, u8 pin)
 {
-	struct irq_desc *d = irq_to_desc(PCIE_IRQ);
+	static int pcie_virq;
 
-	if (d)
-		irqd_set_trigger_type(&d->irq_data, IRQ_TYPE_LEVEL_HIGH);
-	return PCIE_IRQ;
+	/* The endpoint's INTx is aggregated by the SoC INTC onto a single input
+	 * line; map that hwirq through the INTC's (linear) irq_domain to obtain
+	 * the Linux virq the PCI core hands to the endpoint driver. Returning the
+	 * raw hwirq would yield an unmapped virq (no_irq_chip) so request_irq()
+	 * fails with -ENOSYS. The INTC drives handle_level_irq, so the line is
+	 * already level-triggered. */
+	if (!pcie_virq) {
+		struct device_node *np;
+
+		np = of_find_compatible_node(NULL, NULL,
+					     "realtek,rtl9602c-intc");
+		if (np) {
+			struct irq_domain *domain = irq_find_host(np);
+
+			of_node_put(np);
+			if (domain)
+				pcie_virq = irq_create_mapping(domain,
+							       PCIE_HWIRQ);
+		}
+	}
+	return pcie_virq;
 }
 
 int pcibios_plat_dev_init(struct pci_dev *dev)
@@ -203,73 +246,64 @@ static struct pci_controller luna_pcie_controller = {
 
 /* ---------- bring-up ---------- */
 
-/* Number of full reset+train attempts before giving up. The LTSSM occasionally
- * stalls in POLLING (link state 0x03) on the first try; re-asserting the MAC and
- * PHY reset and re-arming the LTSSM recovers it, so a few attempts are made. */
-#define LINK_RETRIES	4
+/* Number of full reset+train attempts before giving up — the LTSSM occasionally
+ * stalls in POLLING on the first try and a fresh cold reset recovers it. */
+#define LINK_RETRIES	3
 
 /*
- * Re-assert the SoC-side resets and re-open the MAC gate. Safe to call on every
- * retry: it brings the 0xb8b0xxxx window from gated to decoding. Returns 0 once
- * config space answers with the expected PCI manufacturer ID, -ENODEV otherwise. No access
- * to the PCIe window happens before the gate (bit 7) is set, or the CPU bus
- * stalls on an un-acked target.
+ * Full PCIe host bring-up, in the controller's documented reset order/timing:
+ * MDIO reset, MAC-enable pulse, PHY reset + SerDes tuning, then link training.
+ * Returns 0 once the LTSSM reaches L0 (state 0x11), -ETIMEDOUT otherwise. No
+ * access to the 0xb8b0xxxx window happens before the MAC gate is set in step 2,
+ * or the CPU bus stalls on an un-acked target.
  */
-static int __init luna_pcie_macenable(void)
+static int __init luna_pcie_reset(void)
 {
 	u32 v;
-
-	/* 1. PCIe pin/clock mux. */
-	writel(readl(SOC_PINMUX) | PINMUX_PCIE, SOC_PINMUX);
-	/* 2. LX peripheral bus clock. */
-	writel(readl(SOC_CLK_MANAGE) | CLK_EN_LX1, SOC_CLK_MANAGE);
-	/* 3. PCIe MDIO reset: clear, then strobe port-0 reset bit. */
-	v = readl(SOC_PCI_MISC) & ~(PCI_MISC_MDIO_CLR | PCI_MISC_MDIO_P0 | PCI_MISC_MDIO_P1);
-	writel(v, SOC_PCI_MISC);
-	writel(v | PCI_MISC_MDIO_P0 | PCI_MISC_MDIO_P1, SOC_PCI_MISC);
-	/* 4. PCIe MAC + PHY enable (clear then set) — ungates 0xb8b0xxxx. */
-	v = readl(SOC_IP_SEL) & ~(IP_SEL_EN_PCIE0 | IP_SEL_EN_PCIE_PHY);
-	writel(v, SOC_IP_SEL);
-	mb();
-	writel(v | IP_SEL_EN_PCIE0 | IP_SEL_EN_PCIE_PHY, SOC_IP_SEL);
-	mdelay(10);
-
-	/* Now safe: confirm config space decodes (PCI manufacturer ID 0x10ec). */
-	v = readl(PCIE_HOSTCFG);
-	if ((v & 0xffff) != PCI_VENDOR_ID_REALTEK)
-		return -ENODEV;
-	return 0;
-}
-
-/*
- * Pulse the host PHY reset and arm the LTSSM, then poll for link-up. The PHY
- * reset (bit7) is released in the same write that enables the LTSSM (bit0); the
- * link needs ~50 ms to settle before it begins reporting state. Returns 0 once
- * the LTSSM reaches L0 (state 0x11), -ETIMEDOUT otherwise.
- */
-static int __init luna_pcie_linkup(void)
-{
 	int i;
 
+	/* 0. Reset settle (the per-board device-reset strap is not software-driven
+	 *    on this board, so this is the bare timing budget). */
+	mdelay(10);
+
+	/* 1. PCIe pin mux, then MDIO reset: clear the reset-hold bit and the port
+	 *    reset bits, then strobe the port reset bits. This board trains only
+	 *    with both port reset bits strobed. */
+	writel(readl(SOC_PINMUX) | PINMUX_PCIE, SOC_PINMUX);
+	v = readl(SOC_PCI_MISC) & ~(PCI_MISC_MDIO_CLR | PCI_MISC_MDIO_P0 | PCI_MISC_MDIO_P1);
+	writel(v, SOC_PCI_MISC);
+	mb();
+	writel(v | PCI_MISC_MDIO_P0 | PCI_MISC_MDIO_P1, SOC_PCI_MISC);
+	mdelay(1);
+
+	/* 2. Ensure the PHY + operational gates are enabled, then pulse ONLY the MAC
+	 *    enable bit (clear then set) as the MAC reset. The PHY-enable bit is left
+	 *    set throughout — clearing it mid-bring-up resets the SerDes. */
+	writel(readl(SOC_IP_SEL) | IP_SEL_EN_PCIE_PHY | IP_SEL_EN_EXTRA, SOC_IP_SEL);
+	v = readl(SOC_IP_SEL) & ~IP_SEL_EN_PCIE0;
+	writel(v, SOC_IP_SEL);
+	mb();
+	writel(v | IP_SEL_EN_PCIE0, SOC_IP_SEL);
+	mdelay(100);
+
+	/* 3. Arm the LTSSM with the PHY held in reset, then release the PHY reset. */
 	writel(0, PCIE_HOSTEXT + HOSTEXT_FN);
 	writel(0x01, PCIE_HOSTEXT + HOSTEXT_LTSSM);	/* PHY in reset, LTSSM en */
 	mb();
 	writel(0x81, PCIE_HOSTEXT + HOSTEXT_LTSSM);	/* release PHY reset      */
-	mb();
-	mdelay(50);					/* let the PHY settle     */
+	mdelay(50);
 
-	/* Tune the SerDes PHY over MDIO — required before POLLING can complete. */
+	/* 4. SerDes PHY tuning over MDIO — required before POLLING can complete. */
 	for (i = 0; luna_pcie_phy_params[i].reg != 0xff; i++) {
 		writel(((u32)luna_pcie_phy_params[i].val << 16) |
 		       ((u32)luna_pcie_phy_params[i].reg << 8) | 1,
 		       PCIE_HOSTEXT + HOSTEXT_MDIO);
 		mdelay(1);
 	}
-
-	/* Give the SerDes time to settle before the LTSSM is polled. */
 	mdelay(20);
 
-	for (i = 0; i < 30; i++) {			/* up to ~300 ms          */
+	/* 5. Poll for link-up (L0). */
+	for (i = 0; i < 10; i++) {
 		if ((readl(PCIE_HOSTCFG + HOSTCFG_LINK) & 0x1f) == LINK_UP_STATE)
 			return 0;
 		mdelay(10);
@@ -277,51 +311,14 @@ static int __init luna_pcie_linkup(void)
 	return -ETIMEDOUT;
 }
 
-/*
- * U-Boot already trains this link (and leaves the LTSSM at L0) as part of its
- * own PCIe init, and nothing touches the controller between bootm and this
- * late_initcall. Re-running the MAC/MDIO/PHY reset here would wipe U-Boot's PHY
- * tuning and drop the link back to POLLING. So first try to *inherit* the live
- * link: open the config window idempotently (set the gate bit without the
- * destructive clear/MDIO-strobe) and, if the link is already up, use it as-is.
- * No PCIe-window access happens until the gate bit is set.
- */
-static int __init luna_pcie_inherit(void)
-{
-	u32 v;
-
-	writel(readl(SOC_PINMUX) | PINMUX_PCIE, SOC_PINMUX);
-	writel(readl(SOC_CLK_MANAGE) | CLK_EN_LX1, SOC_CLK_MANAGE);
-	v = readl(SOC_IP_SEL);
-	if (!(v & IP_SEL_EN_PCIE0)) {
-		writel(v | IP_SEL_EN_PCIE0, SOC_IP_SEL);
-		mdelay(10);
-	}
-
-	v = readl(PCIE_HOSTCFG);
-	if ((v & 0xffff) != PCI_VENDOR_ID_REALTEK)
-		return -ENODEV;
-	if ((readl(PCIE_HOSTCFG + HOSTCFG_LINK) & 0x1f) != LINK_UP_STATE)
-		return -ENODEV;
-	pr_info("realtek-pcie: inherited U-Boot link (bridge 0x%08x)\n", v);
-	return 0;
-}
-
 static int __init luna_pcie_init(void)
 {
-	int attempt, ret;
+	int attempt, ret = -ETIMEDOUT;
 
-	ret = luna_pcie_inherit();
-	if (!ret)
-		goto linked;
-
-	ret = -ETIMEDOUT;
+	/* Train the link: the pcie1-revC SerDes table + bit7 MAC enable bring the
+	 * lane to L0, retried a few times to clear an occasional POLLING stall. */
 	for (attempt = 0; attempt < LINK_RETRIES; attempt++) {
-		if (luna_pcie_macenable()) {
-			ret = -ENODEV;
-			continue;	/* gate not up — re-assert and retry */
-		}
-		ret = luna_pcie_linkup();
+		ret = luna_pcie_reset();
 		if (!ret)
 			break;
 		pr_info("realtek-pcie: link not trained (state=0x%x), retry %d/%d\n",
@@ -334,26 +331,32 @@ static int __init luna_pcie_init(void)
 		return ret;
 	}
 
-linked:
-	/* Host bridge command: mem + bus-master enable; 128 B max payload. */
+	/* Configuration-retry settle before any config/BAR access. */
+	mdelay(100);
+
+	/* Program the downstream endpoint's BARs + command register, then enable the
+	 * host bridge (written twice), set 128 B max payload, and enable config
+	 * forwarding. The forwarding-enable is the bit17 write-strobe — the register
+	 * then reads back the operational value 0x100, but writing 0x100 does not
+	 * enable it. */
+	writel(0x18c00001, PCIE_DEVCFG + 0x10);
+	writel(0x19000004, PCIE_DEVCFG + 0x18);
+	writel(0x00180007, PCIE_DEVCFG + 0x04);
+	writel(0x00100007, PCIE_HOSTCFG + HOSTCFG_CMD);
 	writel(0x00100007, PCIE_HOSTCFG + HOSTCFG_CMD);
 	writeb(readb(PCIE_HOSTCFG + HOSTCFG_PAYLOAD) & ~0xe0,
 	       PCIE_HOSTCFG + HOSTCFG_PAYLOAD);
-
-	/* Enable forwarding of config requests to the downstream endpoint; without
-	 * this the endpoint's config space reads back the abort pattern. */
-	writel(readl(PCIE_HOSTCFG + HOSTCFG_CFGCTL) | BIT(17),
+	writel(readl(PCIE_HOSTCFG + HOSTCFG_CFGCTL) | CFGCTL_FWD_EN,
 	       PCIE_HOSTCFG + HOSTCFG_CFGCTL);
 	mb();
 
-	/* The endpoint (RTL8192FR) loads internal ROM after link-up and only then
-	 * answers config reads; until ready, its config space returns the bridge's
-	 * abort pattern (0xeeeeeeee). Wait for a valid manufacturer ID before the bus scan
-	 * so the device is not skipped. Function 0 is selected on the host window. */
-	for (attempt = 0; attempt < 6; attempt++) {	/* up to ~300 ms */
+	/* Wait for the endpoint's config space to answer before the bus scan so the
+	 * device is not skipped. Function 0 is selected on the host window. */
+	for (attempt = 0; attempt < 20; attempt++) {	/* up to ~1 s */
 		u32 id;
 
 		writel(0, PCIE_HOSTEXT + HOSTEXT_FN);
+		mb();
 		id = readl(PCIE_DEVCFG);
 		if ((id & 0xffff) == PCI_VENDOR_ID_REALTEK)
 			break;

@@ -64,11 +64,25 @@ static void __init prom_init_cmdline(void)
 
 void __init prom_init(void)
 {
+	int i;
+
 	/* Bring-up bisect markers (earliest reliable output; remove later). */
 	prom_putchar('\n');
 	prom_putchar('[');
 	prom_putchar('P');
 	prom_putchar(']');
+
+	/* Clear the CPU's unmapped-memory-segment (UMSAR0..3 @ 0xb8001300) and SRAM
+	 * segment (SRAMSAR0..3 @ 0xb8004000) address registers. Left in their
+	 * preloader state, some CPU<->peripheral transactions (PCIe config
+	 * completions, peripheral SRAM DMA) can mis-route on the SoC OCP fabric and
+	 * return the master-abort pattern. The earliest init is the safe place to do
+	 * this, before DRAM/SRAM is in active use. */
+	for (i = 0; i < 4; i++) {
+		*(volatile u32 *)(0xb8001300ul + i * 0x10) = 0;
+		*(volatile u32 *)(0xb8004000ul + i * 0x10) = 0;
+	}
+
 	prom_init_cmdline();
 }
 

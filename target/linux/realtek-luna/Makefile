@@ -20,6 +20,7 @@ include $(INCLUDE_DIR)/target.mk
 
 DEFAULT_PACKAGES += \
 	kmod-gpio-button-hotplug \
-	uboot-envtools
+	uboot-envtools \
+	iw
 
 $(eval $(call BuildTarget))

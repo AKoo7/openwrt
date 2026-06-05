@@ -298,6 +298,15 @@
 
 #define PI_IO_CMD_0_US		0x05434		/* [5] GMII_RX_EN [4] GMII_TX_EN */
 #define PI_IO_CMD_0_DS		0x0d434
+/* Internal-MII force-link for the two PON-IP NICs (symmetric pair, US = DS-0x8000):
+ * MEDIA_STS_DS @0xc058 (read 0x106e8400 from the bootloader, the DS-NIC<->GMAC0 RX
+ * link that DS OMCI rides) and MEDIA_STS_US @0x4058 (the GMAC0-TX -> US-NIC link
+ * that US OMCI must ride). FORCELINK[18] FORCEDFULLDUP[19] FORCE_SPD[17:16]
+ * FORCE_SPD_MODE[10] TRXFCE/RXFCE/TXFCE[31:29]; golden 0x106e8400. No DAL code
+ * writes the US one -> it stays down -> GMAC0-TX OMCI is dropped at the US-NIC GMII
+ * ingress before PON_SID2QID (ustx 0x329bc = 0). Force it up like the DS side. */
+#define PI_MEDIA_STS_US		0x04058
+#define PI_MEDIA_STS_DS		0x0c058
 #define PI_IO_CMD_1_US		0x05438		/* [5:4] RPAGE [1:0] TPAGE size  */
 #define PI_IO_CMD_1_DS		0x0d438
 #define   PI_GMII_RX_EN		BIT(5)
@@ -325,7 +334,9 @@
 #define PI_RX_CFG_US		0x04044		/* [5] accept-CRC-error          */
 #define PI_RX_CFG_DS		0x0c044
 #define PI_PROBE_SELECT_US	0x05400		/* [1] debug func select         */
-#define PI_PROBE_SELECT_DS	0x0d400
+#define PI_PROBE_SELECT_DS	0x0d400		/* stock O5 = 0x40 (DS-NIC drain) */
+#define PI_DS_NIC_CFG_D404	0x0d404		/* stock O5 = 0x11100348          */
+#define PI_DS_NIC_CFG_D42C	0x0d42c		/* stock O5 = 0x40               */
 
 /*
  * SRAM page accounting for GPON, 128-byte pages, no DRAM reservation.
@@ -355,14 +366,26 @@ static void __iomem *ponip_base;
  * factory value takes effect on the next ranging cycle; the FSM re-reads the
  * parsed serial each time it sends its Serial_Number_ONU upstream. */
 static void gpon_parse_sn(const char *s);	/* defined below; re-parses onu_sn */
-static char *onu_sn = "XPON00000000";
+static char *onu_sn = "XPON39013867";	/* TEST-ONLY default = this board's SN, so the FSM
+					 * ranges with the real SN immediately (no placeholder
+					 * phantom / re-range that races OLT discovery). For
+					 * production revert to a placeholder + provision via the
+					 * gpon_provision init script at OS startup. */
+static bool gpon_sn_changed;		/* SN (re)provisioned -> FSM must re-range */
 
 static int onu_sn_set(const char *val, const struct kernel_param *kp)
 {
 	int ret = param_set_charp(val, kp);
 
-	if (!ret)
+	if (!ret) {
 		gpon_parse_sn(onu_sn);
+		/* The driver loads with the placeholder SN and begins ranging
+		 * immediately; the real per-board SN is provisioned slightly later
+		 * via this /sys param (userspace) or the cmdline. Flag a re-range so
+		 * the OLT sees the correct Serial_Number and authorises the
+		 * provisioned ONU instead of auto-ranging the placeholder phantom. */
+		gpon_sn_changed = true;
+	}
 	return ret;
 }
 static const struct kernel_param_ops onu_sn_ops = {
@@ -379,7 +402,18 @@ MODULE_PARM_DESC(skip_bosa, "leave external BOSA as-is (warm-boot bisection)");
 /* Open the DS GEM unicast/broadcast pass gate (GEM_DS_MC_CFG). Default OFF: without
  * the PON-IP->GMAC-NIC OMCI drain, opening it backs up the DS path and stalls the US
  * (deactivate ~48s). Set =1 only when drain-path testing. */
-static bool gem_gate_open;		/* default OFF = stable online; the downstream OMCI-to-host path is still being brought up */
+/* Pass unicast DS GEM so the GTC de-encapsulates the OLT's unicast OMCI.
+ * DEFAULT OFF: opening it de-encapsulates OMCI (verified: gem_ds_rx climbs) but
+ * the de-encapsulated frame does NOT yet drain to the CPU NIC (omci_rx stays 0 —
+ * the PON-IP->GMAC HW-PBO trap delivery is the open wall), so the DS path backs
+ * up and the OLT Deactivates the ONU (~17-22s). Set gem_gate_open=1 to resume
+ * debugging the trap delivery; keep 0 for a stable O5 baseline. */
+/* Pass unicast DS GEM so the GTC de-encapsulates the OLT's unicast OMCI.
+ * DEFAULT OFF: stable O5 baseline. Stage instrumentation (DSPIPE / ds_deenc_sweep,
+ * gated on this flag) showed that with it ON, de-encap is 0 on ALL 128 flows and
+ * the OLT is NOT sending OMCI (nonidle GEM ~0) — it deallocs + deactivates ~36s.
+ * Set =1 to re-run the DS-pipeline probes. */
+static bool gem_gate_open;
 module_param(gem_gate_open, bool, 0444);
 MODULE_PARM_DESC(gem_gate_open, "open DS GEM pass gate (needs the PON-IP->host OMCI drain; default off = stable online)");
 /* DIAGNOSTIC: force the upstream laser continuously on (US_CFG.FS_LON). Tests
@@ -1627,6 +1661,10 @@ static void __init gpon_pbo_init(void)
 	 * ONU was stuck in O3. Must be set here in pbo_init (before the MAC reset);
 	 * setting it post-boot is too late. */
 	pi_wr(PI_IO_CMD_0_US, 0x90101070);
+	/* Force the GMAC0-TX -> US-NIC internal-MII link UP so a CPU-injected US OMCI
+	 * frame is accepted at the US-NIC GMII ingress (mirror of the DS-NIC link that
+	 * carries DS OMCI to the CPU). No DAL writes this; default leaves it down. */
+	pi_wr(PI_MEDIA_STS_US, 0x106e8400u);
 	/* DS IO_CMD (the DMA/FIFO drain enable, 0x90081070) is written LAST, after the
 	 * backpressure thresholds + PBUF_EN, so the DS engine drains out of a properly
 	 * bounded buffer (see end of this function). */
@@ -1688,10 +1726,16 @@ static void __init gpon_pbo_init(void)
 	pi_field(PI_CFG_US, 26, 26, 1);			/* E_EN_RFF_AFULL         */
 	pi_field(PI_CFG_US, 17, 17, 1);			/* EN_TX_STOP             */
 	pi_field(PI_CFG_US, 16, 16, 1);			/* EN_TXE_EXTRA           */
-	pi_field(PI_PROBE_SELECT_DS, 1, 1, 1);
+	/* (0xD400 PROBE_SELECT_DS is set to the stock golden 0x40 at the end of this
+	 * function, with 0xD404/0xD42C — the DS-NIC drain config, not a debug probe.) */
 	pi_field(PI_CFG_DS, 26, 26, 1);
 	pi_field(PI_CFG_DS, 17, 17, 1);
 	pi_field(PI_CFG_DS, 16, 16, 1);
+	/* CFG_DS[6:0] = RX_SID: the stream-id the DS-NIC STAMPS on every frame it egresses
+	 * over the internal MII into GMAC0's GMII-RX. The GMAC's CPUtag1CR SID-64 trap only
+	 * fires (and the GMAC only accepts the on-wire cpu-tag) when this SID = 64. Reset
+	 * default is 0x40 but the pbo MAC reset can clear it; set it explicitly. */
+	pi_field(PI_CFG_DS, 6, 0, 64);			/* RX_SID = 64 (OMCC SID) */
 
 	/* 6. PONNIC TX framing (IFG, preamble, padding) + RX accept-CRC-error. */
 	pi_field(PI_TX_CFG_US, 12, 10, 3);		/* IFG                    */
@@ -1720,15 +1764,18 @@ static void __init gpon_pbo_init(void)
 	 * cpu-tag stream-id 64 that the NIC's OMCI hook catches. */
 	pi_wr(PI_IO_CMD_0_DS, 0x90081070u);
 
-	/* 9. PON-IP DS NIC config that forwards de-encapsulated DS frames to the host
-	 * GMAC NIC (OMCI bypasses the switch: the switch PON-port RX MIB stays 0, OMCI
-	 * goes PON-IP -> GMAC NIC direct). These registers in the DS NIC block are 0 at
-	 * reset and must be programmed for O5; without them the de-encapsulated frame is
-	 * not handed to the GMAC NIC and backs up in the PON-IP. Operational values. */
-	pi_wr(0x0d400u, 0x00000040u);	/* DS NIC: OMCI SID 64 */
-	pi_wr(0x0d404u, 0x11100348u);	/* DS NIC forward/queue config */
-	pi_wr(0x0d42cu, 0x00000040u);	/* DS NIC: OMCI SID 64 (mirror) */
-	pi_wr(0x0d3f4u, 0x02d60000u);	/* DS NIC RX ring-size/CDO config */
+	/* PON-IP DS-NIC drain config (0xD400/0xD404/0xD42C). A LIVE STOCK ONU that is
+	 * online and draining real OMCI has these SET — 0xd400=0x40, 0xd404=0x11100348,
+	 * 0xd42c=0x40 — with PKT_OK_CNT_DS (0xc010) climbing (dumped 0x0265 = 613 frames).
+	 * My driver left them 0 (and wrote 0xd400 bit1 instead of bit6), and its
+	 * PKT_OK_CNT_DS stayed 0 = de-encapsulated DS OMCI was never handed off to the
+	 * GMAC NIC (filled=0). The earlier "SWPBO-only, vendor never touches them" note
+	 * was wrong — measured against the live stock datapath. These program the DS
+	 * de-encap engine's transfer to the GMAC NIC RX (the long-unsolved transfer gap).
+	 * Written LAST, after IO_CMD_0_DS, matching stock's golden values verbatim. */
+	pi_wr(PI_PROBE_SELECT_DS, 0x00000040u);
+	pi_wr(PI_DS_NIC_CFG_D404, 0x11100348u);
+	pi_wr(PI_DS_NIC_CFG_D42C, 0x00000040u);
 }
 
 /* Full BOSA page2 (slave 0x54) + page3 (slave 0x55) register dump for diagnostics.
@@ -1767,6 +1814,144 @@ static u32 gpon_gem_ds_rx_cnt(u8 flow)
 		udelay(1);
 	}
 	return gpon_rd(0x4044);				/* ETH_PKT_RX count */
+}
+
+/* Per-flow downstream GEM FORWARDED-to-PON-IP count (GEM_DS_FWD_CNTR, IND 0x404C /
+ * STAT 0x4050, field ETH_PKT_FWD) — same indirect protocol as gpon_gem_ds_rx_cnt.
+ * DECISIVE diagnostic: GEM_NON_IDLE is a GLOBAL de-assembler counter, so its rise
+ * only proves the GTC de-encapsulated SOMETHING, not that flow-64/OMCI was forwarded
+ * toward the PON-IP. FWD[64] localizes the break: if flow_cnt(64) climbs but FWD=0
+ * the GTC de-encap'd but did NOT forward (GTC-side gap); if FWD climbs but the PON-IP
+ * DS SRAM (PI_DSC_USAGE_DS) stays flat the PON-IP rejected it (descriptor base/region
+ * or the internal DS-GMII link MEDIA_STS_DS). */
+static u32 gpon_gem_ds_fwd_cnt(u8 flow)
+{
+	int i;
+
+	gpon_wr(0x404c, flow & 0x7f);
+	for (i = 0; i < 1000; i++) {
+		if (gpon_rd(0x404c) & BIT(15))		/* ETH_PKT_FWD_R_ACK */
+			break;
+		udelay(1);
+	}
+	return gpon_rd(0x4050);				/* ETH_PKT_FWD count */
+}
+
+/* Read back the DS GEM-port CAM entry for `flow` (READ op = OP_MODE 2): does the
+ * CAM actually hold the OMCC gem at flow 64 at runtime? Returns [11:0]=stored gem,
+ * bit16=OP_HIT. Stock de-encaps OMCI on flow 64 (786) while our flow 64 reads 0, so
+ * either our CAM entry is wrong/absent or it is not being matched. */
+static u32 gpon_ds_cam_read(u8 flow)
+{
+	int i;
+	u32 ind;
+
+	gpon_wr(0x1100, (2u << 8) | (flow & 0x7f));		/* DS_PORT_IND OP_MODE=READ, REQ=0 */
+	gpon_wr(0x1100, (2u << 8) | (flow & 0x7f) | BIT(15));	/* REQ=1 -> trigger */
+	for (i = 0; i < 1000; i++) {
+		if (gpon_rd(0x1100) & BIT(14))	/* OP_COMPL */
+			break;
+		udelay(1);
+	}
+	ind = gpon_rd(0x1100);
+	return ((ind & BIT(13)) ? BIT(16) : 0) | (gpon_rd(0x110c) & 0xfff);	/* HIT | RDATA gem */
+}
+
+/* Invalidate ALL 128 DS GEM-port CAM entries (CLEAN op = OP_MODE 3). The CAM holds
+ * only a 12-bit gemPortId per entry with NO valid bit, so at reset the entries carry
+ * GARBAGE gem values (observed e0=gem3566). The lookup matches an incoming gem against
+ * every entry, so a stale entry that happens to equal the OMCC gem (2) shadows flow 64
+ * and steals the DS OMCI — flow 64 then de-encaps nothing. Clear them all before
+ * installing the OMCC so ONLY flow 64 matches gem 2. */
+static void gpon_ds_cam_clear_all(void)
+{
+	int f, i;
+
+	for (f = 0; f < 128; f++) {
+		if (f == 64)		/* never disturb the OMCC flow (its CAM+TRAFFIC_CFG are
+					 * written right after; the CLEAN op also zeroes the
+					 * entry's TRAFFIC_CFG and races our isOMCI write). */
+			continue;
+		gpon_wr(0x1100, (3u << 8) | (f & 0x7f));		/* OP_MODE=CLEAN, IDX, REQ=0 */
+		gpon_wr(0x1100, (3u << 8) | (f & 0x7f) | BIT(15));	/* REQ=1 -> trigger */
+		for (i = 0; i < 1000; i++) {
+			if (gpon_rd(0x1100) & BIT(14))			/* OP_COMPL */
+				break;
+			udelay(1);
+		}
+	}
+}
+
+/* GTC US MISC PM counter (GPON_GTC_US_MISC_CNTR_IDX 0x5140 [2:0] / STAT 0x5148):
+ * write the raw type index, read the 32-bit count. raw idx map (vendor
+ * gpon_usGtcMiscCntType_cfg2raw): 0=PLOAM_BOH_TX 1=GEM_DBRU_TX 2=PLOAM_CPU_TX
+ * 3=PLOAM_AUTO_TX 4=GEM_BYTE_TX. Decisive US-emission instrument: idx2 (our ACK/SN
+ * PLOAM, expect >0) vs idx4 GEM_BYTE_TX + TCONT_IDLE_BYTE_STAT[16] (expect 0 = ONU
+ * transmits PLOAM but NO US GEM on its T-CONT-16 grants -> OLT deactivates ~42s). */
+static u32 gpon_us_misc_cnt(u8 idx)
+{
+	gpon_wr(0x5140, idx & 0x7);
+	udelay(5);
+	return gpon_rd(0x5148);
+}
+
+/* GEM DS MISC PM counter (GPON_GEM_DS_MISC_IND 0x4064 [3:0]=idx, R_ACK bit15, STAT
+ * 0x4068) — GLOBAL, CAM-INDEPENDENT de-encap-stage counters. idx map (gponv2):
+ * 0=MC_RX 1=UC_RX 2=MC_FWD 3=MC_LEAK 4=ETH_CRC_ERR 5=OVER_INTERLEAV 6=OMCI_RX.
+ * Decisive: UC_RX(1) counts every DS unicast GEM the de-assembler accepts regardless
+ * of the per-port CAM; OMCI_RX(6) is the authoritative "GTC de-encapsulated an OMCI
+ * frame" count. If UC_RX climbs but OMCI_RX stays 0 -> unicast arrives but is not
+ * PTI-classified as OMCI; if neither climbs -> no unicast reaches the de-assembler. */
+static u32 gpon_gem_ds_misc_cnt(u8 idx)
+{
+	int i;
+
+	gpon_wr(0x4064, idx & 0xf);
+	for (i = 0; i < 16; i++) {
+		if (gpon_rd(0x4064) & BIT(15))
+			break;
+		udelay(2);
+	}
+	return gpon_rd(0x4068);
+}
+
+/* Read back the GTC alloc CAM entry for a T-CONT (READ op, same indirect protocol
+ * as the DS GEM CAM): does T-CONT 16 actually hold alloc 0x400 + HIT? If the BWMAP's
+ * alloc-id does not match a valid CAM entry, the GTC ignores the operational grant
+ * (bwm_acpt stays 0) and the ONU never transmits operational US. Returns [11:0]=
+ * stored allocId, bit16=OP_HIT. ALLOC_IND 0x10c0 / ALLOC_RD 0x10cc. */
+static u32 gpon_alloc_cam_read(u8 tcont)
+{
+	int i;
+	u32 ind;
+
+	gpon_wr(0x10c0, (2u << 8) | (tcont & 0x1f));		/* OP_MODE=READ, REQ=0 */
+	gpon_wr(0x10c0, (2u << 8) | (tcont & 0x1f) | BIT(15));	/* REQ=1 -> trigger */
+	for (i = 0; i < 1000; i++) {
+		if (gpon_rd(0x10c0) & BIT(14))			/* OP_COMPL */
+			break;
+		udelay(1);
+	}
+	ind = gpon_rd(0x10c0);
+	return ((ind & BIT(13)) ? BIT(16) : 0) | (gpon_rd(0x10cc) & 0xfff);
+}
+
+/* DS-PIPELINE STAGE-A: per-flow de-encapsulated GEM frame count (indirect):
+ * GPON_GTC_DS_PORT_CNTR_IND(0x1140) IDX[6:0]=flow|RSEL[8]=0(pkt)/1(byte), poll
+ * R_ACK(bit15), read GPON_GTC_DS_PORT_CNTR_STAT(0x1144). Unlike gem_ds_rx_cnt
+ * (ETH-only 0x4040), this counts ALL de-encapped GEM frames incl. isOMCI flow 64
+ * — the reliable "did the GTC de-encapsulate OMCI?" detector. Bounded poll. */
+static u32 gpon_gem_flow_cnt(u32 idx, int rsel)
+{
+	int t;
+
+	gpon_wr(0x1140, (idx & 0x7f) | ((rsel & 1) << 8));
+	for (t = 0; t < 1000; t++) {
+		if (gpon_rd(0x1140) & BIT(15))
+			return gpon_rd(0x1144);
+		udelay(1);
+	}
+	return 0xffffffffu;				/* ACK never set */
 }
 
 static int gpon_proc_show(struct seq_file *s, void *v)
@@ -1874,6 +2059,124 @@ static int gpon_proc_show(struct seq_file *s, void *v)
 		   gpon_rd(0x11a4), gpon_rd(0x11a8), gpon_rd(0x11ac));
 	seq_printf(s, "gem_ds_rx: omcc(f64)=%u f0=%u f1=%u  (>0 => OLT is sending DS GEM/OMCI)\n",
 		   gpon_gem_ds_rx_cnt(64), gpon_gem_ds_rx_cnt(0), gpon_gem_ds_rx_cnt(1));
+	/* GLOBAL CAM-independent de-assembly counters (the decisive OMCI detector):
+	 * UC_RX>0 => DS unicast GEM reaches the de-assembler; OMCI_RX>0 => it de-encapped
+	 * an OMCI frame; ETH_CRC_ERR>0 => frames arrive but fail FCS (then are dropped). */
+	seq_printf(s, "ds_misc: UC_RX=%u MC_RX=%u OMCI_RX=%u ETH_CRC_ERR=%u OVER_INTL=%u MC_LEAK=%u\n",
+		   gpon_gem_ds_misc_cnt(1), gpon_gem_ds_misc_cnt(0), gpon_gem_ds_misc_cnt(6),
+		   gpon_gem_ds_misc_cnt(4), gpon_gem_ds_misc_cnt(5), gpon_gem_ds_misc_cnt(3));
+	/* GTC-layer GEM health (direct regs): distinguishes "GEM arrives but FAILS" (FAIL
+	 * or HEC climbs => garble/sync) from "no GEM at all" (all flat). NON_IDLE/IDLE =
+	 * good frames; FAIL=0x11c0 LOS=0x11b4 HEC=0x11b8 frm_to(0x4098). */
+	seq_printf(s, "ds_gem: NON_IDLE=%u IDLE=%u FAIL=%u LOS=%u HEC=%u | frm_to(0x4098)=0x%x\n",
+		   gpon_rd(0x11c4), gpon_rd(0x11bc), gpon_rd(0x11c0),
+		   gpon_rd(0x11b4), gpon_rd(0x11b8), gpon_rd(0x4098));
+	/* DS pipeline stages for the OMCI frame (read with the gate open at O5):
+	 * A=de-encap pkt(f64)+global non-idle; B=PBO HIGH-queue(Q0) page cur/max;
+	 * C=DS SRAM pool used/peak; D=PON-IP->NIC RX_OK/MISS/ERR + init-ready.
+	 * Walk A->D: first 0 (or non-zero-meets-zero boundary) = the stall stage. */
+	{
+		u32 a = gpon_gem_flow_cnt(64, 0);
+		u32 q0 = pi_rd(0xa100), us = pi_rd(0xa0bc), sts = pi_rd(0xa0c8);
+		u32 ok = pi_rd(0xc010), ms = pi_rd(0xc018), er = pi_rd(0xc014);
+
+		seq_printf(s, "ds_pipe: A_deenc(f64)=%u nonidle=%u | B_q0cur=%u q0max=%u | C_sram=%u peak=%u | D_rxok=%u miss=%u err=%u initrdy=%u\n",
+			   a, gpon_rd(0x11c4),
+			   q0 & 0x1fff, (q0 >> 13) & 0x1fff,
+			   us & 0x1fff, sts & 0x1fff,
+			   ok & 0xffff, (ms >> 16) & 0xffff, er & 0xffff,
+			   pi_rd(0xa0c0) & 1);
+		/* DECISIVE break-localizer: FWD(f64)=GEM frames the GTC FORWARDED to the
+		 * PON-IP (0x404c/0x4050) vs A_deenc(=de-encap'd). media_sts(0x1bf0c058) bit18
+		 * = internal DS-GMII FORCELINK (stock ~0x106e8400). de-encap>FWD => GTC drops;
+		 * FWD>0 & C_sram flat => PON-IP rejects (descriptor base or DS-GMII down). */
+		seq_printf(s, "ds_fwd: FWD(f64)=%u FWD(f0)=%u | media_sts=0x%08x (bit18 link=%u)\n",
+			   gpon_gem_ds_fwd_cnt(64), gpon_gem_ds_fwd_cnt(0),
+			   pi_rd(0xc058), (pi_rd(0xc058) >> 18) & 1);
+		/* Read-back the DS-engine enables (a later reset may have cleared them):
+		 * ctl_ds expect 0x81 (CFG_PBUF_EN bit0 + bit7), io0_ds expect 0x90081070
+		 * (GMII_RX_EN bit5 + GMII_TX_EN bit4 must be set). */
+		seq_printf(s, "ds_en: ctl_ds(0xa0ac)=0x%08x io0_ds(0xd434)=0x%08x io1_ds(0xd438)=0x%08x\n",
+			   pi_rd(0xa0ac), pi_rd(0xd434), pi_rd(0xd438));
+		seq_printf(s, "ds_nic: cfg_ds(0xc04c)=0x%08x[RX_SID=%u] rxcfg_ds(0xc044)=0x%08x media_ds(0xc058)=0x%08x rxfdp_ds(0xd3f0)=0x%08x\n",
+			   pi_rd(0xc04c), pi_rd(0xc04c) & 0x7f, pi_rd(0xc044),
+			   pi_rd(0xc058), pi_rd(0xd3f0));
+		/* US-NIC arm (symmetric to DS) + US SID-64 classification, for ustx=0
+		 * triage: media_us(0x4058) must be 0x106e8400 (force-link UP), io0_us
+		 * GMII enables, gem_us_map[64](gpon 0x6500) the OMCC GEM port, sidvalid
+		 * word(0x2144) bit0, sid2qid words(0x2138/0x2130), omci_cfg(0x2154). */
+		seq_printf(s, "us_arm: media_us(0x4058)=0x%08x io0_us(0x5434)=0x%08x gemus_map64(0x6500)=0x%08x sidvld(0x2144)=0x%08x s2q(0x2138/0x2130)=0x%08x/0x%08x omcicfg(0x2154)=0x%08x\n",
+			   pi_rd(0x4058), pi_rd(0x5434), gpon_rd(0x6500),
+			   pi_rd(0x2144), pi_rd(0x2138), pi_rd(0x2130), pi_rd(0x2154));
+		/* PON-IP OMCI packet counters (vendor reg_list, SoC base 0x1b000000 ->
+		 * swcore offsets): OMCI_RX_PKT_CNT 0x329c0 (DS OMCI de-encapsulated by the
+		 * PON-IP, DISTINCT from my GTC 0x4064 idx6), DROP 0x329b8, CRC_ERR 0x329cc,
+		 * US_TX 0x329bc; PON_TRAP_CFG 0x111f8 [2:0]=OMCI_MPCP_PRIORITY. DECODER:
+		 * rx>0 & NIC filled=0 => de-encap OK but trap-to-CPU gap; drop>0 =>
+		 * SID/queue/PBO mapping rejecting the OMCI before it traps. */
+		seq_printf(s, "omci_pi: rx(0x329c0)=%u drop(0x329b8)=%u crcerr(0x329cc)=%u ustx(0x329bc)=%u trapcfg(0x111f8)=0x%08x\n",
+			   sw_rd(0x329c0), sw_rd(0x329b8), sw_rd(0x329cc),
+			   sw_rd(0x329bc), sw_rd(0x111f8));
+		/* US packet-engine TX counters (PI_PKT_OK_CNT_US 0x04010 / ERR 0x04014 /
+		 * MISS 0x04018). If the ONU transmits ANY upstream GEM on the OLT's BWMAP
+		 * grants these climb; us_tx_ok=0 => the ONU never fills its grants (US PLOAM
+		 * only, no US GEM packet engine) — the suspected reason the OLT deactivates
+		 * us ~42s after O5 without ever sending OMCI. */
+		seq_printf(s, "us_tx: ploam_acpt(0x119c)=%u bwm_acpt(0x11b0)=%u bwm_fail(0x11a4)=%u bwm_inv(0x11a8)=%u | us_onu_id=%u ds_cfg(0x1014)=0x%08x\n",
+			   gpon_rd(0x119c), gpon_rd(0x11b0), gpon_rd(0x11a4), gpon_rd(0x11a8),
+			   (gpon_rd(GPON_GTC_US_ONU_ID) >> 8) & 0xff, gpon_rd(0x1014));
+		/* Alloc CAM read-back: T-CONT 16 must hold alloc 0x400 (HIT) for the GTC to
+		 * accept the OLT's operational BWMAP grant on that alloc-id. */
+		{
+			u32 a16 = gpon_alloc_cam_read(16);
+
+			seq_printf(s, "us_alloc: tc16=alloc0x%x hit%u\n", a16 & 0xfff, !!(a16 & BIT(16)));
+		}
+		/* US GTC emission breakdown: PLOAM (idx2 cpu / idx3 auto) vs GEM (idx4 byte /
+		 * idx1 dbru) + per-T-CONT-16 idle-GEM (TCONT_IDLE_BYTE_STAT[16] = 0x6c00+16*64
+		 * = 0x7000). The decisive signature for "OLT deactivates ~42s, no OMCI": cpu>0
+		 * (ACKs egress) but gem_byte=0 AND idle16=0 (no US GEM fills the grants). */
+		/* OMCC US-emission detector. TCONT_IDLE_BYTE_STAT array base 0x6c00, stride 8
+		 * BYTES (reg_list "array offset 64"=64 BITS), 64-bit/entry: T-CONT 16 (OMCC) =
+		 * 0x6c00+16*8=0x6c80, T-CONT 8 (data) = 0x6c40. GEM_US_BYTE_STAT base 0x6800,
+		 * stride 8, flow 64 (OMCC) = 0x6800+64*8=0x6a00. If idle16/gemus64 climb the ONU
+		 * IS emitting US GEM on the OMCC (so the OLT should confirm it); if flat, the
+		 * OMCC US is silent = the OLT keeps re-Configure_Port-ID and withholds OMCI. */
+		seq_printf(s, "us_gtc: ploam_cpu=%u ploam_auto=%u | gem_byte=%u gem_dbru=%u | idle16=%u/%u idle8=%u gemus64=%u/%u | us_cfg=0x%04x pti=0x%08x\n",
+			   gpon_us_misc_cnt(2), gpon_us_misc_cnt(3),
+			   gpon_us_misc_cnt(4), gpon_us_misc_cnt(1),
+			   gpon_rd(0x6c80), gpon_rd(0x6c84), gpon_rd(0x6c40),
+			   gpon_rd(0x6a00), gpon_rd(0x6a04),
+			   gpon_rd(GPON_GTC_US_CFG), gpon_rd(0x6020));
+		/* CAM read-back: does the DS GEM CAM actually map gem->flow 64 at runtime?
+		 * e64 should read gem=2 (the OMCC) HIT=1; traffic_cfg[64] should be 0x4. */
+		{
+			u32 c64 = gpon_ds_cam_read(64), c0 = gpon_ds_cam_read(0);
+
+			seq_printf(s, "ds_cam: e64=gem%u hit%u tcfg64=0x%x | e0=gem%u hit%u\n",
+				   c64 & 0xfff, !!(c64 & BIT(16)),
+				   gpon_rd(0x1400 + 64 * 4) & 0x1f,
+				   c0 & 0xfff, !!(c0 & BIT(16)));
+		}
+	}
+	/* Full per-flow de-encap sweep: does ANY flow de-encapsulate a GEM frame?
+	 * If some flow > 0 => the OLT IS sending de-encodable GEM (find the OMCI
+	 * flow). If NONE => frames arrive but de-encap is globally not happening
+	 * (gem-port CAM / OMCI not classifying), or the OLT sends only idle GEM. */
+	{
+		int f, n = 0;
+
+		seq_printf(s, "ds_deenc_sweep:");
+		for (f = 0; f < 128; f++) {
+			u32 v = gpon_gem_flow_cnt(f, 0);
+
+			if (v && v != 0xffffffffu) {
+				seq_printf(s, " f%d=%u", f, v);
+				n++;
+			}
+		}
+		seq_printf(s, "%s\n", n ? "" : " (NONE de-encap)");
+	}
 	seq_printf(s, "io: io_mode_en=0x%08x gpio_en0=0x%08x gpio_en1=0x%08x  (operational 0x12050/0x40202006/0x819)\n",
 		   sw_rd(SOC_IO_MODE_EN), sw_rd(SOC_IO_GPIO_EN), sw_rd(SOC_IO_GPIO_EN + 4));
 
@@ -1966,12 +2269,16 @@ static int gpon_proc_show(struct seq_file *s, void *v)
 #define PLM_DS_DISABLE_SN		0x06
 #define PLM_DS_EXT_BURST_LENGTH		0x14
 #define PLM_DS_ENCRYPT_PORT		0x08	/* Encrypted_Port-ID (ACK) */
+#define PLM_DS_REQUEST_KEY		0x0d	/* Request_key (-> Encryption_Key) */
+#define PLM_DS_KEY_SWITCH		0x13	/* Key_Switching_Time (-> arm HW key switch) */
 #define PLM_DS_ASSIGN_ALLOC_ID		0x0a	/* Assign_Alloc-ID (ACK) */
 #define PLM_DS_CONFIG_PORT		0x0e	/* Configure_Port-ID (ACK) */
+#define PLM_US_ENCRYPT_KEY		0x05	/* US Encryption_Key response */
 #define PLM_US_SERIAL_NUMBER		0x01
 #define PLM_US_ACKNOWLEDGE		0x09	/* US Acknowledge message type */
 #define PLM_US_QUEUE_SN			0x6	/* US_PLOAM_IND[10:8] auto-SN queue */
 #define PLM_US_QUEUE_URG		0x1	/* US_PLOAM_IND[10:8] urgent queue (ACKs) */
+#define PLM_US_QUEUE_NOMSG		0x7	/* US_PLOAM_IND[10:8] HW auto-No_message slot */
 
 /* Parse "XPON12345678" -> {'X','P','O','N',0x12,0x34,0x56,0x78}. */
 static void gpon_parse_sn(const char *s)
@@ -2019,6 +2326,19 @@ static void gpon_send_cpu_ploam(u8 queue, const u8 m[12])
 {
 	u32 ind;
 	int i;
+
+	/* The CPU US-PLOAM path has a SINGLE transmit buffer (GPON_GTC_US_PLOAM_DATA) and
+	 * a self-clearing ENQ bit: the HW sends the enqueued message in the next granted US
+	 * PLOAM slot and clears ENQ. Back-to-back sends (the 6 Encryption_Key fragments, the
+	 * Acknowledge, the Key_Switching_Time ACK) otherwise overwrite the buffer before the
+	 * previous one is transmitted, so the OLT never receives the important Acknowledge
+	 * and re-cycles Configure_Port-ID forever (PLOAM_CPU_TX stays 0). Wait (bounded) for
+	 * ENQ to self-clear before reloading the buffer. */
+	for (i = 0; i < 1000; i++) {
+		if (!(gpon_rd(GPON_GTC_US_PLOAM_IND) & GPON_US_PLM_ENQ))
+			break;
+		udelay(5);
+	}
 
 	ind = gpon_rd(GPON_GTC_US_PLOAM_IND);
 	ind &= ~((0x7u << GPON_US_PLM_TYPE_SHIFT) | GPON_US_PLM_ENQ);
@@ -2072,6 +2392,76 @@ static void gpon_send_ack(const u8 *ds)
 }
 
 /*
+ * Respond to a downstream Request_key (0x0d): generate a 128-bit AES key and send it
+ * to the OLT in two upstream Encryption_Key (US type 0x05) PLOAM fragments
+ * (msg[2]=key_index, msg[3]=row, msg[4..11]=8 key bytes; row 0 = key[0..7], row 1 =
+ * key[8..15]). The OLT requests this during activation; an ONU that never returns a
+ * key can't complete config (it stalls before/at OMCI). Matches vendor
+ * gpon_ploam_key_tx. (HW decryption isn't programmed — the OMCC is unencrypted; this
+ * just satisfies the OLT's key exchange so config proceeds.)
+ */
+static u8 gpon_aes_key[16];
+static u8 gpon_key_index;
+static u32 gpon_aes_switch_time = 0xffffffff;	/* last Key_Switching_Time superframe (de-dup) */
+static bool gpon_key_staged;			/* a valid AES key is loaded in the staged bank */
+
+/* Program the 16-byte AES-128 key into the GPON hardware STAGED (next) key bank. After
+ * the ONU answers Request_Key with the upstream Encryption_Key it MUST also load that
+ * same key into hardware; the OLT then sends Key_Switching_Time (0x13) and the HW
+ * promotes the staged key to active at the given superframe. Without this load the OLT
+ * treats the key exchange as incomplete and keeps re-cycling Request_Key / Configure_
+ * Port-ID every ~15s, never advancing to OMCI. GPON-block regs (gpon_wr): SWITCH_REQ
+ * 0x3010 [15]=KEY_CFG_REQ(strobe) [14]=CFG_ACTIVE_KEY(0=staged); WORD_DATA 0x3024 [15:0];
+ * WORD_IND 0x3020 [15]=KEY_WR_REQ(strobe) [14]=KEY_WR_COMPL [2:0]=KEY_WORD_IDX. Word i
+ * carries key[2i] (high byte) | key[2i+1] (low byte); words 0..7 = key bytes 0..15. */
+static void gpon_aes_stage_key(const u8 *key)
+{
+	int idx, i;
+
+	gpon_wr(0x3010, 0x0000);			/* CFG_ACTIVE_KEY=0 (staged), REQ=0     */
+	gpon_wr(0x3010, 0x8000);			/* KEY_CFG_REQ 0->1: config staged bank */
+	for (idx = 0; idx < 8; idx++) {
+		gpon_wr(0x3024, ((u32)key[2 * idx] << 8) | key[2 * idx + 1]);
+		gpon_wr(0x3020, idx);			/* KEY_WORD_IDX=idx, KEY_WR_REQ=0       */
+		gpon_wr(0x3020, idx | 0x8000);		/* KEY_WR_REQ 0->1: latch word idx      */
+		for (i = 0; i < 200; i++) {		/* bounded; timeout != success          */
+			if (gpon_rd(0x3020) & BIT(14))	/* KEY_WR_COMPL                         */
+				break;
+			udelay(5);
+		}
+	}
+}
+
+static void gpon_send_key(void)
+{
+	u8 m[12];
+	int row, rep;
+
+	get_random_bytes(gpon_aes_key, sizeof(gpon_aes_key));
+	gpon_key_index++;
+	/* Send the SAME key 3x (6 PLOAMs total), matching the vendor (for i<3 around the
+	 * 2-fragment emit). The US PLOAM channel is lossy and the OLT re-issues Request_key
+	 * rapidly when it does not receive a complete key, stalling config; the redundant
+	 * triple-send maximises the chance the OLT accepts the key and proceeds. */
+	for (rep = 0; rep < 3; rep++) {
+		for (row = 0; row < 2; row++) {
+			memset(m, 0, sizeof(m));
+			m[0] = gpon_fsm_onu_id;		/* ONU-ID (HW may override)    */
+			m[1] = PLM_US_ENCRYPT_KEY;	/* 0x05 Encryption_Key         */
+			m[2] = gpon_key_index;
+			m[3] = row;			/* fragment row 0/1            */
+			memcpy(&m[4], gpon_aes_key + row * 8, 8);
+			gpon_send_cpu_ploam(PLM_US_QUEUE_URG, m);
+		}
+	}
+	/* Load the SAME key into the HW staged bank (the OLT waits for this before OMCI). */
+	gpon_aes_stage_key(gpon_aes_key);
+	gpon_key_staged = true;
+	pr_info("rtl9602c-gpon: Request_key -> sent Encryption_Key idx %u (3x2 frags) + staged in HW\n",
+		gpon_key_index);
+}
+
+/*
  * OMCI channel (OMCC) GEM datapath. After ranging the OLT assigns the OMCC GEM
  * port via Configure_Port-ID; install it at the fixed RTL9602C OMCI flow/SID 64
  * (T-CONT 16) so DS OMCI GEM frames are de-encapsulated + trapped to the CPU and
@@ -2085,13 +2475,22 @@ static void gpon_send_ack(const u8 *ds)
 #define   DS_PORT_OP_COMPL	BIT(14)
 #define   DS_PORT_OP_WRITE	BIT(8)		/* OP_MODE = WRITE(1) */
 #define GPON_GTC_DS_PORT_WR	0x1104		/* [11:0] gemPortId */
-#define GPON_GTC_DS_TRAFFIC_CFG	0x1400		/* +flow*4, [4:0] traffic-type */
+#define GPON_GTC_DS_TRAFFIC_CFG	0x1400		/* array: base 0x1400, STRIDE 4 bytes, idx
+						 * 0..127, [4:0] traffic-type. The vendor reg_list
+						 * "array offset"=32 is in BITS (32b = 4 bytes), NOT
+						 * bytes — confirmed on a live online stock ONU whose
+						 * tcfg[64] sits at 0x1500 (=0x1400+64*4)=0x4, with
+						 * 0x1c00 empty. (A 0x20 stride wrote outside the
+						 * 0x1400..0x1600 array, into the void.) */
+#define   DS_TRAFFIC_CFG_STRIDE	4u
 #define   DS_TRAFFIC_IS_OMCI	BIT(2)
-#define GPON_GTC_GEM_US_PORT_MAP 0x6400		/* +flow*4, [11:0] gemPortId */
+#define GPON_GTC_GEM_US_PORT_MAP 0x6400		/* array: base 0x6400, STRIDE 0x20 (vendor
+						 * reg_list "array offset"=32), idx 0..127,
+						 * [11:0] gemPortId. NOT stride 4. */
 #define GPON_GTC_DS_OMCI_PTI	0x1204		/* [6:4] PTI_MASK [2:0] END_PTI */
 #define   DS_OMCI_PTI_VAL	((1u << 4) | 1u)	/* mask=1 ptn=1 -> 0x11 */
 #define GPON_GEM_DS_MC_CFG	0x4080		/* [6] BROADCAST_PASS [4] NON_MULTICAST_PASS [3] FCS_CHK_EN */
-#define   GEM_DS_MC_CFG_VAL	0x18u		/* NON_MULTICAST_PASS(4)|FCS_CHK_EN(3): pass unicast OMCI, NOT broadcast (avoids DS flood backup that stalls US); the full operating value is 0x59 (adds BROADCAST_PASS+bit0) */
+#define   GEM_DS_MC_CFG_VAL	0x59u		/* stock O5 operating value (read live from an online stock ONU): BROADCAST_PASS(6)|NON_MULTICAST_PASS(4)|FCS_CHK_EN(3)|bit0. The earlier 0x18 (no broadcast/bit0) was a wrong "avoid US stall" guess — stock runs 0x59 stably online with OMCI flowing. */
 #define PI_PON_SID2QID		0x020f8		/* packed 7b/SID: physical queue */
 #define PI_PON_SIDVALID		0x0213c		/* packed 1b/SID */
 #define PI_PON_OMCI_CFG		0x02154		/* [6:0] OMCI SID */
@@ -2116,6 +2515,9 @@ static int gpon_install_omcc(u16 gem)
 {
 	int i;
 
+	/* Wipe stale/garbage CAM entries first so none shadow the OMCC gem at lookup. */
+	gpon_ds_cam_clear_all();
+
 	/* DS GEM-port CAM: map gem -> flow 64, mark isOMCI. */
 	gpon_wr(GPON_GTC_DS_PORT_IND, DS_PORT_OP_WRITE | (GPON_OMCC_FLOW & 0x7f));
 	gpon_wr(GPON_GTC_DS_PORT_WR, gem & 0xfff);
@@ -2130,7 +2532,8 @@ static int gpon_install_omcc(u16 gem)
 		pr_err("rtl9602c-gpon: OMCC DS GEM install timeout\n");
 		return -ETIMEDOUT;
 	}
-	gpon_wr(GPON_GTC_DS_TRAFFIC_CFG + GPON_OMCC_FLOW * 4, DS_TRAFFIC_IS_OMCI);
+	gpon_wr(GPON_GTC_DS_TRAFFIC_CFG + GPON_OMCC_FLOW * DS_TRAFFIC_CFG_STRIDE,
+		DS_TRAFFIC_IS_OMCI);
 
 	/* DS OMCI PTI: tell the GTC how to detect the end of an OMCI GEM frame for
 	 * reassembly (PTI_MASK[6:4]=1 compares GEM-header PTI bit0; END_PTI[2:0]=1 =
@@ -2138,29 +2541,56 @@ static int gpon_install_omcc(u16 gem)
 	 * the GTC never recognises an OMCI frame boundary and drops every downstream
 	 * OMCI frame — the reason DS OMCI never reaches the CPU. Operating value 0x11. */
 	gpon_wr(GPON_GTC_DS_OMCI_PTI, DS_OMCI_PTI_VAL);
+	/* A live online stock ONU sets the ADJACENT DS-PTI registers too — 0x1200 and
+	 * 0x1208 both = 0x11, same as the OMCI PTI 0x1204. My driver set only 0x1204 and
+	 * the DS de-encap/reassembly produced NOTHING (DS SRAM flat, PKT_OK_DS=0, no OMCI
+	 * to the CPU). 0x1200 is the GENERAL DS-PTI / frame-boundary config the reassembly
+	 * engine needs for ANY flow; 0x1208 = the eth-PTI. Set both to stock's 0x11. */
+	gpon_wr(0x1200, DS_OMCI_PTI_VAL);	/* general DS-PTI (stock O5 = 0x11) */
+	gpon_wr(0x1208, DS_OMCI_PTI_VAL);	/* eth DS-PTI (stock O5 = 0x11)     */
 
 	/* GEM DS pass config: WITHOUT NON_MULTICAST_PASS (bit4) the GTC drops every
 	 * unicast downstream GEM frame BEFORE de-encapsulation — including OMCI, which
 	 * the OLT sends unicast on the OMCC GEM port — so OMCI never reaches the flow
 	 * datapath or the CPU (DS GEM RX counter stays 0). At reset this register is 0.
-	 * The O5 operating value 0x59 = BROADCAST_PASS(6) | NON_MULTICAST_PASS(4) | FCS_CHK_EN(3).
-	 * DISABLED for now: opening this gate lets de-encapsulated unicast OMCI flow, but
-	 * the PON-IP -> GMAC-NIC drain is not yet built, so the frames back up and the US
-	 * stalls (deactivate ~48s). Re-enable once the PON-IP->host OMCI DMA path lands. */
-	if (gem_gate_open)
-		gpon_wr(GPON_GEM_DS_MC_CFG, GEM_DS_MC_CFG_VAL);
+	 * The O5 operating value 0x59 = BROADCAST_PASS(6) | NON_MULTICAST_PASS(4) | FCS_CHK_EN(3) | bit0.
+	 * Now written UNCONDITIONALLY: a live online stock ONU runs 0x59 with the US
+	 * stable, so the earlier "US stall" fear (which gated this behind gem_gate_open
+	 * and used a partial 0x18) was wrong — the stall came from the partial value's
+	 * broadcast/bit0 mishandling, not from opening the gate. */
+	gpon_wr(GPON_GEM_DS_MC_CFG, GEM_DS_MC_CFG_VAL);
+
+	/* GEM-DS reassembly flush/forward timer (GPON_GEM_DS_FRM_TIMEOUT 0x4098,
+	 * ASSM_TIMEOUT_FRM[4:0]). The vendor writes 16 UNCONDITIONALLY at device init
+	 * (gpon_res default assemble_timer=16). FRM_TIMEOUT field map: [4:0]
+	 * ASSM_TIMEOUT_FRM, [8] OMCI_TR_MODE, [15:14] DEBUG_BUS_SEL. The hardware RESET
+	 * default is 0x8110 (OMCI_TR_MODE=1) and the vendor only ever FIELD-writes the
+	 * assemble timer (bits[4:0]), PRESERVING OMCI_TR_MODE=1. A full write of 0x10
+	 * (as done before) CLEARS OMCI_TR_MODE — and with OMCI transparent mode off the
+	 * DS GEM de-assembler does not pass OMCI frames, so the GEM-DS MISC counters
+	 * (UC_RX/OMCI_RX) stay 0 and no OMCI ever reaches the CPU. Field-write only. */
+	gpon_field(0x4098, 8, 8, 1);		/* OMCI_TR_MODE = 1 (stock reset default) */
+	gpon_field(0x4098, 4, 0, 16);		/* ASSM_TIMEOUT_FRM = 16 frames */
 
 	/* US GEM-port map for flow 64. */
-	gpon_wr(GPON_GTC_GEM_US_PORT_MAP + GPON_OMCC_FLOW * 4, gem & 0xfff);
+	gpon_wr(GPON_GTC_GEM_US_PORT_MAP + GPON_OMCC_FLOW * DS_TRAFFIC_CFG_STRIDE,
+		gem & 0xfff);
 
-	/* PON-IP: flow->queue, SID-valid, OMCI-SID, DS PBO high queue. */
+	/* PON-IP: SID-valid + OMCI-SID. CONFIRMED against LIVE stock O5: SIDVALID[64]=1,
+	 * OMCI_CFG=0x40. SID_Q_MAP_DS[64] is 0 on stock (NOT the HIGH queue 2 I set
+	 * before) — DS OMCI reaches the CPU purely via the GMAC CPUtag SID-64 trap, not a
+	 * PBO queue. My SID_Q_MAP_DS[64]=2 MISROUTED the de-encapped OMCI away from the
+	 * CPU. Write 0 to match stock. */
 	pi_packed_set(PI_PON_SID2QID, GPON_OMCC_FLOW, 7, GPON_OMCC_PHYS_QID & 0x7f);
 	pi_packed_set(PI_PON_SIDVALID, GPON_OMCC_FLOW, 1, 1);
 	pi_field(PI_PON_OMCI_CFG, 6, 0, GPON_OMCC_FLOW);
-	pi_packed_set(PI_PON_SID_Q_MAP_DS, GPON_OMCC_FLOW, 2, GPON_OMCC_DSQ_HIGH);
+	pi_packed_set(PI_PON_SID_Q_MAP_DS, GPON_OMCC_FLOW, 2, 0);
 
-	/* Arm the NIC OMCI trap so DS stream-64 frames reach the CPU netdev. */
+	/* Arm the NIC OMCI trap so DS stream-64 frames reach the CPU netdev, and hand
+	 * the eth driver this board's 8-byte ONU-SN so its OMCI ONU-G GET reply reports
+	 * a Vendor-ID/Serial matching the PLOAM Serial_Number the OLT ranged. */
 	rtl9602c_eth_set_omci_sid(GPON_OMCC_FLOW);
+	rtl9602c_eth_set_omci_identity(gpon_sn_bytes);
 
 	pr_info("rtl9602c-gpon: OMCC installed gem=%u flow=%u (compl %d)\n",
 		gem, GPON_OMCC_FLOW, i);
@@ -2195,6 +2625,33 @@ static int gpon_install_tcont(u8 tcont, u16 alloc)
 		pr_err("rtl9602c-gpon: T-CONT alloc bind timeout\n");
 		return -ETIMEDOUT;
 	}
+
+	/* PON-MAC US scheduler activation — the half of the vendor ponmac_queue_add our
+	 * driver omitted. The GTC alloc CAM above binds the OLT Alloc-ID to the T-CONT for
+	 * BWMAP grants, but the PON-IP scheduler never knew T-CONT 16 / physical queue 64
+	 * was a live member, so the ONU could not actually transmit US GEM on it. The OLT
+	 * then never sees the upstream T-CONT operate, stays Config State "initial" and
+	 * never starts OMCI (so DS OMCI never arrives — gem-2 frames never reach our
+	 * correctly-programmed flow-64 CAM). Activate: enable the T-CONT, put its logical
+	 * queue 0 in the schedule mask, give physical queue 64 STRICT type + MAX PIR/CIR,
+	 * and (RTL9602C = rev A) clear PON_GEN_PIR_DROP "due to the tcont 16". Offsets are
+	 * PON-IP driver-relative (phys - 0xF00000); physicalQid = 32*(16/8)+0 = 64. */
+	{
+		/* physicalQid = TCONT_QUEUE_MAX(32) * (tcont/8) + logical-queue-0.
+		 * T-CONT 0 -> qid 0 (default/mgmt), T-CONT 16 -> qid 64 (OMCC). Both qids
+		 * are 32-bit-word-aligned in the 18-bit PIR/CIR arrays (0*18, 64*18=1152),
+		 * so a single [17:0] field write per qid is exact. */
+		u8 qid = 32 * (tcont / 8);
+		u32 rwd = (qid * 18) / 32;			/* PIR/CIR word index for qid */
+
+		pi_field(0x023e4 + (tcont / 32) * 4, tcont % 32, tcont % 32, 1); /* PON_TCONT_EN[tcont] */
+		pi_wr(0x023a0 + tcont * 4, 0x1);		/* PON_SCH_QMAP[tcont] = logical-q0 */
+		pi_field(0x0229c + rwd * 4, 17, 0, 0x3ffff);	/* PON_QID_PIR_RATE[qid] = MAX */
+		pi_field(0x02198 + rwd * 4, 17, 0, 0x3ffff);	/* PON_QID_CIR_RATE[qid] = MAX */
+		pi_field(0x023e8 + (qid / 32) * 4, qid % 32, qid % 32, 0); /* PON_WFQ_TYPE[qid] = STRICT */
+		pi_field(0x02194, 18, 18, 0);			/* PON_SCH_CTRL.PON_GEN_PIR_DROP = 0 */
+	}
+
 	pr_info("rtl9602c-gpon: T-CONT %u <- alloc 0x%x bound (compl %d)\n",
 		tcont, alloc, i);
 	return 0;
@@ -2349,6 +2806,14 @@ static void gpon_fsm_handle(const u8 *m)
 			gpon_fsm_onu_id = d[0];
 			gpon_field(GPON_GTC_US_ONU_ID, 15, 8, gpon_fsm_onu_id);
 			gpon_field(GPON_GTC_DS_ONU_STATUS, 15, 8, gpon_fsm_onu_id);
+			/* Bind the DEFAULT/management Alloc-ID (= ONU-ID, per G.984.3) to the
+			 * OMCC's T-CONT 16 (NOT T-CONT 0). Pre-config the OLT grants only this
+			 * default alloc for PLOAM/OMCI, and per the vendor it owns the OMCC
+			 * T-CONT, so its grants must serve the OMCC US queue (phys qid 64). With
+			 * it on an empty T-CONT 0 the OMCC upstream is never drained, the OLT
+			 * sees the OMCC half-dead and WITHHOLDS DS OMCI. (The separate data
+			 * Alloc-ID 0x400 is bound to T-CONT 8 on Assign_Alloc-ID.) */
+			gpon_install_tcont(GPON_OMCC_TCONT, gpon_fsm_onu_id);
 			pr_info("rtl9602c-gpon: OLT assigned ONU-ID %u\n",
 				gpon_fsm_onu_id);
 			gpon_fsm_set_state(4);
@@ -2372,6 +2837,8 @@ static void gpon_fsm_handle(const u8 *m)
 	case PLM_DS_DISABLE_SN:
 		if (onu_id == gpon_fsm_onu_id || onu_id == 0xff) {
 			gpon_fsm_onu_id = 0xff;
+			gpon_aes_switch_time = 0xffffffff;	/* re-arm 0x13 on next activation */
+			gpon_key_staged = false;
 			gpon_fsm_set_state(1);
 		}
 		break;
@@ -2409,12 +2876,21 @@ static void gpon_fsm_handle(const u8 *m)
 		}
 		break;
 	case PLM_DS_ASSIGN_ALLOC_ID:
-		/* Assign_Alloc-ID (0x0a): bind the OLT's Alloc-ID (alloc=(d[0]<<4)|
-		 * (d[1]>>4)) to the OMCC T-CONT so the ONU answers BWMAP grants for it
-		 * (d[2]: 0x01=allocate, 0xff=deallocate). Then Acknowledge. */
+		/* Assign_Alloc-ID (0x0a): bind the OLT's separate DATA Alloc-ID
+		 * (alloc=(d[0]<<4)|(d[1]>>4)) to a DATA T-CONT (8), NOT the OMCC T-CONT 16
+		 * (which now belongs to the management Alloc-ID = ONU-ID, set at Assign_ONU-ID,
+		 * so two allocs do not collide on T-CONT 16). (d[2]: 0x01=allocate,
+		 * 0xff=deallocate.) Then Acknowledge. */
 		if (onu_id == gpon_fsm_onu_id) {
 			u16 alloc = ((u16)d[0] << 4) | (d[1] >> 4);
 
+			/* THE alloc the OLT assigns here (e.g. 0x400) is the OMCC's upstream
+			 * Alloc-ID, NOT a data Alloc-ID: bind it to the OMCC T-CONT 16 (overwriting
+			 * the placeholder ONU-ID bind from Assign_ONU-ID). The OLT grants ONLY this
+			 * Alloc-ID pre-OMCI; binding it to a separate T-CONT 8 left the OMCC T-CONT 16
+			 * (on the ungranted ONU-ID alloc) SILENT — TCONT_IDLE[16]=0 — so the OLT never
+			 * saw the OMCC upstream operate, kept re-Configure_Port-ID and withheld OMCI.
+			 * On stock this same alloc is bound to T-CONT 16 and its OMCC emits (~10M). */
 			if (d[2] == 0x01 && !gpon_tcont_installed) {
 				if (!gpon_install_tcont(GPON_OMCC_TCONT, alloc))
 					gpon_tcont_installed = true;
@@ -2422,6 +2898,35 @@ static void gpon_fsm_handle(const u8 *m)
 			gpon_send_ack(m);
 			pr_info_ratelimited("rtl9602c-gpon: ACK type=0x%02x d=%*phN\n",
 					    type, 8, d);
+		}
+		break;
+	case PLM_DS_REQUEST_KEY:
+		/* OLT requests a downstream AES key; reply with Encryption_Key (US 0x05). */
+		if (onu_id == gpon_fsm_onu_id)
+			gpon_send_key();
+		break;
+	case PLM_DS_KEY_SWITCH:
+		/* Key_Switching_Time (0x13): the OLT supplies the 30-bit superframe count at
+		 * which the HW promotes the staged AES key (loaded by gpon_send_key) to active.
+		 * Arm the HW comparator (write SWITCH_SUPERFRAME) and Acknowledge. The OLT will
+		 * not advance to OMCI until this key handshake completes, so a missing 0x13
+		 * handler leaves it re-cycling Request_Key/Configure_Port-ID forever. De-dup the
+		 * register write per superframe (the OLT re-sends 0x13 every cycle). */
+		if (onu_id == gpon_fsm_onu_id || onu_id == 0xff) {
+			u32 fc = ((u32)(d[0] & 0x3f) << 24) | ((u32)d[1] << 16) |
+				 ((u32)d[2] << 8) | d[3];
+
+			/* Only arm the HW key-switch once we have actually loaded a key into
+			 * the staged bank (via Request_Key); arming a switch to an empty/stale
+			 * staged bank would promote a garbage key and corrupt AES. ACK either way
+			 * so the OLT sees the message handled. */
+			if (gpon_key_staged && fc != gpon_aes_switch_time) {
+				gpon_aes_switch_time = fc;
+				gpon_wr(0x3014, fc);	/* AES_KEY_SWITCH_TIME[29:0] */
+				pr_info("rtl9602c-gpon: Key_Switching_Time -> arm switch @superframe %u\n",
+					fc);
+			}
+			gpon_send_ack(m);
 		}
 		break;
 	case PLM_DS_ENCRYPT_PORT:
@@ -2441,6 +2946,24 @@ static void gpon_fsm_poll(struct timer_list *t)
 	int guard = 0;
 
 	gpon_fsm_ticks++;
+	/* SN was (re)provisioned after ranging began (the driver started with the
+	 * placeholder SN, which the OLT auto-ranges as a phantom that never matches
+	 * the provisioned ONU). Drop to O1 and re-offer the new Serial_Number. */
+	if (gpon_sn_changed) {
+		gpon_sn_changed = false;
+		if (gpon_fsm_state > 1) {
+			gpon_fsm_onu_id = 0xff;
+			gpon_omcc_installed = false;
+			gpon_tcont_installed = false;
+			gpon_aes_switch_time = 0xffffffff;
+			gpon_key_staged = false;
+			gpon_field(GPON_GTC_DS_ONU_STATUS, 15, 8, 0xff);
+			gpon_field(GPON_GTC_US_ONU_ID, 15, 8, 0xff);
+			gpon_fsm_set_state(1);
+			pr_info("rtl9602c-gpon: SN reprovisioned (%8phN) -> re-ranging\n",
+				gpon_sn_bytes);
+		}
+	}
 	while (!(gpon_rd(GPON_GTC_DS_PLOAM_IND) & GPON_DS_PLM_BUF_EMPTY) &&
 	       guard++ < 16) {
 		u8 m[13];
@@ -2449,6 +2972,23 @@ static void gpon_fsm_poll(struct timer_list *t)
 		gpon_fsm_handle(m);
 		gpon_ds_rx++;					/* DS-lock liveness */
 		gpon_wr(GPON_GTC_DS_PLOAM_IND, GPON_DS_PLM_DEQ);	/* advance */
+	}
+	/* DS-PIPELINE STAGE PROBE (gate open + O5): sample ~1/s to localize where a
+	 * de-encapsulated OMCI frame stalls during the short O5 window before any
+	 * deactivate. A=de-encap, B=PBO HIGH-queue, C=DS SRAM, D=PON-IP->NIC. The
+	 * FIRST 0 (or non-zero-meets-zero boundary) A->D is the stall stage. */
+	if (gem_gate_open && gpon_fsm_state == 5 && (gpon_fsm_ticks % 100) == 0) {
+		/* de-encap pkt count per flow index: f64=OMCC flow, f3=OMCC gem,
+		 * f0/f1/f2=low flows. Localizes whether OMCI de-encaps ANYWHERE
+		 * (mapping issue) vs nowhere (OLT not sending OMCI). */
+		pr_emerg("DSPIPE deenc f64=%u f3=%u f2=%u f1=%u f0=%u | nonidle=%u idle=%u los=%u hec=%u | sram=%u q0=%u rxok=%u\n",
+			 gpon_gem_flow_cnt(64, 0), gpon_gem_flow_cnt(3, 0),
+			 gpon_gem_flow_cnt(2, 0), gpon_gem_flow_cnt(1, 0),
+			 gpon_gem_flow_cnt(0, 0),
+			 gpon_rd(0x11c4), gpon_rd(0x11bc), gpon_rd(0x11b4),
+			 gpon_rd(0x11b8),
+			 pi_rd(0xa0bc) & 0x1fff, pi_rd(0xa100) & 0x1fff,
+			 pi_rd(0xc010) & 0xffff);
 	}
 	/* Periodic SerDes-TX re-sync while UN-RANGED. The upstream-burst serializer
 	 * lock is non-deterministic (the OLT decodes our SN burst only intermittently —
@@ -2661,6 +3201,13 @@ skip_bosa_init:
 			     GPON_US_CFG_VAL | (force_laser ? BIT(15) : 0));
 	if (force_laser)
 		pr_info("rtl9602c-gpon: force_laser=1 -> US_CFG.FS_LON set (CW diagnostic)\n");
+	/* US GEM-header PTI vector (GPON_GEM_US_PTI_CFG 0x6020, NOT write-protected).
+	 * Vendor gpon_res.c sets gemUsPtiVector_set(0,1,0,1) => PTI_VECTOR1[6:4]=1,
+	 * PTI_VECTOR3[14:12]=1 => 0x00001010 (FS_GEM_IDLE[31]=0 keeps auto-idle). Reset
+	 * is 0, so every US GEM frame (incl OMCC OMCI responses) carries PTI=000 even on
+	 * end-of-fragment; the vendor comment: "For ALU OLT it only accepts OMCI with
+	 * NON_END_FRAG=0 and END_FRAG=1." Set it so the upstream GEM/OMCC is well-formed. */
+	gpon_wr(0x6020, 0x00001010);
 	gpon_wr_us_protected(GPON_GTC_US_LASER, GPON_US_LASER_VAL);
 
 	/*
@@ -2701,9 +3248,30 @@ skip_bosa_init:
 	 */
 	gpon_field(GPON_GTC_DS_ONU_STATUS, 15, 8, 0xff);	/* DS ONU-ID = broadcast */
 	gpon_field(GPON_GTC_US_ONU_ID, 15, 8, 0xff);		/* US ONU-ID = broadcast */
-	gpon_field(0x1014, 11, 11, 1);				/* DS_CFG BWM_NO_FLT = 1 */
+	gpon_field(0x1014, 11, 11, 0);				/* DS_CFG BWM_NO_FLT = 0 (stock value; the
+								 * bring-up =1 "accept all grants" left bwm_acpt=0
+								 * (vs stock 130k+), i.e. it broke the BWMAP parser
+								 * rather than relaxing it — filter by US_ONU_ID
+								 * like stock: 0xff during ranging, assigned id at O5) */
 	gpon_wr(GPON_GTC_US_PLOAM_CFG,
 		GPON_US_PLM_CRC_GEN_EN | GPON_US_PLM_ONUID_OVRD);
+	/* Arm the HW auto-No_message PLOAM keepalive (US_PLOAM_IND queue type 0x7). At
+	 * O5 the OLT continuously grants the ONU's default Alloc-ID a PLOAM slot and reads
+	 * back what we emit; the GTC auto-fills every otherwise-empty granted PLOAM slot
+	 * with this latched No_message (US type 0x04) template. WITHOUT it our granted
+	 * slots carry zeroed/invalid PLOAMs once the ACK/key bursts drain, so the OLT
+	 * never confirms a continuously-alive upstream PLOAM/OMCC channel, keeps re-issuing
+	 * Configure_Port-ID/Request_key and WITHHOLDS DS OMCI. The vendor loads this
+	 * unconditionally in gpon_ploam_init. One call latches the persistent template;
+	 * /proc/gpon us_gtc:ploam_auto should then climb on every OLT grant. */
+	{
+		u8 nomsg[12];
+
+		memset(nomsg, 0xaa, sizeof(nomsg));
+		nomsg[0] = 0xff;		/* ONU-ID (HW overrides via ONUID_OVRD)  */
+		nomsg[1] = 0x04;		/* GPON_PLOAM_US_NOMESSAGE                */
+		gpon_send_cpu_ploam(PLM_US_QUEUE_NOMSG, nomsg);
+	}
 	gpon_wr(GPON_GTC_US_WRITE_PROTECT, GPON_US_WP_UNLOCK);
 	gpon_field(0x5200, 0, 0, 1);				/* US_PROC_MODE AUTO_PROC_SSTART */
 	gpon_wr(GPON_GTC_US_WRITE_PROTECT, GPON_US_WP_LOCK);

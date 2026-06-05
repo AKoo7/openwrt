@@ -14,4 +14,9 @@
  * rtl9602c_eth.c; called from the GPON Configure_Port-ID handler. */
 void rtl9602c_eth_set_omci_sid(unsigned int sid);
 
+/* Provision the ONU identity (G.984.3 ONU-SN: 4 ASCII vendor + 4 serial bytes)
+ * so the eth driver's OMCI responder reports an ONU-G Vendor-ID/Serial matching
+ * the PLOAM Serial_Number the OLT ranged. Provided by rtl9602c_eth.c. */
+void rtl9602c_eth_set_omci_identity(const u8 *sn8);
+
 #endif /* _RTL9602C_GPON_NIC_H */
