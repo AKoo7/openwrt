@@ -3050,6 +3050,18 @@ static int gpon_proc_show(struct seq_file *s, void *v)
 	seq_printf(s, "bosa_apc: W69_245=%02x(loopmode) W58_23a=%02x(iavg) W72_248=%02x(biasmax) W73_249=%02x(biasmin 0x2a)\n",
 		   bosa_read_reg(0x245) & 0xff, bosa_read_reg(0x23a) & 0xff,
 		   bosa_read_reg(0x248) & 0xff, bosa_read_reg(0x249) & 0xff);
+	/* SerDes/serializer run-state vs LIVE working-stock O5 (stock_usburst.txt
+	 * golden in [..]). Decisive good-vs-bad-boot diff for the cold-start US-TX
+	 * serializer lock: any reg that DIVERGES from the [stock] value on a
+	 * non-leasing boot is a live-confirmed candidate (unlike the transient
+	 * mode_set disasm values, which are overwritten by the CDR reset). */
+	seq_printf(s, "sds_run: 280c=%04x[3106] 281c=%04x[1359] 225a0=%04x[713] 220a8=%04x[2] 225d8=%04x[29]\n",
+		   sw_rd(0x2280c) & 0xffff, sw_rd(0x2281c) & 0xffff,
+		   sw_rd(0x225a0) & 0xffff, sw_rd(0x220a8) & 0xffff,
+		   sw_rd(0x225d8) & 0xffff);
+	seq_printf(s, "sds_ext: 22a2c=%04x[0] 22a30=%04x[4] 22a34=%04x[326a]\n",
+		   sw_rd(0x22a2c) & 0xffff, sw_rd(0x22a30) & 0xffff,
+		   sw_rd(0x22a34) & 0xffff);
 	return 0;
 }
 
