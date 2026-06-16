@@ -246,6 +246,12 @@ bool rtl92fe_phy_bb_config(struct ieee80211_hw *hw)
 	rtl_write_word(rtlpriv, REG_SYS_FUNC_EN, regval | BIT(0) | BIT(1));
 
 	rtl_write_byte(rtlpriv, REG_RF_CTRL, RF_EN | RF_RSTB | RF_SDMRSTB);
+	/* Release RF path S0 (MAC reg 0x7B, distinct from radio RF_OPTION3 0x7B):
+	 * vendor pairs S1@0x1F with S0@0x7B (8192cd_hw.c:18163-18164). Without
+	 * this the second RF path stays in reset and on-air TX is dark.
+	 */
+	rtl_write_byte(rtlpriv, 0x7B, 0x00);
+	rtl_write_byte(rtlpriv, 0x7B, RF_EN | RF_RSTB | RF_SDMRSTB);
 
 	/* 8192F MAC-loopback workaround: LDOHCI12 + SWR_CTRL2 nudge before
 	 * the BB tables are pushed.

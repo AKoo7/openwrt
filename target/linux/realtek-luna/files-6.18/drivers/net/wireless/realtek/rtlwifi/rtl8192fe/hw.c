@@ -1537,6 +1537,25 @@ int rtl92fe_hw_init(struct ieee80211_hw *hw)
 		rtl_get_rfreg(hw, RF90_PATH_A, RF_CHNLBW, RFREG_OFFSET_MASK),
 		rtl_get_rfreg(hw, RF90_PATH_B, RF_CHNLBW, RFREG_OFFSET_MASK));
 
+	/* Post-IQK operating dump: TX-IQ correction result (0xc80/0xc94 path A,
+	 * 0xc88/0xc9c path B), TX path-enable (0x90c), TX-AGC rate18-06 (0xe00)
+	 * and RF mode 0x00 for both paths. Diff path-A 0xc80/0xc94/0xe00/RF0x00
+	 * against the working stock twin: a 0xc80 stuck at the table default
+	 * 0x40000100 with reg_e94==0x100/reg_e9c==0 means IQK produced no TX-IQ
+	 * correction (ran but failed -> identity), while a non-default 0xc80 with
+	 * a sane gain (~0x100 in [31:22]) and small phase means IQK took. */
+	pr_info("rtl8192fe: PHY op: 0xc80=0x%08x 0xc94=0x%08x 0xc88=0x%08x 0xc9c=0x%08x 0x90c=0x%08x 0xe00=0x%08x RF_A[0x00]=0x%05x RF_B[0x00]=0x%05x iqk{e94=0x%x e9c=0x%x eb4=0x%x ebc=0x%x}\n",
+		rtl_get_bbreg(hw, ROFDM0_XATXIQIMBALANCE, MASKDWORD),
+		rtl_get_bbreg(hw, ROFDM0_XCTXAFE, MASKDWORD),
+		rtl_get_bbreg(hw, ROFDM0_XBTXIQIMBALANCE, MASKDWORD),
+		rtl_get_bbreg(hw, ROFDM0_XDTXAFE, MASKDWORD),
+		rtl_get_bbreg(hw, 0x90c, MASKDWORD),
+		rtl_get_bbreg(hw, RTXAGC_A_RATE18_06, MASKDWORD),
+		rtl_get_rfreg(hw, RF90_PATH_A, RF_AC, RFREG_OFFSET_MASK),
+		rtl_get_rfreg(hw, RF90_PATH_B, RF_AC, RFREG_OFFSET_MASK),
+		(u32)rtlphy->reg_e94, (u32)rtlphy->reg_e9c,
+		(u32)rtlphy->reg_eb4, (u32)rtlphy->reg_ebc);
+
 	rtl_dbg(rtlpriv, COMP_INIT, DBG_LOUD,
 		"end of Rtl8192FE hw init %x\n", err);
 	return 0;

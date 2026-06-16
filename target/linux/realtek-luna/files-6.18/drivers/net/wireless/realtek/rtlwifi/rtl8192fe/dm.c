@@ -22,6 +22,11 @@
  * DIG bounds) carry 8192F values.
  */
 
+static int rtl92fe_dump_rf;
+module_param_named(dump_rf, rtl92fe_dump_rf, int, 0644);
+MODULE_PARM_DESC(dump_rf,
+		 "set 1 to one-shot dump operating RF/BB/MAC-AFE regs in the dm watchdog");
+
 static void rtl92fe_dm_false_alarm_counter_statistics(struct ieee80211_hw *hw)
 {
 	u32 ret_value;
@@ -1174,4 +1179,27 @@ void rtl92fe_dm_watchdog(struct ieee80211_hw *hw)
 		rtl92fe_dm_txpower_tracking_callback(hw);
 	}
 	spin_unlock(&rtlpriv->locks.rf_ps_lock);
+
+	if (rtl92fe_dump_rf) {
+		rtl92fe_dump_rf = 0;
+		pr_info("rtl8192fe RFdump RF_A 00=%05x 18=%05x 33=%05x b2=%05x df=%05x | RF_B 00=%05x 18=%05x df=%05x\n",
+			rtl_get_rfreg(hw, RF90_PATH_A, 0x00, RFREG_OFFSET_MASK),
+			rtl_get_rfreg(hw, RF90_PATH_A, 0x18, RFREG_OFFSET_MASK),
+			rtl_get_rfreg(hw, RF90_PATH_A, 0x33, RFREG_OFFSET_MASK),
+			rtl_get_rfreg(hw, RF90_PATH_A, 0xb2, RFREG_OFFSET_MASK),
+			rtl_get_rfreg(hw, RF90_PATH_A, 0xdf, RFREG_OFFSET_MASK),
+			rtl_get_rfreg(hw, RF90_PATH_B, 0x00, RFREG_OFFSET_MASK),
+			rtl_get_rfreg(hw, RF90_PATH_B, 0x18, RFREG_OFFSET_MASK),
+			rtl_get_rfreg(hw, RF90_PATH_B, 0xdf, RFREG_OFFSET_MASK));
+		pr_info("rtl8192fe RFdump BB 800=%08x 804=%08x 90c=%08x c04=%08x e00=%08x | MAC 1f=%02x 7b=%02x 97=%02x dc=%02x\n",
+			rtl_get_bbreg(hw, 0x800, MASKDWORD),
+			rtl_get_bbreg(hw, 0x804, MASKDWORD),
+			rtl_get_bbreg(hw, 0x90c, MASKDWORD),
+			rtl_get_bbreg(hw, 0xc04, MASKDWORD),
+			rtl_get_bbreg(hw, 0xe00, MASKDWORD),
+			rtl_read_byte(rtlpriv, 0x1f),
+			rtl_read_byte(rtlpriv, 0x7b),
+			rtl_read_byte(rtlpriv, 0x97),
+			rtl_read_byte(rtlpriv, 0xdc));
+	}
 }
