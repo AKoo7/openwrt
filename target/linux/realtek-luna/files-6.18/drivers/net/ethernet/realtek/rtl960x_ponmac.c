@@ -1104,30 +1104,357 @@ static int rtl9607c_serdes_cdr_reset(const struct rtl960x_ops *o)
 	return c7_cdr_reset(o);
 }
 
-/* ---- RTL9602C ---------------------------------------------------------- *
- * STUB. The realtek-luna 9602C board currently uses the in-tree
- * gpon-rtl9602c.c bring-up, which is the HW-tested path for this SoC. This
- * family-lib 9602C slot is a reference placeholder to be filled in later from
- * that tested code; until then its entry points are no-ops returning success
- * so the family dispatch stays complete and collision-free.
+/* ------------------------------------------------------------------ *
+ *  RTL9602C GPON PON-MAC / SerDes bring-up - clean-room op-table form.
+ *  HW-TESTED on the realtek-luna board: this is a faithful translation of
+ *  the in-tree gpon-rtl9602c.c gpon_serdes_init() / gpon_pbo-ponmac steps
+ *  into this file's op-table primitives, so the family-lib path behaves
+ *  identically to the inline driver.
+ *
+ *  Default parameter path baked in (the configuration that locks on hardware):
+ *    serdes_cdr_reset = TRUE   -> the COM_REG08 bit15 invert/10ms/restore pulse
+ *    serdes_modev1_tx = FALSE  -> SKIP the explicit COM_REG02/03/08/24/25 block
+ *                                 (the golden analog table already covers them)
+ *    serdes_tx_xtra   = FALSE  -> the D2A / sample-clock bits are forced to 0
+ *                                 (0x220a8[5:4]=0, 0x2281c[14]=0, 0x22a30[8]=0)
+ *    full_serdes_reinit = FALSE
+ *
+ *  Address spaces (absolute physical, supplied to the board's rd/wr via ops):
+ *    SDS / swcore regs : 0x1B000000 + offset
+ *    PON-IP regs       : 0x1BF00000 + offset
+ *  Symbols are c2_/C2_ prefixed to stay collision-free with the other chips.
+ * ------------------------------------------------------------------ */
+#define C2_SWCORE_BASE		0x1B000000u	/* SDS / swcore offset base    */
+#define C2_PONIP_BASE		0x1BF00000u	/* PON-IP datapath offset base */
+
+/* swcore-relative register absolutes used by the ordered bring-up steps */
+#define C2_SDS_CFG		0x1B0001D0u	/* [4:0] CFG_SDS_MODE          */
+#define   C2_SDS_MODE_OFF	0x1Fu		/* illegal/off mode (park)     */
+#define   C2_SDS_MODE_GPON	0x08u		/* GPON line-rate mode         */
+#define C2_SW_SOFTWARE_RST	0x1B000104u	/* [7] SDS_CFG_RST [0] SDS_RST */
+#define C2_WSDS_DIG_00		0x1B022030u	/* [0] STOP_CLK; run = 0xf30   */
+#define   C2_WSDS_DIG00_RUN	0xF30u		/* operational run state       */
+#define C2_WSDS_DIG_01		0x1B022034u	/* [31:0] CFG_DMY0 (force-SDS) */
+#define C2_WSDS_DIG_02		0x1B022038u	/* [10] EN_PDOWN_BEN           */
+#define C2_WSDS_DIG_03		0x1B02203Cu	/* [6:4] TXDIS_SEL_DLY [3:0]D2A*/
+#define C2_WSDS_DIG_18		0x1B022090u	/* [12] BEN_OE [15:13] optic   */
+#define C2_WSDS_DIG_1D		0x1B0220A4u	/* [16:14] interface reset-B   */
+#define C2_WSDS_DIG_1E		0x1B0220A8u	/* [5:4] D2A interconnect      */
+#define C2_SDS_REG7		0x1B02281Cu	/* [14] SP_CFG_NEG_CLKWR_A2D   */
+#define C2_SDS_EXT_REG12	0x1B022A30u	/* [8] SEP_CFG_NEG_CLKRD_D2A   */
+#define C2_SDS_FORCE_BEN	0x1B0220E4u	/* [0] BEN_FORCE_MODE          */
+#define C2_SDS_ANA_COM_REG08	0x1B0225A0u	/* TX-CDR; [15] cdr_reset bit  */
+#define C2_SDS_ANA_COM_REG12	0x1B0225B0u	/* [14] RX_SEL_CDR_AFEN        */
+#define C2_SDS_ANA_COM_REG22	0x1B0225D8u	/* [5:3] TX_AMP [2:0] TX_EMP   */
+#define C2_SDS_ANA_MISC_REG00	0x1B022500u	/* [5] FRC_RX_EN_VAL [4] _ON   */
+#define C2_SDS_ANA_MISC_REG01	0x1B022504u	/* [7:5] SPDSEL_VAL [4] _ON    */
+#define C2_SDS_ANA_MISC_REG02	0x1B022508u	/* [13] SD_VAL [12] SD_FORCE   */
+#define C2_FIB_EXT_REG21	0x1B022E54u	/* [13] FEP_V2ANALOG (lock)    */
+#define   C2_SDS_ANALOG_READY	13u		/* FIB_EXT_REG21 ready bit      */
+#define C2_SDS_LOCK_POLL_MAX	1000u		/* x200us = up to 200 ms        */
+
+/* FIB_REG0 bank bases (absolute); FP_CFG_FIB_PDOWN bit11 cleared = fiber on. */
+#define C2_FIB_REG0_PDOWN	BIT(11)
+static const u32 c2_fib_reg0_banks[] = {
+	0x1B022C00u, 0x1B022C80u, 0x1B022D00u, 0x1B022D80u,
+};
+
+/*
+ * Full SerDes analog + WSDS configuration golden table - the operating point
+ * the ONU runs at O5 (CMU, CDR, RX front-end incl. optical signal-detect/LOS,
+ * TX driver, GPON-rate banks, and the 4 FIB optical front-end banks). Each
+ * entry is an ABSOLUTE swcore address (0x1B000000 + the chip offset) and its
+ * operational value - register facts of this silicon. Status/monitor regs and
+ * the digital reset-B/clock bank (DIG_00/18/1D) are deliberately excluded;
+ * those are driven by the ordered sequence below. FIB_REG0 power-down (bit11)
+ * is cleared separately, after each write, to turn fiber power on.
  */
+static const struct { u32 off; u32 val; } c2_analog[] = {
+	/* WSDS analog front + digital RX-path config */
+	{ 0x1B022000u, 0x00000805 }, { 0x1B022008u, 0x0000ffff }, { 0x1B02201cu, 0x0000ffff },
+	{ 0x1B022020u, 0x0000ffff }, { 0x1B022038u, 0x00000900 }, { 0x1B022048u, 0x000000ff },
+	{ 0x1B022050u, 0x00022300 }, { 0x1B022054u, 0x00022310 }, { 0x1B022058u, 0x083d0100 },
+	{ 0x1B022060u, 0x00000fff }, { 0x1B022064u, 0x0000cf45 }, { 0x1B022068u, 0x00000f45 },
+	/* SDS_ANA_MISC (RX-enable force, speed-select, force-SD) */
+	{ 0x1B022500u, 0x00000030 }, { 0x1B022504u, 0x00000030 }, { 0x1B022508u, 0x00003000 },
+	/* SDS_ANA_COM (CMU, RX CDR front-end, filters, bias) */
+	{ 0x1B022580u, 0x00003400 }, { 0x1B022584u, 0x000073a4 }, { 0x1B022588u, 0x00006df8 },
+	{ 0x1B02258cu, 0x00008941 }, { 0x1B022590u, 0x00008884 }, { 0x1B022594u, 0x0000413f },
+	{ 0x1B022598u, 0x00004fc0 }, { 0x1B02259cu, 0x00005682 }, { 0x1B0225a0u, 0x00000713 },
+	{ 0x1B0225a4u, 0x000002f5 }, { 0x1B0225a8u, 0x00002793 }, { 0x1B0225acu, 0x0000b000 },
+	{ 0x1B0225b0u, 0x00004848 }, { 0x1B0225b4u, 0x000000c8 }, { 0x1B0225bcu, 0x000008f2 },
+	{ 0x1B0225c0u, 0x00001042 }, { 0x1B0225c4u, 0x0000c391 }, { 0x1B0225c8u, 0x00006a00 },
+	{ 0x1B0225ccu, 0x00006600 }, { 0x1B0225d0u, 0x0000c000 },
+	/* 0x225d8 (COM_REG22 TX_AMP/EMP) is set later, in the TX section, to the
+	 * rev-A value 0x29 (TX_AMP=0x5, TX_EMP=0x1) via field-writes - NOT a full
+	 * word here, so the upper bits keep their reset state. */
+	{ 0x1B0225dcu, 0x00000418 }, { 0x1B0225e0u, 0x00008001 }, { 0x1B0225e4u, 0x0000001f },
+	{ 0x1B0225e8u, 0x000011e4 }, { 0x1B0225ecu, 0x00009422 }, { 0x1B0225f0u, 0x00008502 },
+	{ 0x1B0225f4u, 0x00000ff0 }, { 0x1B0225f8u, 0x0000000a },
+	/* SDS_ANA_GPON (GPON-rate CDR/PLL/PCM config) */
+	{ 0x1B022708u, 0x00000f00 }, { 0x1B02270cu, 0x0000b8c6 }, { 0x1B022710u, 0x0000a112 },
+	{ 0x1B022714u, 0x00004280 }, { 0x1B022718u, 0x0000f53f }, { 0x1B02271cu, 0x00004fdf },
+	{ 0x1B022720u, 0x00000001 }, { 0x1B022724u, 0x0000309b }, { 0x1B022728u, 0x0000225c },
+	{ 0x1B02272cu, 0x00001061 }, { 0x1B022730u, 0x0000110d }, { 0x1B022734u, 0x00004854 },
+	{ 0x1B022738u, 0x000080c5 }, { 0x1B02273cu, 0x0000121e }, { 0x1B022740u, 0x0000307b },
+	{ 0x1B022744u, 0x00000271 }, { 0x1B022748u, 0x00000271 }, { 0x1B02274cu, 0x00001012 },
+	{ 0x1B022750u, 0x0000f162 }, { 0x1B022754u, 0x00003026 }, { 0x1B022758u, 0x0000a780 },
+	{ 0x1B02275cu, 0x0000f000 },
+	/* SDS_ANA_GPON additional per-rate/lane banks (the RX path selects among
+	 * these; leaving them at reset starves the active RX/SD analog). */
+	{ 0x1B022608u, 0x00000f00 }, { 0x1B02260cu, 0x0000b8c6 }, { 0x1B022610u, 0x0000a112 },
+	{ 0x1B022614u, 0x00004280 }, { 0x1B022618u, 0x0000f53f }, { 0x1B02261cu, 0x00004fdf },
+	{ 0x1B022620u, 0x00000001 }, { 0x1B022624u, 0x0000309b }, { 0x1B022628u, 0x0000225c },
+	{ 0x1B02262cu, 0x00001061 }, { 0x1B022630u, 0x0000110d }, { 0x1B022634u, 0x00004854 },
+	{ 0x1B022638u, 0x000080c5 }, { 0x1B02263cu, 0x0000121e }, { 0x1B022640u, 0x0000307b },
+	{ 0x1B022644u, 0x00000271 }, { 0x1B022648u, 0x00000271 }, { 0x1B02264cu, 0x00001012 },
+	{ 0x1B022650u, 0x0000f162 }, { 0x1B022654u, 0x00003026 }, { 0x1B022658u, 0x0000a780 },
+	{ 0x1B02265cu, 0x0000f000 },
+	{ 0x1B022688u, 0x00000f00 }, { 0x1B02268cu, 0x0000b8c6 }, { 0x1B022690u, 0x0000a112 },
+	{ 0x1B022694u, 0x00004280 }, { 0x1B022698u, 0x0000f53f }, { 0x1B02269cu, 0x00004fdf },
+	{ 0x1B0226a0u, 0x00000001 }, { 0x1B0226a4u, 0x0000309b }, { 0x1B0226a8u, 0x0000225c },
+	{ 0x1B0226acu, 0x00001062 }, { 0x1B0226b0u, 0x00002000 }, { 0x1B0226b4u, 0x00001050 },
+	{ 0x1B0226b8u, 0x000080c1 }, { 0x1B0226bcu, 0x0000121e }, { 0x1B0226c0u, 0x0000107b },
+	{ 0x1B0226c4u, 0x00000280 }, { 0x1B0226c8u, 0x00000280 }, { 0x1B0226ccu, 0x00001012 },
+	{ 0x1B0226d0u, 0x0000f862 }, { 0x1B0226d4u, 0x00003938 }, { 0x1B0226d8u, 0x00003100 },
+	{ 0x1B0226dcu, 0x0000f000 },
+	{ 0x1B022788u, 0x00000f00 }, { 0x1B02278cu, 0x0000b8c6 }, { 0x1B022790u, 0x0000a112 },
+	{ 0x1B022794u, 0x00004280 }, { 0x1B022798u, 0x0000f53f }, { 0x1B02279cu, 0x00004fdf },
+	{ 0x1B0227a0u, 0x00000001 }, { 0x1B0227a4u, 0x0000309b }, { 0x1B0227a8u, 0x0000225c },
+	{ 0x1B0227acu, 0x00001062 }, { 0x1B0227b0u, 0x00002000 }, { 0x1B0227b4u, 0x00004850 },
+	{ 0x1B0227b8u, 0x000080c5 }, { 0x1B0227bcu, 0x0000121e }, { 0x1B0227c0u, 0x0000103e },
+	{ 0x1B0227c4u, 0x00000280 }, { 0x1B0227c8u, 0x00000280 }, { 0x1B0227ccu, 0x00001012 },
+	{ 0x1B0227d0u, 0x0000f862 }, { 0x1B0227d4u, 0x00003938 }, { 0x1B0227d8u, 0x0000b100 },
+	{ 0x1B0227dcu, 0x0000f000 },
+	/* FIB (fiber optical front-end) config - 4 identical banks. This block
+	 * powers and configures the optical RX/SD path; FIB_REG0 (bank base)
+	 * carries FP_CFG_FIB_PDOWN at bit11, cleared separately below to turn
+	 * fiber power on. */
+	{ 0x1B022c00u, 0x00001940 }, { 0x1B022c04u, 0x00006109 }, { 0x1B022c08u, 0x0000e001 },
+	{ 0x1B022c0cu, 0x00003290 }, { 0x1B022c10u, 0x000001a0 }, { 0x1B022c1cu, 0x00000004 },
+	{ 0x1B022c3cu, 0x00008000 }, { 0x1B022c40u, 0x00000083 }, { 0x1B022c48u, 0x00005000 },
+	{ 0x1B022c58u, 0x00000001 }, { 0x1B022c5cu, 0x00004001 }, { 0x1B022c60u, 0x00000004 },
+	{ 0x1B022c64u, 0x0000326a }, { 0x1B022c6cu, 0x0000115d }, { 0x1B022c70u, 0x000033fa },
+	{ 0x1B022c74u, 0x0000e46a }, { 0x1B022c78u, 0x0000071e },
+	{ 0x1B022c80u, 0x00001940 }, { 0x1B022c84u, 0x00006109 }, { 0x1B022c88u, 0x0000e001 },
+	{ 0x1B022c8cu, 0x00003290 }, { 0x1B022c90u, 0x000001a0 }, { 0x1B022c9cu, 0x00000004 },
+	{ 0x1B022cbcu, 0x00008000 }, { 0x1B022cc0u, 0x00000083 }, { 0x1B022cc8u, 0x00005000 },
+	{ 0x1B022cd8u, 0x00000001 }, { 0x1B022cdcu, 0x00004001 }, { 0x1B022ce0u, 0x00000004 },
+	{ 0x1B022ce4u, 0x0000326a }, { 0x1B022cecu, 0x0000115d }, { 0x1B022cf0u, 0x000033fa },
+	{ 0x1B022cf4u, 0x0000e46a }, { 0x1B022cf8u, 0x0000071e },
+	{ 0x1B022d00u, 0x00001940 }, { 0x1B022d04u, 0x00006109 }, { 0x1B022d08u, 0x0000e001 },
+	{ 0x1B022d0cu, 0x00003290 }, { 0x1B022d10u, 0x000001a0 }, { 0x1B022d1cu, 0x00000004 },
+	{ 0x1B022d3cu, 0x00008000 }, { 0x1B022d40u, 0x00000083 }, { 0x1B022d48u, 0x00005000 },
+	{ 0x1B022d58u, 0x00000001 }, { 0x1B022d5cu, 0x00004001 }, { 0x1B022d60u, 0x00000004 },
+	{ 0x1B022d64u, 0x0000326a }, { 0x1B022d6cu, 0x0000115d }, { 0x1B022d70u, 0x000033fa },
+	{ 0x1B022d74u, 0x0000e46a }, { 0x1B022d78u, 0x0000071e },
+	{ 0x1B022d80u, 0x00001940 }, { 0x1B022d84u, 0x00006109 }, { 0x1B022d88u, 0x0000e001 },
+	{ 0x1B022d8cu, 0x00003290 }, { 0x1B022d90u, 0x000001a0 }, { 0x1B022d9cu, 0x00000004 },
+	{ 0x1B022dbcu, 0x00008000 }, { 0x1B022dc0u, 0x00000083 }, { 0x1B022dc8u, 0x00005000 },
+	{ 0x1B022dd8u, 0x00000001 }, { 0x1B022ddcu, 0x00004001 }, { 0x1B022de0u, 0x00000004 },
+	{ 0x1B022de4u, 0x0000326a }, { 0x1B022decu, 0x0000115d }, { 0x1B022df0u, 0x000033fa },
+	{ 0x1B022df4u, 0x0000e46a }, { 0x1B022df8u, 0x0000071e },
+};
+
+/*
+ * ponmac_init scheduler / OMCI-egress steering (the SDS/PON-IP config writes).
+ * BEN_TTL_OUT + DYNGASP on swcore; PON_BW_THRES (last + runt) and the transient
+ * PON_GEN_PIR_DROP on PON-IP; OMCI_MPCP_PRIORITY steers OMCI egress to PON
+ * queue 7 on swcore. PIR_DROP is asserted then cleared for rev-A, matching the
+ * inline driver's set/clear pair.
+ */
+static const struct r960_op c2_ponmac_init[] = {
+	FLD(0x1B022584u,  0,  0, 1),	/* SDS_ANA REG_BEN_TTL_OUT = 1          */
+	FLD(0x1B0001ECu,  0,  0, 1),	/* DYNGASP_CMP_INV = 1                  */
+	FLD(0x1BF02150u, 29, 16, 5),	/* PON_BW_THRES last-grant              */
+	FLD(0x1BF02150u, 13,  0, 5),	/* PON_BW_THRES runt-grant             */
+	FLD(0x1BF02194u, 18, 18, 1),	/* PON_GEN_PIR_DROP = 1                 */
+	FLD(0x1B0111F8u,  2,  0, 7),	/* PON_TRAP_CFG OMCI_MPCP_PRIORITY = 7  */
+	FLD(0x1BF02194u, 18, 18, 0),	/* rev-A: clear PON_GEN_PIR_DROP        */
+};
+
 static int rtl9602c_ponmac_init(const struct rtl960x_ops *o)
 {
-	(void)o;
+	return r960_run(o, c2_ponmac_init, ARRAY_SIZE(c2_ponmac_init));
+}
+
+/*
+ * SerDes CDR-lock pulse (the stock dal_rtl9602c_ponmac_serdesCdr_reset): invert
+ * SDS_ANA_COM_REG08 (0x1B0225A0) bit15, hold 10 ms, restore. Seats the upstream
+ * serializer CDR so the per-grant burst is consistently lockable by the OLT
+ * burst-RX. This is the serdes_cdr_reset = TRUE default path.
+ */
+static int rtl9602c_serdes_cdr_reset(const struct rtl960x_ops *o)
+{
+	u32 cdr = o->rd(C2_SDS_ANA_COM_REG08);
+
+	o->wr(C2_SDS_ANA_COM_REG08, cdr ^ BIT(15));
+	mdelay(10);
+	o->wr(C2_SDS_ANA_COM_REG08, cdr);
 	return 0;
 }
+
+/*
+ * GPON SerDes (SDS) bring-up - a faithful translation of gpon_serdes_init().
+ *
+ * Ordering is the whole game: program the analog CMU/CDR block FIRST, keep
+ * CFG_SDS_MODE parked at the illegal/off value, pulse the SDS+MAC reset to
+ * latch the analog config, release the per-datapath soft-reset-B lines and
+ * force the 125M reference clock, arm the RX-CDR through a forced RX-enable
+ * 0->1 edge, set the TX data path + drive level, force signal-detect, and only
+ * THEN switch CFG_SDS_MODE to GPON. A naive "reset-then-configure" sequence
+ * ends with the same final register values yet a CDR that never locks.
+ */
+
+/* Step 1 + 3: park SDS mode off, clear force-SDS dummy / STOP_CLK, then pulse
+ * the SDS config + datapath reset to latch the analog config (10 ms). */
+static const struct r960_op c2_sds_pre[] = {
+	FLD(C2_SDS_CFG, 4, 0, C2_SDS_MODE_OFF),	/* park CFG_SDS_MODE = off (0x1f) */
+	WR(C2_WSDS_DIG_01, 0),			/* clear force-SDS dummy          */
+	FLD(C2_WSDS_DIG_00, 0, 0, 0),		/* STOP_CLK = 0                   */
+};
+
+static const struct r960_op c2_sds_reset[] = {
+	FLD(C2_SW_SOFTWARE_RST, 7, 7, 1),	/* CMD_SDS_CFG_RST_PS             */
+	FLD(C2_SW_SOFTWARE_RST, 0, 0, 1),	/* CMD_SDS_RST_PS                 */
+	DLY(10),
+};
+
+/* Step 4: release all datapath soft-reset-B lines + force 125M ref (DIG_00 run
+ * = 0xf30), then pulse the RX/TX interface reset-B lines (DIG_1D = 0x1c000). */
+static const struct r960_op c2_sds_rstb[] = {
+	WR(C2_WSDS_DIG_00, C2_WSDS_DIG00_RUN),	/* run state, 125M ref forced     */
+	FLD(C2_WSDS_DIG_1D, 15, 15, 0),		/* RX interface reset-B 0         */
+	FLD(C2_WSDS_DIG_1D, 16, 16, 0),		/* TX interface reset-B 0         */
+	FLD(C2_WSDS_DIG_1D, 14, 14, 1),		/* common interface reset-B 1     */
+	FLD(C2_WSDS_DIG_1D, 15, 15, 1),		/* RX interface reset-B 1         */
+	FLD(C2_WSDS_DIG_1D, 16, 16, 1),		/* TX interface reset-B 1         */
+	DLY(10),
+};
+
+/*
+ * Steps 5 + 6: burst-enable output (BEN_OE) with optic-LOS left un-forced (the
+ * real RX front-end drives SD via the external BOSA), then arm the RX in order:
+ * enable the RX-CDR analog front end, settle 10 ms, force the line-rate select
+ * to the GPON rate, drive the forced RX-enable through a 0->1 edge to start the
+ * CDR, settle 50 ms. Finish with EN_PDOWN_BEN=0, TXDIS_SEL_DLY=0, D2A_SEL=0 and
+ * BEN_FORCE_MODE=0 (let the GTC framer drive the laser gate).
+ */
+static const struct r960_op c2_sds_rx_arm[] = {
+	FLD(C2_WSDS_DIG_18, 12, 12, 1),		/* BEN_OE = 1                     */
+	FLD(C2_WSDS_DIG_18, 15, 15, 0),		/* OPTIC_LOS_SEL_EPON = 0         */
+	FLD(C2_WSDS_DIG_18, 14, 14, 0),		/* CFG_FRC_OPTIC_LOS = 0          */
+	FLD(C2_WSDS_DIG_18, 13, 13, 0),		/* CFG_FRCV_OPTIC_LOS = 0         */
+	FLD(C2_SDS_ANA_COM_REG12, 14, 14, 1),	/* RX_SEL_CDR_AFEN = 1            */
+	DLY(10),
+	FLD(C2_SDS_ANA_MISC_REG01, 7, 5, 1),	/* SPDSEL_VAL = GPON rate         */
+	FLD(C2_SDS_ANA_MISC_REG01, 4, 4, 1),	/* SPDSEL force on                */
+	FLD(C2_SDS_ANA_MISC_REG00, 4, 4, 1),	/* FRC_RX_EN_ON = 1               */
+	FLD(C2_SDS_ANA_MISC_REG00, 5, 5, 0),	/* FRC_RX_EN_VAL 0 ...            */
+	FLD(C2_SDS_ANA_MISC_REG00, 5, 5, 1),	/* ... -> 1 (start CDR)           */
+	DLY(50),
+	FLD(C2_WSDS_DIG_02, 10, 10, 0),		/* EN_PDOWN_BEN = 0               */
+	FLD(C2_WSDS_DIG_03, 6, 4, 0),		/* CFG_TXDIS_SEL_DLY = 0          */
+	FLD(C2_WSDS_DIG_03, 3, 0, 0),		/* CFG_D2ANLOG_SEL = 0 (TX path)  */
+	FLD(C2_SDS_FORCE_BEN, 0, 0, 0),		/* BEN_FORCE_MODE = 0 (GTC gates) */
+};
+
+/*
+ * Step 6b + TX drive (serdes_modev1_tx=FALSE / serdes_tx_xtra=FALSE defaults):
+ * the golden analog table already covers COM_REG02/03/08/24/25, so SKIP the
+ * explicit ModeV1 block. Force the D2A interconnect + sample-clock bits to 0
+ * (match the live stock ONU). Then set the rev-A TX drive level (TX_AMP=0x5,
+ * TX_EMP=0x1) via field-writes, before switching to GPON mode.
+ */
+static const struct r960_op c2_sds_tx[] = {
+	FLD(C2_WSDS_DIG_1E,    5,  4, 0),	/* D2A interconnect = 0 (stock)   */
+	FLD(C2_SDS_REG7,      14, 14, 0),	/* SP_CFG_NEG_CLKWR_A2D = 0       */
+	FLD(C2_SDS_EXT_REG12,  8,  8, 0),	/* SEP_CFG_NEG_CLKRD_D2A = 0      */
+	FLD(C2_SDS_ANA_COM_REG22, 5, 3, 5),	/* REG_TX_AMP = 0x5               */
+	FLD(C2_SDS_ANA_COM_REG22, 2, 0, 1),	/* REG_TX_EMP = 0x1               */
+};
+
+/*
+ * Steps 7a + 7b: force signal-detect on so the MAC reset handshake (RST_DONE)
+ * completes (MISC_REG02 = 0x3000), settle 10 ms, then finally select GPON mode
+ * with the RX fully armed, settle 50 ms. Followed by a TX-interface reset-B
+ * re-sync (DIG_1D[16] 0->1) so the TX serializer re-locks onto the connected
+ * framer data now that GPON mode is live.
+ */
+static const struct r960_op c2_sds_mode[] = {
+	FLD(C2_SDS_ANA_MISC_REG02, 13, 13, 1),	/* signal-detect value = 1        */
+	FLD(C2_SDS_ANA_MISC_REG02, 12, 12, 1),	/* force signal-detect            */
+	DLY(10),
+	FLD(C2_SDS_CFG, 4, 0, C2_SDS_MODE_GPON),/* select GPON mode (very last)   */
+	DLY(50),
+	FLD(C2_WSDS_DIG_1D, 16, 16, 0),		/* TX interface reset-B 0         */
+	DLY(2),
+	FLD(C2_WSDS_DIG_1D, 16, 16, 1),		/* TX interface reset-B 1         */
+	DLY(10),
+};
 
 static int rtl9602c_ponmac_mode_set(const struct rtl960x_ops *o,
 				    int rev, int subtype)
 {
-	(void)o; (void)rev; (void)subtype;
-	return 0;
-}
+	unsigned int i;
+	int ret;
 
-static int rtl9602c_serdes_cdr_reset(const struct rtl960x_ops *o)
-{
-	(void)o;
-	return 0;
+	(void)rev; (void)subtype;	/* single rev-A SerDes variant */
+
+	/* Steps 1 + 3 share a write phase around step 2 (the analog table). */
+	ret = r960_run(o, c2_sds_pre, ARRAY_SIZE(c2_sds_pre));
+	if (ret)
+		return ret;
+
+	/* Step 2: program the FULL analog block + turn fiber power on (clear
+	 * FP_CFG_FIB_PDOWN on every FIB bank). */
+	for (i = 0; i < ARRAY_SIZE(c2_analog); i++)
+		o->wr(c2_analog[i].off, c2_analog[i].val);
+	for (i = 0; i < ARRAY_SIZE(c2_fib_reg0_banks); i++)
+		o->wr(c2_fib_reg0_banks[i],
+		      o->rd(c2_fib_reg0_banks[i]) & ~C2_FIB_REG0_PDOWN);
+
+	/* Step 3: pulse the SDS config + datapath reset to latch the analog. */
+	ret = r960_run(o, c2_sds_reset, ARRAY_SIZE(c2_sds_reset));
+	if (ret)
+		return ret;
+
+	/* Step 4: release soft-reset-B lines, force 125M ref, pulse interface
+	 * reset-B. Re-clear FIB power-down, which the reset re-asserts. */
+	ret = r960_run(o, c2_sds_rstb, ARRAY_SIZE(c2_sds_rstb));
+	if (ret)
+		return ret;
+	for (i = 0; i < ARRAY_SIZE(c2_fib_reg0_banks); i++)
+		o->wr(c2_fib_reg0_banks[i],
+		      o->rd(c2_fib_reg0_banks[i]) & ~C2_FIB_REG0_PDOWN);
+
+	/* Steps 5 + 6: burst-enable + arm the RX-CDR. */
+	ret = r960_run(o, c2_sds_rx_arm, ARRAY_SIZE(c2_sds_rx_arm));
+	if (ret)
+		return ret;
+
+	/* Step 6b + TX drive (modev1/tx_xtra defaults baked off). */
+	ret = r960_run(o, c2_sds_tx, ARRAY_SIZE(c2_sds_tx));
+	if (ret)
+		return ret;
+
+	/* Steps 7a + 7b + TX reset-B re-sync. */
+	ret = r960_run(o, c2_sds_mode, ARRAY_SIZE(c2_sds_mode));
+	if (ret)
+		return ret;
+
+	/* US-TX serdesCdr_reset pulse (serdes_cdr_reset = TRUE default), after GPON
+	 * mode + the TX reset-B re-sync so the analog-ready poll confirms recovery. */
+	rtl9602c_serdes_cdr_reset(o);
+
+	/* Keep the MAC clock ungated. */
+	rtl960x_rfwr(o, C2_WSDS_DIG_00, 0, 0, 0);
+
+	/* Wait for the analog to report ready (FIB_EXT_REG21 bit13); ~200 ms cap.
+	 * Return the poll result, matching gpon_serdes_init's final return. */
+	return r960_run(o, (const struct r960_op[]){
+		POLL(C2_FIB_EXT_REG21, C2_SDS_ANALOG_READY, C2_SDS_LOCK_POLL_MAX),
+	}, 1);
 }
 
 /* ---- dispatch --------------------------------------------------------- */

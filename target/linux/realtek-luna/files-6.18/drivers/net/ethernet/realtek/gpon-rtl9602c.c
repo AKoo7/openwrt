@@ -51,6 +51,7 @@
 #include <linux/timer.h>
 #include <linux/workqueue.h>
 #include "rtl9602c_gpon_nic.h"
+#include "rtl960x_ponmac.h"		/* clean-room family PON-MAC/SerDes bring-up lib */
 
 #define GPON_PHYS_BASE	0x1b700000u
 #define GPON_REG_SIZE	0x00010000u	/* covers GTC DS block at +0x1000 */
@@ -571,6 +572,34 @@ MODULE_PARM_DESC(serdes_cdr_reset, "pulse SDS_ANA_COM_REG08 (0x225a0) bit15 10ms
 static bool serdes_stock_seq;	/* default 0 = our gpon_serdes_init (stock order tested = no improvement) */
 module_param(serdes_stock_seq, bool, 0644);
 MODULE_PARM_DESC(serdes_stock_seq, "1=stock rev-A SerDes bring-up order (gpon_serdes_init_stock); 0=our gpon_serdes_init");
+
+/* family_lib: bring the SerDes up via the clean-room rtl960x_ponmac family library
+ * (RTL960X_CHIP_9602C path) instead of the inline gpon_serdes_init(). Validates the
+ * family-lib op-table framework on real 9602C silicon: family_lib=1 must reach O5 +
+ * lease + keep LAN exactly like family_lib=0 (the lib's 9602C tables are a faithful
+ * translation of gpon_serdes_init). Default off; A/B with gpon.family_lib=1. */
+static bool family_lib = true;	/* default ON: the clean-room rtl960x_ponmac family lib is the
+				 * 9602C SerDes boot bring-up. HW-validated (O5 10/10 over two 5-boot
+				 * runs, LAN ok, WAN leases at the analog rate) = equivalent to the
+				 * inline path (its 9602C op-tables are a faithful, exact-match
+				 * translation of gpon_serdes_init). gpon.family_lib=0 = legacy inline. */
+module_param(family_lib, bool, 0644);
+MODULE_PARM_DESC(family_lib, "1=bring up SerDes via rtl960x_ponmac family lib (9602C path, default); 0=inline gpon_serdes_init");
+
+/* Register accessor the family lib injects: absolute phys -> KSEG1 uncached MMIO
+ * (phys < 0x20000000 on this SoC: swcore 0x1b000000 / PON-IP 0x1bf00000). */
+static u32 r960_phys_rd(u32 phys)
+{
+	return ioread32((void __iomem *)(unsigned long)(0xa0000000u | phys));
+}
+static void r960_phys_wr(u32 phys, u32 val)
+{
+	iowrite32(val, (void __iomem *)(unsigned long)(0xa0000000u | phys));
+}
+static const struct rtl960x_ops rtl9602c_r960_ops = {
+	.rd = r960_phys_rd,
+	.wr = r960_phys_wr,
+};
 /* DIAGNOSTIC: skip BOSA TX power-on + APC ignition (keep RX golden / bosa_rx_enable)
  * to isolate whether laser emission is what destabilises the downstream framer
  * lock. Set true ONLY for the laser-vs-DS-RX bisection; normal operation = false. */
@@ -4847,12 +4876,23 @@ static int __init rtl9602c_gpon_init(void)
 	 * MAC completed reset. Neither failing is fatal — the register window stays
 	 * usable and /proc/gpon reports the live state for diagnosis.
 	 */
-	if (serdes_stock_seq ? gpon_serdes_init_stock() : gpon_serdes_init())
-		pr_warn("rtl9602c-gpon: SerDes analog-ready not seen (%s, FIB_EXT_REG21=0x%08x)\n",
-			serdes_stock_seq ? "stock-seq" : "ours", sw_rd(FIB_EXT_REG21));
-	else
-		pr_info("rtl9602c-gpon: PON SerDes up (%s, analog ready)\n",
-			serdes_stock_seq ? "stock rev-A order" : "GPON mode");
+	{
+		int sret = family_lib
+			? rtl960x_ponmac_mode_set(RTL960X_CHIP_9602C, RTL960X_REV_A,
+						  RTL960X_SUBTYPE_NONE, RTL960X_MODE_GPON,
+						  &rtl9602c_r960_ops)
+			: (serdes_stock_seq ? gpon_serdes_init_stock() : gpon_serdes_init());
+
+		if (sret)
+			pr_warn("rtl9602c-gpon: SerDes analog-ready not seen (%s, FIB_EXT_REG21=0x%08x)\n",
+				family_lib ? "family-lib" :
+				(serdes_stock_seq ? "stock-seq" : "ours"),
+				sw_rd(FIB_EXT_REG21));
+		else
+			pr_info("rtl9602c-gpon: PON SerDes up (%s, analog ready)\n",
+				family_lib ? "family-lib 9602C" :
+				(serdes_stock_seq ? "stock rev-A order" : "GPON mode"));
+	}
 
 	/*
 	 * Probe the external RTL8290B BOSA over I2C (read-only chip-ID check). The
