@@ -2285,6 +2285,17 @@ void gpon_pbo_init(void)
 	 * draining de-encapsulated GEM frames out of the (now bounded) buffer into the
 	 * switch -> CPU-port GMAC; DS OMCI (SID 64) egresses on the GMAC RX with the
 	 * cpu-tag stream-id 64 that the NIC's OMCI hook catches. */
+	/* Force the DS-NIC <-> GMAC0 internal-MII link UP (golden 0x106e8400,
+	 * FORCELINK[18] FORCEDFULLDUP[19] FORCE_SPD/TRXFCE). This is the missing
+	 * symmetric twin of the US write at PI_MEDIA_STS_US below: the bootloader
+	 * latches 0xc058 once, but rtl9602c_eth_open()'s GMAC0 IP-block power-cycle
+	 * (rtl9602c_ipsel_cycle, gmac_reset=1) tears down the GMAC0 side of this
+	 * link and NOTHING re-asserts it -> a de-encapped DS frame counts RX_OK at
+	 * the DS-NIC MAC (PKT_OK_CNT_DS @0xc010 = D_rxok) but never crosses the
+	 * un-trained MII into the GMAC RX ring (filled=0, gpon0 RX=0) on ~50% of
+	 * cold boots. Force it here, BEFORE the GMII enable edge, so the edge
+	 * latches against an established link. */
+	pi_wr(PI_MEDIA_STS_DS, 0x106e8400u);
 	pi_wr(PI_IO_CMD_0_DS, 0x90081070u);
 
 	/* PON-IP DS-NIC drain config (0xD400/0xD404/0xD42C). A LIVE STOCK ONU that is
@@ -2808,9 +2819,10 @@ static int gpon_proc_show(struct seq_file *s, void *v)
 		 * PON-IP (0x404c/0x4050) vs A_deenc(=de-encap'd). media_sts(0x1bf0c058) bit18
 		 * = internal DS-GMII FORCELINK (stock ~0x106e8400). de-encap>FWD => GTC drops;
 		 * FWD>0 & C_sram flat => PON-IP rejects (descriptor base or DS-GMII down). */
-		seq_printf(s, "ds_fwd: FWD(f64)=%u FWD(f0)=%u | media_sts=0x%08x (bit18 link=%u)\n",
+		seq_printf(s, "ds_fwd: FWD(f64)=%u FWD(f0)=%u | media_sts=0x%08x (bit18 link=%u) gmii_en=%u\n",
 			   gpon_gem_ds_fwd_cnt(64), gpon_gem_ds_fwd_cnt(0),
-			   pi_rd(0xc058), (pi_rd(0xc058) >> 18) & 1);
+			   pi_rd(0xc058), (pi_rd(0xc058) >> 18) & 1,
+			   (pi_rd(0xd434) >> 5) & 1);
 		/* Read-back the DS-engine enables (a later reset may have cleared them):
 		 * ctl_ds expect 0x81 (CFG_PBUF_EN bit0 + bit7), io0_ds expect 0x90081070
 		 * (GMII_RX_EN bit5 + GMII_TX_EN bit4 must be set). */
@@ -3715,6 +3727,20 @@ int gpon_install_data_gem(void)
 		}
 		pr_info("rtl9602c-gpon: data-gem: flow-%u classify committed after %d edge(s)\n",
 			GPON_DATA_FLOW, tries + 1);
+
+		/* DS half of the same fix: the DS-NIC drain config + GMII edge were
+		 * latched at boot in gpon_pbo_init, BEFORE this Configure_Port-ID
+		 * window and BEFORE the ifup GMAC0 power-cycle may have perturbed the
+		 * DS-NIC<->GMAC0 internal MII. Re-force the DS link and re-pulse the DS
+		 * GMII_RX_EN edge here (OFF->ON) so the now-complete DS data flow is
+		 * latched against an established link -> makes DS delivery to the GMAC
+		 * RX ring deterministic every boot (cures the ~50% D_rxok-climbs-but-
+		 * filled=0 split). Same config window the US re-latch above already
+		 * tolerates (NOT Online -> no US-burst/'Laser out' risk). */
+		pi_wr(PI_MEDIA_STS_DS, 0x106e8400u);	/* re-force DS-NIC<->GMAC0 internal MII link UP */
+		pi_wr(PI_IO_CMD_0_DS, 0x90081050u);	/* DS GMII_RX_EN OFF */
+		udelay(50);
+		pi_wr(PI_IO_CMD_0_DS, 0x90081070u);	/* ON -> re-latch DS drain config + link */
 	}
 	rtl9602c_ponmac_modeset_gpon();	/* keep: no-op unless ponmac_modeset=1 (reference path) */
 
