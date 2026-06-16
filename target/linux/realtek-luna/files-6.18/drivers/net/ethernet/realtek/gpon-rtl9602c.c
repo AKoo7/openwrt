@@ -554,6 +554,23 @@ MODULE_PARM_DESC(serdes_tx_xtra, "1=set legacy SerDes-TX D2A/clk-edge bits (stoc
 static bool serdes_cdr_reset = true;
 module_param(serdes_cdr_reset, bool, 0644);
 MODULE_PARM_DESC(serdes_cdr_reset, "pulse SDS_ANA_COM_REG08 (0x225a0) bit15 10ms to lock US-TX CDR (stock ponmac step; default on)");
+/* serdes_stock_seq: 1 = use gpon_serdes_init_stock() (the EXACT stock rev-A bring-up
+ * ORDER: reset-FIRST then config, single reset bit CMD_SDS_RST_PS, the D2A/sample-clock
+ * bits SET=1, NO reset-B-release dance) instead of our gpon_serdes_init() (config-first
+ * + reset-B dance). Tests whether the deterministic cold-start US-TX serializer lock is
+ * an emergent property of stock's reset-first order — the one angle the per-register
+ * tests couldn't cover.
+ * ★A/B RESULT 2026-06-16 (HW, default-on test build): the stock order DS-locks fine
+ * (reached O5 6/6 — so our reset-B dance is NOT needed) but the cold-start lease rate
+ * did NOT improve (1/6, no better than the ~60% baseline). So the deterministic lock is
+ * NOT an emergent property of stock's order either. Combined with config-values-match +
+ * every-component-tested, this DEFINITIVELY shows the ~40% cold-start US-TX serializer
+ * lock non-determinism is irreducible by any register/sequence-level ONU action (it is
+ * below the register level — analog VCO/CMU trim / PVT). DEFAULT OFF; kept as documented
+ * negative knowledge — do NOT re-enable expecting a WAN fix. */
+static bool serdes_stock_seq;	/* default 0 = our gpon_serdes_init (stock order tested = no improvement) */
+module_param(serdes_stock_seq, bool, 0644);
+MODULE_PARM_DESC(serdes_stock_seq, "1=stock rev-A SerDes bring-up order (gpon_serdes_init_stock); 0=our gpon_serdes_init");
 /* DIAGNOSTIC: skip BOSA TX power-on + APC ignition (keep RX golden / bosa_rx_enable)
  * to isolate whether laser emission is what destabilises the downstream framer
  * lock. Set true ONLY for the laser-vs-DS-RX bisection; normal operation = false. */
@@ -1904,6 +1921,140 @@ static int gpon_serdes_init(void)	/* not __init: re-run on re-range from gpon_cd
 		sw_rd(SDS_CFG), sw_rd(WSDS_DIG_00), sw_rd(WSDS_DIG_1D),
 		sw_rd(FIB_EXT_REG21), sw_rd(0x22c00));
 
+	for (i = 0; i < SDS_LOCK_POLL_MAX; i++) {
+		if (sw_rd(FIB_EXT_REG21) & SDS_ANALOG_READY)
+			return 0;
+		udelay(200);
+	}
+	return -ETIMEDOUT;
+}
+
+/*
+ * gpon_serdes_init_stock() - stock rev-A (CHIP_REV_ID_A) GPON SerDes bring-up
+ * ORDER from the vendor SDK, with OUR golden analog overlay applied in that
+ * order. VERIFIED 2026-06-16 against:
+ *   - dal_rtl9602c_ponmac.c PONMAC_MODE_GPON case (lines 2559-2658) and
+ *     _rtl9602c_ponMacModeV1_set() (lines 854-1018)
+ *   - rtk_rtl9602c_reg_list.c (every offset below confirmed)
+ *   - rtk_rtl9602c_regField_list.c (every lsp/len confirmed)
+ *
+ * SCOPE NOTE (corrected): this is NOT a bit-faithful replica of stock's ANALOG
+ * config. The vendor stock sequence has NO golden table and NO fib_reg0 loop;
+ * _rtl9602c_ponMacModeV1_set() IS the entire vendor analog config. The golden
+ * table + fib power-on here are OUR overlay (same data as gpon_serdes_init),
+ * applied in stock ORDER (after the reset). V1_set's explicit writes overwrite
+ * every overlapping golden entry, so the final operating point is the ModeV1
+ * one. What IS faithful to stock is the ORDER (reset-first), the single reset
+ * bit (CMD_SDS_RST_PS only, NOT CMD_SDS_CFG_RST_PS), and the D2A/sample-clock
+ * bits being SET=1 (the vendor-SOURCE value; note the LIVE stock ONU reads them
+ * clear at O5 - a real source-vs-runtime divergence worth A/B testing).
+ *
+ * __init: this function reads sds_analog_golden[]/fib_reg0_banks[], both
+ * __initconst, so it MUST live in .init.text or modpost reports a section
+ * mismatch and (post-init) it would read freed memory. Marked __init
+ * accordingly. If post-init re-runnability is ever required, de-__initconst
+ * both tables (a wider change shared with gpon_serdes_init).
+ *
+ * Offsets not in the file's #define block are declared local (consistent with
+ * the existing 0x22588/0x225a0/etc. literals used elsewhere in this file).
+ */
+static int __init gpon_serdes_init_stock(void)
+{
+	/* offsets absent from our #define block - all confirmed via reg_list */
+	const u32 WSDS_DIG_1Eo         = 0x220a8;
+	const u32 SDS_REG7o            = 0x2281c;
+	const u32 SDS_EXT_REG12o       = 0x22a30;
+	const u32 SDS_ANA_COM_REG02o   = 0x22588;
+	const u32 SDS_ANA_COM_REG19o   = 0x225cc;
+	const u32 SDS_ANA_COM_REG24o   = 0x225e0;
+	const u32 SDS_ANA_COM_REG25o   = 0x225e4;
+	const u32 SDS_ANA_1P25G_REG46o = 0x226b8;
+	const u32 SDS_ANA_EPON_REG46o  = 0x227b8;
+	int i;
+
+	/* === ponmac.c:2559-2565: serdes mode -> illegal (0x1f) === */
+	sw_field(SDS_CFG, 4, 0, SDS_MODE_OFF);		/* CFG_SDS_MODE = 0x1f     */
+
+	/* === ponmac.c:2567-2574: no force sds === */
+	sw_wr(WSDS_DIG_01, 0);				/* WSDS_DIG_01 = 0         */
+
+	/* === ponmac.c:2576-2583: RESET FIRST - pulse ONLY CMD_SDS_RST_PS (bit0).
+	 * Stock does NOT touch CMD_SDS_CFG_RST_PS (bit7) here. === */
+	sw_field(SW_SOFTWARE_RST, 0, 0, 1);		/* CMD_SDS_RST_PS = 1      */
+	mdelay(10);					/* osal_time_mdelay(10)    */
+
+	/* === ponmac.c:2586-2592: BEN on === */
+	sw_field(WSDS_DIG_18, 12, 12, 1);		/* BEN_OE = 1              */
+
+	/* === ponmac.c:2613-2627: rev-A (CHIP_REV_ID_A) else-branch - adjust
+	 * TX_Burst's Burst Mode Sequence === */
+	sw_field(WSDS_DIG_03, 6, 4, 0x0);		/* CFG_TXDIS_SEL_DLY = 0   */
+	sw_field(WSDS_DIG_03, 3, 0, 0x0);		/* CFG_D2ANLOG_SEL   = 0   */
+
+	/* ----------------------------------------------------------------------
+	 * OUR golden analog overlay + fiber power-on, applied AFTER the reset
+	 * (stock ORDER). NOT part of vendor stock; V1_set below overrides every
+	 * overlapping entry. Provides the per-rate/lane + FIB bank config that
+	 * vendor stock assumes is already present from an earlier mode-set.
+	 * -------------------------------------------------------------------- */
+	for (i = 0; i < ARRAY_SIZE(sds_analog_golden); i++)
+		sw_wr(sds_analog_golden[i].off, sds_analog_golden[i].val);
+	for (i = 0; i < ARRAY_SIZE(fib_reg0_banks); i++)
+		sw_wr(fib_reg0_banks[i],
+		      sw_rd(fib_reg0_banks[i]) & ~FIB_REG0_PDOWN);	/* fiber on */
+
+	/* ======================================================================
+	 * ponmac.c:2629 -> _rtl9602c_ponMacModeV1_set() (854-1018) inlined.
+	 * ==================================================================== */
+
+	/* --- ### TX ### ponmac.c:867-915 : PON TX CMU/PLL + TX-LA-LDO --- */
+	sw_wr(SDS_ANA_COM_REG02o, 0x6df8);	/* :867 COM_REG02 (CMU/LDO/ISTANK) */
+	sw_wr(SDS_ANA_COM_REG03, 0x8941);	/* :873 COM_REG03 (0x2258c)        */
+	sw_wr(SDS_ANA_COM_REG08, 0x0713);	/* :879 COM_REG08 (0x225a0)        */
+	sw_wr(SDS_ANA_COM_REG25o, 0x1f);	/* :885 COM_REG25                  */
+
+	/* WSDS_DIG_1E[5]=CFG_ANALOG2D_SEL, [4]=CFG_D2ANLOG_INF_SEL - vendor SETs
+	 * these =1 (opposite of our oracle-parity path which clears them). */
+	sw_field(WSDS_DIG_1Eo, 5, 5, 0x1);	/* :896 CFG_ANALOG2D_SEL = 1       */
+	sw_field(WSDS_DIG_1Eo, 4, 4, 0x1);	/* :902 CFG_D2ANLOG_INF_SEL = 1    */
+
+	sw_wr(SDS_ANA_COM_REG24o, 0x8001);	/* :909 COM_REG24 (REG_TXLA_LDOEN) */
+
+	/* --- ### RX ### ponmac.c:919-992 (ASIC, !FPGA) --- */
+	sw_wr(SDS_ANA_1P25G_REG46o, 0x80c5);	/* :922 FIB1G Rx 1.25 KP/KI        */
+	sw_wr(SDS_ANA_EPON_REG46o,  0x80c5);	/* :931 EPON  Rx 1.25 KP/KI        */
+	sw_wr(SDS_ANA_GPON_REG46,   0x80c5);	/* :940 GPON  Rx 2.488 KP/KI       */
+
+	sw_field(SDS_ANA_COM_REG12, 14, 14, 0x1);	/* :948 REG_RX_SEL_CDR_AFEN = 1   */
+	sw_field(SDS_ANA_COM_REG11,  7,  0, 0x0);	/* :956 REG_RX_FILT_CONFIG = 0    */
+	sw_field(SDS_ANA_COM_REG19o, 14, 14, 0x1);	/* :964 REG_CDR_RESET_MANUAL = 1  */
+	sw_field(SDS_ANA_COM_REG19o, 10, 10, 0x1);	/* :972 REG_CDR_EN_LPF_MANUAL = 1 */
+
+	/* ### RX_EN toggle ### MISC_REG00: FRC_RX_EN_ON[4], FRC_RX_EN_VAL[5] */
+	sw_wr(SDS_ANA_MISC_REG00, 0x10);	/* :981 RX_EN force on, val=0       */
+	sw_wr(SDS_ANA_MISC_REG00, 0x30);	/* :987 RX_EN val 0->1 (start CDR)  */
+
+	mdelay(50);				/* :994 osal_time_mdelay(50)        */
+
+	sw_field(WSDS_DIG_02, 10, 10, 0x0);	/* :997 REG_EN_PDOWN_BEN = 0        */
+
+	/* TX-data sample clocks - vendor SETs these =1 (:1004-1016). */
+	sw_field(SDS_REG7o,      14, 14, 0x1);	/* :1004 SP_CFG_NEG_CLKWR_A2D = 1   */
+	sw_field(SDS_EXT_REG12o,  8,  8, 0x1);	/* :1010 SEP_CFG_NEG_CLKRD_D2A = 1  */
+	/* === end _rtl9602c_ponMacModeV1_set() === */
+
+	/* === ponmac.c:2636-2642: serdes mode -> GPON (0x8) === */
+	sw_field(SDS_CFG, 4, 0, SDS_MODE_GPON);		/* CFG_SDS_MODE = 0x8      */
+
+	/* === ponmac.c:2644-2658 (!FPGA): force ber notify [13:12] = 0x3 === */
+	sw_field(SDS_ANA_MISC_REG02, 13, 13, 0x1);	/* FRC_BER_NOTIFY_VAL = 1  */
+	sw_field(SDS_ANA_MISC_REG02, 12, 12, 0x1);	/* FRC_BER_NOTIFY_ON  = 1  */
+
+	pr_info("rtl9602c-gpon: stock rev-A SerDes init done: SDS_CFG=0x%08x DIG18=0x%08x MISC02=0x%08x fib21=0x%08x\n",
+		sw_rd(SDS_CFG), sw_rd(WSDS_DIG_18), sw_rd(SDS_ANA_MISC_REG02),
+		sw_rd(FIB_EXT_REG21));
+
+	/* Local readiness gate (NOT vendor) - mirrors gpon_serdes_init tail. */
 	for (i = 0; i < SDS_LOCK_POLL_MAX; i++) {
 		if (sw_rd(FIB_EXT_REG21) & SDS_ANALOG_READY)
 			return 0;
@@ -4696,11 +4847,12 @@ static int __init rtl9602c_gpon_init(void)
 	 * MAC completed reset. Neither failing is fatal — the register window stays
 	 * usable and /proc/gpon reports the live state for diagnosis.
 	 */
-	if (gpon_serdes_init())
-		pr_warn("rtl9602c-gpon: SerDes analog-ready not seen (FIB_EXT_REG21=0x%08x)\n",
-			sw_rd(FIB_EXT_REG21));
+	if (serdes_stock_seq ? gpon_serdes_init_stock() : gpon_serdes_init())
+		pr_warn("rtl9602c-gpon: SerDes analog-ready not seen (%s, FIB_EXT_REG21=0x%08x)\n",
+			serdes_stock_seq ? "stock-seq" : "ours", sw_rd(FIB_EXT_REG21));
 	else
-		pr_info("rtl9602c-gpon: PON SerDes up (GPON mode, analog ready)\n");
+		pr_info("rtl9602c-gpon: PON SerDes up (%s, analog ready)\n",
+			serdes_stock_seq ? "stock rev-A order" : "GPON mode");
 
 	/*
 	 * Probe the external RTL8290B BOSA over I2C (read-only chip-ID check). The
