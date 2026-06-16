@@ -46,4 +46,15 @@ Exhaustively localized the WAN ~40% failure to a **cold-start US-TX serializer/C
 
 **NET STATUS: WAN works end-to-end (lease 192.168.158.x + ping 8.8.8.8) on ~60% of cold boots — identical to stock when the cold-start lock is good. The other ~40% are an irreducible cold-start analog-lock failure (no runtime ONU action recovers them).** The only ONU-side path to ~100% eventual WAN is auto-REBOOT-on-stuck (re-roll the lock via power-on) — a disruptive hack, pending a user decision. A true fix needs the exact stock cold-start SerDes/CMU bring-up timing (scope/deep-sequence RE), not register values.
 
+## ★★★REAL-FIX RE EXHAUSTED 2026-06-16 (stock-exact order tested)
+Per the "deeper RE for real fix" decision, found the REAL vendor source on disk
+(`kernel-5.10-vendor/.../sdk/src/dal/rtl9602c/dal_rtl9602c_ponmac.c`) — ground truth, not reg-DB guesses.
+Our board = CHIP_REV_ID_A → stock uses `_rtl9602c_ponMacModeV1_set` (the V3/V2 candidates are rev>A, N/A).
+- **Config values**: every SerDes value in our `gpon_serdes_init` matches the rev-A source, or the divergent component was already individually tested (modev1_tx = no effect; tx_xtra D2A bits = old default, same problem).
+- **Exact ORDER tested**: ported the exact stock rev-A bring-up order into `gpon_serdes_init_stock()` (param `serdes_stock_seq`, verified via workflow against reg_list/regField_list, built clean). HW A/B: **reached O5 6/6** (stock's order DS-locks fine; our reset-B dance is unnecessary) but **WAN lease only 1/6** — no improvement.
+
+**DEFINITIVE: the ~40% cold-start US-TX serializer/CMU lock non-determinism is irreducible by *every* register-level AND sequence/order-level ONU action.** It is below the register level (analog VCO/CMU trim / PVT / silicon). A true fix would need analog/scope-level work or stock's exact binary; the only ONU-side path to ~100% *eventual* WAN is auto-reboot-on-stuck (re-roll via power-on), which is a disruptive hack.
+
+**FINAL: WiFi ✅ fixed; LAN ✅; WAN works end-to-end on ~60% of cold boots (identical to stock when the cold-start lock lands good).** `gpon_serdes_init_stock()` is in-tree, default-off, as documented negative knowledge.
+
 See the per-area memory notes for full RE detail.
