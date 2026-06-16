@@ -22,6 +22,10 @@ void rtl9602c_eth_set_omci_identity(const u8 *sn8);
 /* DS OMCI frames that reached the CPU NIC ring (defined in rtl9602c_eth.c). */
 u32 rtl9602c_eth_omci_rx_count(void);
 
+/* gpon0 (WAN) RX packet count; 0 => OLT forwarded us no downstream data (not
+ * provisioned). Used by the GPON O5 provisioning watchdog. Defined in rtl9602c_eth.c. */
+u32 rtl9602c_eth_wan_rx_count(void);
+
 /* US-OMCI TX-ring reclaim cursor ("dirty"): count of OMCC descriptors the HW has
  * consumed (OWN cleared). Non-zero => the OMCC TX ring is being fetched. Defined
  * in rtl9602c_eth.c; surfaced for the periodic O5 serial diagnostic. */

@@ -698,6 +698,19 @@ u32 rtl9602c_eth_omci_rx_count(void)
 }
 EXPORT_SYMBOL(rtl9602c_eth_omci_rx_count);
 
+/* gpon0 (WAN) RX packet count. 0 = the OLT has forwarded us NO downstream data
+ * (no DHCP OFFER, no unicast, not even via the demux) = we are not provisioned /
+ * "Laser out". Used by the GPON O5 provisioning watchdog to detect a stuck link
+ * that reached O5 locally but the OLT never provisioned (so it can self-re-range
+ * and re-roll the non-deterministic US-TX serializer phase). */
+u32 rtl9602c_eth_wan_rx_count(void)
+{
+	struct rtl9602c_eth *ep = g_ep;
+
+	return (ep && ep->wan_ndev) ? (u32)ep->wan_ndev->stats.rx_packets : 0;
+}
+EXPORT_SYMBOL(rtl9602c_eth_wan_rx_count);
+
 /*
  * US-OMCI TX-ring "dirty" cursor = number of OMCC descriptors the HW has consumed
  * (OWN cleared) and our reclaim has retired. Non-zero => the dedicated HW ring is

@@ -478,6 +478,29 @@ static uint o5_ploam_keepalive_ticks = 100;
 module_param(o5_ploam_keepalive_ticks, uint, 0644);
 MODULE_PARM_DESC(o5_ploam_keepalive_ticks, "emit No_message US-PLOAM every N 10ms ticks at O5 (0=off, default 100)");
 
+/* o5_provision_watchdog_ticks: a "Laser out" boot reaches O5 LOCALLY but the OLT
+ * cannot frame our US burst (the TX-serializer lock PHASE is non-deterministic per
+ * boot, gpon-rtl9602c.c:~1843), so the OLT stays Offline / Config=fail, never
+ * provisions us, and sends NO Deactivate the ONU acts on -> the ONU sits at O5
+ * forever with the bad phase and never self-recovers (gpon0 RX stays 0, sds_sync
+ * stays 0 = no re-range = "never leases in 5 min", HW-observed). If at O5 this many
+ * ticks with ZERO gpon0 WAN RX (the OLT forwarded us nothing = definitely not
+ * provisioned), self-re-range to RE-ROLL the serializer phase; each roll has ~50%
+ * chance of a frameable phase, so a stuck boot leases within a few cycles instead of
+ * never. Gated PAST the slow-lease window (observed max ~135s) AND on wan_rx==0, so
+ * it can NEVER disturb a working or slow-leasing link (those have wan_rx>0). About
+ * 12ms/tick; 12000 ~= 150s. 0 = disabled.
+ * ★PROVEN INEFFECTIVE (2026-06-16, HW A/B): it FIRES correctly (dmesg "O5 provision
+ * watchdog (12001 ticks...)") but re-ranging does NOT recover a stuck boot — a hard-fail
+ * boot reached sn_tx=37 / sds_sync=7 + 2 watchdog re-ranges and STILL never leased
+ * (gpon0 RX=0 @700s). The bad US-TX serializer/CMU lock is a COLD-START analog state
+ * fixed at power-on; NO amount of runtime re-range/CDR-reseat re-rolls it (only a reboot
+ * does — hence ~60% lease ACROSS reboots but a stuck boot stays stuck forever). DEFAULT
+ * OFF; kept as documented negative knowledge — do NOT re-enable expecting a WAN fix. */
+static uint o5_provision_watchdog_ticks;	/* default 0 = off (proven ineffective, see above) */
+module_param(o5_provision_watchdog_ticks, uint, 0644);
+MODULE_PARM_DESC(o5_provision_watchdog_ticks, "re-range if at O5 this many ticks with gpon0 RX=0 (0=off default; PROVEN INEFFECTIVE: re-range does not re-roll the cold-start serializer lock)");
+
 /* last DS PLOAM type drained this cycle, surfaced on the periodic O5 line */
 static u8 gpon_last_ds_type;
 /* DIAGNOSTIC: force the upstream laser continuously on (US_CFG.FS_LON). Tests
@@ -4438,6 +4461,36 @@ static void gpon_fsm_poll(struct timer_list *t)
 	    ((gpon_fsm_ticks - gpon_o5_entry_tick) % 150) == 0) {
 		rtl9602c_eth_omci_report_oper_up();
 		gpon_avc_sent++;
+	}
+
+	/* O5 provisioning watchdog (see o5_provision_watchdog_ticks). A boot that
+	 * reached O5 locally but the OLT never provisioned it (gpon0 RX still 0 well
+	 * past the slow-lease window) is stuck on a non-frameable US-TX serializer
+	 * phase with no OLT Deactivate to recover it. Self-re-range to RE-ROLL the
+	 * phase, mirroring the Deactivate->O1 path (incl. the CDR/reset-B re-seat that
+	 * actually changes the serializer lock). wan_rx>0 on any working or
+	 * slow-leasing link, so this fires only on a genuinely dead/stuck link. */
+	if (o5_provision_watchdog_ticks && gpon_fsm_state == 5 &&
+	    gpon_fsm_onu_id != 0xff && gpon_o5_entry_tick &&
+	    (gpon_fsm_ticks - gpon_o5_entry_tick) > o5_provision_watchdog_ticks &&
+	    rtl9602c_eth_wan_rx_count() == 0) {
+		pr_info("rtl9602c-gpon: O5 provision watchdog (%u ticks, gpon0 RX=0) -> re-range to re-roll serializer phase\n",
+			gpon_fsm_ticks - gpon_o5_entry_tick);
+		gpon_fsm_onu_id = 0xff;
+		gpon_omcc_installed = false;
+		gpon_tcont_installed = false;
+		gpon_data_installed = false;
+		gpon_aes_switch_time = 0xffffffff;
+		gpon_key_staged = false;
+		gpon_field(GPON_GTC_DS_ONU_STATUS, 15, 8, 0xff);
+		gpon_field(GPON_GTC_US_ONU_ID, 15, 8, 0xff);
+		if (cdr_reseat_on_reactivate) {
+			sw_field(WSDS_DIG_1D, 16, 16, 0);
+			udelay(500);
+			sw_field(WSDS_DIG_1D, 16, 16, 1);
+			schedule_work(&gpon_cdr_reset_work);
+		}
+		gpon_fsm_set_state(1);
 	}
 
 	/* Hybrid LAN/VLAN: once stably at O5 (config-apply done), clear VLAN_FILTER so the
