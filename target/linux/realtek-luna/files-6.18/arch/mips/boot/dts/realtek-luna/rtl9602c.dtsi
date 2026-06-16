@@ -83,6 +83,17 @@
 		interrupt-parent = <&intc>;
 		interrupts = <43>;
 	};
+	nic: ethernet@18012000 {
+		/* re8686-class GMAC0; base confirmed on silicon (IDR0-5 hold the
+		 * U-Boot MAC). INTC input 26 = GMAC0 TX/RX completion (matches live
+		 * stock GIMR0/GISR0 bit26 and /proc/interrupts "26: ... eth0"). The
+		 * driver request_irq()s this for IRQ-driven NAPI TX/RX servicing. */
+		compatible = "realtek,rtl9602c-nic";
+		reg = <0x18012000 0x2000>;
+		interrupt-parent = <&intc>;
+		interrupts = <26>;
+		status = "okay";
+	};
 
 	spi_nor: flash@14000000 {
 		/* 16 MB SPI-NOR, memory-mapped (physmap) at 0x14000000 */

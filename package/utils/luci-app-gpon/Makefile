@@ -17,7 +17,7 @@ define Package/luci-app-gpon
   CATEGORY:=LuCI
   SUBMENU:=3. Applications
   TITLE:=GPON ONU provisioning UI
-  DEPENDS:=+luci-base +gpon-provision
+  DEPENDS:=+luci-base +gpon-provision +luci-mod-status
   PKGARCH:=all
 endef
 
@@ -35,6 +35,12 @@ define Package/luci-app-gpon/install
 	$(INSTALL_DIR) $(1)/www/luci-static/resources/view/gpon
 	$(INSTALL_DATA) ./htdocs/luci-static/resources/view/gpon/identity.js \
 		$(1)/www/luci-static/resources/view/gpon/identity.js
+	$(INSTALL_DIR) $(1)/www/luci-static/resources/view/status/include
+	$(INSTALL_DATA) ./htdocs/luci-static/resources/view/status/include/35_gpon.js \
+		$(1)/www/luci-static/resources/view/status/include/35_gpon.js
+	$(INSTALL_DIR) $(1)/usr/libexec/rpcd
+	$(INSTALL_BIN) ./root/usr/libexec/rpcd/gpon \
+		$(1)/usr/libexec/rpcd/gpon
 	$(INSTALL_DIR) $(1)/usr/share/luci/menu.d
 	$(INSTALL_DATA) ./root/usr/share/luci/menu.d/luci-app-gpon.json \
 		$(1)/usr/share/luci/menu.d/luci-app-gpon.json

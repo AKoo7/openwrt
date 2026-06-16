@@ -145,7 +145,17 @@ static int __init luna_intc_of_init(struct device_node *node,
 	writel(0, ic->base + LUNA_INTC_GIMR(1));
 	writel(0x03333330, ic->base + LUNA_INTC_IRR_BASE + 0x00);
 	writel(0x30302222, ic->base + LUNA_INTC_IRR_BASE + 0x04);
-	writel(0x00020222, ic->base + LUNA_INTC_IRR_BASE + 0x08);
+	/*
+	 * Word at IRR_BASE+0x08 holds the routing nibbles for inputs 26..33
+	 * (ascending tiling: input 42 is nibble1 of the +0x10 word per the
+	 * UART/timer fix below). GMAC0 ethernet is input 26 = bits[3:0] here.
+	 * The vendor value 2 targets a CP0 IP line our cascade does not pick
+	 * up (same failure mode as the original UART input), so route it to
+	 * the proven-delivering value 6 (as timer input 43 / uart input 49
+	 * use). [3:0]: 2 -> 6. Once GIMR0 bit26 is unmasked (request_irq ->
+	 * luna_intc_unmask) input 26 is then delivered through the cascade.
+	 */
+	writel(0x00020226, ic->base + LUNA_INTC_IRR_BASE + 0x08);
 	writel(0x22020333, ic->base + LUNA_INTC_IRR_BASE + 0x0c);
 	/*
 	 * IRR4 (base+0x20) holds the routing nibbles for inputs 42..49: the

@@ -5,6 +5,11 @@
 'require form';
 'require uci';
 'require fs';
+'require rpc';
+'require poll';
+
+/* Live ONU state + fiber RX/TX dBm, from /proc/gpon via the rpcd backend. */
+var callGpon = rpc.declare({ object: 'gpon', method: 'status' });
 
 /*
  * Parse "key=value\nkey=value\n..." output from rtk_factory optical_cal
@@ -19,12 +24,32 @@ function parseKV(text) {
 	return r;
 }
 
+/* Read the per-field factory values (what is in effect when a field is empty /
+ * source=Factory) so we can show them as input placeholders + a copyable table. */
+var FAC_KEYS = ['sn', 'mac', 'loid', 'loid_passwd', 'ploam_passwd', 'olt_mode', 'vendor_id'];
+
+function factoryRead(key) {
+	return fs.exec('/usr/sbin/rtk_factory', ['-p', 'config', key])
+		.then(function(r) { return ((r && r.stdout) || '').trim(); })
+		.catch(function() { return ''; });
+}
+
+function loadFactory() {
+	return Promise.all(FAC_KEYS.map(factoryRead)).then(function(vals) {
+		var o = {};
+		FAC_KEYS.forEach(function(k, i) { o[k] = vals[i]; });
+		return o;
+	});
+}
+
 return view.extend({
 	load: function () {
 		return Promise.all([
 			uci.load('gpon'),
 			fs.exec('/usr/sbin/rtk_factory', ['-p', 'config', 'optical_cal'])
-			  .catch(function() { return { stdout: '', stderr: '' }; })
+			  .catch(function() { return { stdout: '', stderr: '' }; }),
+			L.resolveDefault(callGpon(), {}),
+			loadFactory()
 		]);
 	},
 
@@ -32,6 +57,14 @@ return view.extend({
 		var optOut = data[1] ? data[1].stdout : '';
 		var cal = parseKV(optOut);
 		var calOk = !!(cal.rssi_v0 || cal.mpd0);
+		var live = data[2] || {};
+		var fac = data[3] || {};
+
+		function stateText(d) {
+			return (d && d.onu_state_name && d.onu_state_name != 'unknown')
+				? ('O' + d.onu_state + ' – ' + d.onu_state_name + (d.online ? ' (online)' : ''))
+				: '—';
+		}
 
 		var m, s, o;
 
@@ -53,21 +86,26 @@ return view.extend({
 		o = s.option(form.Value, 'sn', _('GPON Serial Number'),
 			_('e.g. XPON12345678'));
 		o.depends('source', 'manual');
+		o.placeholder = fac.sn || '';
 
 		o = s.option(form.Value, 'mac', _('MAC Address'));
 		o.datatype = 'macaddr';
 		o.depends('source', 'manual');
+		o.placeholder = fac.mac || '';
 
 		o = s.option(form.Value, 'loid', _('LOID'));
+		o.placeholder = fac.loid || '';
 
 		o = s.option(form.Value, 'loid_passwd', _('LOID Password'));
 		o.password = true;
+		o.placeholder = fac.loid_passwd || '';
 
 		o = s.option(form.Value, 'ploam_passwd', _('PLOAM Password'));
 		o.password = true;
+		o.placeholder = fac.ploam_passwd || '';
 
 		o = s.option(form.ListValue, 'omci_olt_mode', _('OMCI OLT Mode'));
-		o.value('', _('Use factory value'));
+		o.value('', _('Use factory value') + (fac.olt_mode ? ' (' + fac.olt_mode + ')' : ''));
 		o.value('0', _('0 - Default'));
 		o.value('1', _('1 - Huawei'));
 		o.value('2', _('2 - ZTE'));
@@ -75,6 +113,7 @@ return view.extend({
 
 		o = s.option(form.Value, 'pon_vendor_id', _('PON Vendor ID'),
 			_('4 chars, e.g. XPON; empty = factory value'));
+		o.placeholder = fac.vendor_id || '';
 
 		/* Optical transceiver calibration (read-only, from rtl8290b.data) */
 		var optSec = m.section(form.TypedSection, 'gpon', _('Optical Transceiver (rtl8290b)'));
@@ -85,7 +124,8 @@ return view.extend({
 			E('h3', {}, [ _('Optical Transceiver (rtl8290b)') ]),
 			E('div', { 'class': 'cbi-section-descr' }, [
 				_('Factory calibration data from the config flash partition. ' +
-				  'Live RX/TX power requires the PON stack to be running.')
+				  'ONU state and live RX/TX power below refresh automatically every 5s ' +
+				  '(the BOSA publishes optical power even before O5).')
 			]),
 			E('table', { 'class': 'table cbi-section-table' }, [
 				E('tr', { 'class': 'tr table-titles' }, [
@@ -117,18 +157,70 @@ return view.extend({
 					E('td', { 'class': 'td' }, [ cal.temp_off || '0' ])
 				]) : E([]),
 				E('tr', { 'class': 'tr' }, [
+					E('td', { 'class': 'td' }, [ _('ONU state') ]),
+					E('td', { 'class': 'td', 'id': 'gpon-live-state' }, [ stateText(live) ])
+				]),
+				E('tr', { 'class': 'tr' }, [
 					E('td', { 'class': 'td' }, [ _('Live RX power') ]),
-					E('td', { 'class': 'td' }, [ _('N/A — requires PON driver') ])
+					E('td', { 'class': 'td', 'id': 'gpon-live-rx' }, [
+						(live.optic_rx_dbm || 'n/a') + ' dBm'
+					])
 				]),
 				E('tr', { 'class': 'tr' }, [
 					E('td', { 'class': 'td' }, [ _('Live TX power') ]),
-					E('td', { 'class': 'td' }, [ _('N/A — requires PON driver') ])
+					E('td', { 'class': 'td', 'id': 'gpon-live-tx' }, [
+						(live.optic_tx_dbm || 'n/a') + ' dBm'
+					])
 				])
 			])
 		]);
 
+		var facRows = [
+			[ _('GPON Serial Number'), fac.sn ],
+			[ _('MAC Address'), fac.mac ],
+			[ _('LOID'), fac.loid ],
+			[ _('LOID Password'), fac.loid_passwd ],
+			[ _('PLOAM Password'), fac.ploam_passwd ],
+			[ _('OMCI OLT Mode'), fac.olt_mode ],
+			[ _('PON Vendor ID'), fac.vendor_id ]
+		];
+		var facDiv = E('div', { 'class': 'cbi-section' }, [
+			E('h3', {}, [ _('Factory identity values') ]),
+			E('div', { 'class': 'cbi-section-descr' }, [
+				_('Per-board values read from this unit\'s flash — in effect when the matching ' +
+				  'field above is left empty. Read-only, so you can copy them and notice if a ' +
+				  'value that should be constant ever changes (e.g. memory corruption).')
+			]),
+			E('table', { 'class': 'table cbi-section-table' },
+				[ E('tr', { 'class': 'tr table-titles' }, [
+					E('th', { 'class': 'th' }, [ _('Field') ]),
+					E('th', { 'class': 'th' }, [ _('Factory value') ])
+				]) ].concat(facRows.map(function(r) {
+					return E('tr', { 'class': 'tr' }, [
+						E('td', { 'class': 'td' }, [ r[0] ]),
+						E('td', { 'class': 'td', 'style': 'font-family:monospace;user-select:all' },
+							[ (r[1] && r[1].length) ? r[1] : '—' ])
+					]);
+				}))
+			)
+		]);
+
 		return Promise.resolve(m.render()).then(function(node) {
+			node.appendChild(facDiv);
 			node.appendChild(optDiv);
+			/* Live refresh: a value correct at O5 that a bug later corrupts will
+			 * visibly change here, since this keeps showing the current value. */
+			poll.add(function() {
+				return L.resolveDefault(callGpon(), {}).then(function(d) {
+					d = d || {};
+					var rx = document.getElementById('gpon-live-rx');
+					var tx = document.getElementById('gpon-live-tx');
+					var st = document.getElementById('gpon-live-state');
+					if (rx) rx.textContent = (d.optic_rx_dbm || 'n/a') + ' dBm';
+					if (tx) tx.textContent = (d.optic_tx_dbm || 'n/a') + ' dBm';
+					if (st) st.textContent = stateText(d);
+				});
+			}, 5);
 			return node;
 		});
 	}

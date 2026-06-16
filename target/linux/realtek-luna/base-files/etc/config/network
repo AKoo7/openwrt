@@ -37,15 +37,19 @@ config interface 'lan'
 	option netmask '255.255.255.0'
 	option ip6assign '60'
 
-# WAN = GPON upstream (IPoE/DHCP). Pulls 192.168.158.x from the OLT once the
-# ONU reaches O5; stays down at O1 (harmless retry). eth0.2 = the CPU-facing
-# WAN service VLAN the PON datapath is wired to in the OMCI/PON-IP phase.
+# WAN = GPON upstream (IPoE/DHCP), pulls 192.168.158.x from the OLT once the ONU
+# activates. Carried on the dedicated UNTAGGED data-GEM netdev gpon0 (the clean-room
+# nas0-equivalent): the driver demuxes downstream data-GEM frames (switch PON port 2)
+# to gpon0 and steers upstream frames to the data GEM's internal flow. The stock WAN
+# (nas0_0) is likewise UNTAGGED (VLAN 0) IPoE — NOT a tagged switch VLAN, so eth0.2 was
+# wrong. LAN (br-lan/eth0) and WAN (gpon0) stay on separate L3 interfaces -> the ONU
+# routes + NATs (firewall lan->wan).
 config interface 'wan'
-	option device 'eth0.2'
+	option device 'gpon0'
 	option proto 'dhcp'
 
 config interface 'wan6'
-	option device 'eth0.2'
+	option device 'gpon0'
 	option proto 'dhcpv6'
 	option reqaddress 'try'
 	option reqprefix 'auto'

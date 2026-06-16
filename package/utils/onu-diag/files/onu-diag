@@ -1,0 +1,168 @@
+#!/bin/sh
+# onu-diag - one-shot remote ONU diagnostic for the RTL9602C GPON ONU.
+#
+# Prints EVERYTHING a technician needs to diagnose this unit remotely when the
+# GPON WAN is down: identity (MAC/SN/LOID), fiber state (O1-O5) and RX/TX power
+# in dBm, WAN lease, LAN clients, Wi-Fi, Ethernet link, and system health.
+# Self-contained (no WAN, no ubus, no extra packages needed) so it answers even
+# from a board that never reached the OLT. Run over telnet/ssh/serial:
+#     onu-diag           human-readable report (default)
+#     onu-diag -j        JSON (for tooling / LuCI)
+#
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+PROC=/proc/gpon
+ENV=/var/run/gpon.env
+JSON=0
+[ "$1" = "-j" ] || [ "$1" = "--json" ] && JSON=1
+
+# ---- helpers ---------------------------------------------------------------
+g()   { sed -n "s/^$1[:=] *//p" "$PROC" 2>/dev/null | head -1; }    # /proc/gpon field
+ev()  { [ -f "$ENV" ] && sed -n "s/^$1=//p" "$ENV" 2>/dev/null | head -1; }
+have(){ command -v "$1" >/dev/null 2>&1; }
+
+# SFF-8472 DDM raw word (0.1uW/LSB) -> dBm string, "n/a" for dark/unfit.
+dbm() {
+	d=$(printf '%d' "0x${1:-0}" 2>/dev/null) || d=0
+	[ "$d" -gt 0 ] && [ "$d" -lt 65535 ] || { echo "n/a"; return; }
+	awk -v r="$d" 'BEGIN{printf "%.1f", 10*log(r/10000.0)/log(10)}'
+}
+
+uptime_h() { awk '{d=int($1/86400);h=int(($1%86400)/3600);m=int(($1%3600)/60);
+	printf (d?"%dd ":""),d; printf "%dh%dm",h,m}' /proc/uptime 2>/dev/null; }
+
+# ---- collect ---------------------------------------------------------------
+HOST=$(cat /proc/sys/kernel/hostname 2>/dev/null)
+FW=$(sed -n "s/.*DISTRIB_DESCRIPTION='\(.*\)'/\1/p" /etc/openwrt_release 2>/dev/null)
+[ -n "$FW" ] || FW=$(cat /etc/openwrt_version 2>/dev/null)
+MODEL=$(cat /tmp/sysinfo/model 2>/dev/null); [ -n "$MODEL" ] || MODEL="X111W-A10 (RTL9602C)"
+KERN=$(uname -r)
+UP=$(uptime_h)
+LOAD=$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null)
+MEMT=$(sed -n 's/MemTotal: *\([0-9]*\).*/\1/p' /proc/meminfo)
+MEMA=$(sed -n 's/MemAvailable: *\([0-9]*\).*/\1/p' /proc/meminfo)
+[ -n "$MEMA" ] || MEMA=$(sed -n 's/MemFree: *\([0-9]*\).*/\1/p' /proc/meminfo)
+MEMU=$(( (${MEMT:-0} - ${MEMA:-0}) / 1024 ))M/$(( ${MEMT:-0} / 1024 ))M
+
+# Identity: prefer the live-provisioned env, fall back to factory tool, then /proc.
+MAC=$(ev GPON_MAC);  [ -n "$MAC" ] || MAC=$(cat /sys/class/net/eth0/address 2>/dev/null)
+SN=$(ev GPON_SN);    [ -n "$SN" ]  || SN=$(g sn)
+LOID=$(ev GPON_LOID)
+OUI=$(ev GPON_OUI)
+OLTMODE=$(ev OMCI_OLT_MODE)
+PROVSRC=$(uci -q get gpon.identity.source 2>/dev/null)
+
+# GPON / fiber
+STLINE=$(grep -a '^onu_state' "$PROC" 2>/dev/null | head -1)
+ST=$(echo "$STLINE" | sed -n 's/.*O\([0-9]\).*/\1/p'); [ -n "$ST" ] || ST=0
+STNAME=$(echo "$STLINE" | sed -n 's/.*(\([^)]*\)).*/\1/p')
+RXR=$(sed -n 's/.*optic_rx_raw[:=] *0x*\([0-9a-fA-F]*\).*/\1/p' "$PROC" 2>/dev/null | head -1)
+TXR=$(sed -n 's/.*optic_tx_raw[:=] *0x*\([0-9a-fA-F]*\).*/\1/p' "$PROC" 2>/dev/null | head -1)
+LOS=$(sed -n 's/.*optic_los[:=] *\([0-9]\).*/\1/p' "$PROC" 2>/dev/null | head -1)
+ONUID=$(g onu_id)
+DIST=$(g distance)
+RXDBM=$(dbm "$RXR"); TXDBM=$(dbm "$TXR")
+[ "$ST" = "5" ] && ONLINE=yes || ONLINE=no
+
+# Upstream health (why "no internet" even at O5): grants accepted + US bytes sent.
+USL=$(grep -a '^us_tx:' "$PROC" 2>/dev/null)
+BWM=$(echo "$USL" | sed -n 's/.*bwm_acpt(0x11b0)=\([0-9]*\).*/\1/p')
+USONU=$(echo "$USL" | sed -n 's/.*us_onu_id=\([0-9]*\).*/\1/p')
+GEMUS=$(sed -n 's/.*gemus64=\([0-9]*\).*/\1/p' "$PROC" 2>/dev/null | head -1)
+USTX=$(sed -n 's/.*ustx=\([0-9]*\).*/\1/p' "$PROC" 2>/dev/null | head -1)
+USHINT="ok"
+if [ "$ST" = "5" ]; then
+	[ "${BWM:-0}" = "0" ] && USHINT="US SILENT (no OLT grants matched - check ranging/alloc)"
+	[ "${GEMUS:-0}" = "0" ] && [ "${BWM:-0}" != "0" ] && USHINT="granted but no US data egress"
+else
+	USHINT="not at O5 (no upstream)"
+fi
+
+# WAN (GPON DHCP) - parse ubus ifstatus if present, else from ip
+WANDEV=$(uci -q get network.wan.device 2>/dev/null)
+WANPROTO=$(uci -q get network.wan.proto 2>/dev/null)
+WANIP=""; WANMASK=""; WANGW=""; WANDNS=""; WANUP="down"
+if have ubus; then
+	WS=$(ubus call network.interface.wan status 2>/dev/null)
+	if [ -n "$WS" ]; then
+		WANUP=$(echo "$WS" | sed -n 's/.*"up": *\(true\|false\).*/\1/p' | head -1)
+		[ "$WANUP" = "true" ] && WANUP="up" || WANUP="down"
+		WANIP=$(echo "$WS" | sed -n 's/.*"address": *"\([0-9.]*\)".*/\1/p' | head -1)
+		WANMASK=$(echo "$WS" | sed -n 's/.*"mask": *\([0-9]*\).*/\1/p' | head -1)
+		WANGW=$(echo "$WS" | sed -n 's/.*"nexthop": *"\([0-9.]*\)".*/\1/p' | head -1)
+		WANDNS=$(echo "$WS" | grep -o '"[0-9.]*"' | tr -d '"' | tr '\n' ' ')
+	fi
+fi
+[ -n "$WANDEV" ] && WANMAC=$(cat /sys/class/net/$WANDEV/address 2>/dev/null)
+
+# LAN
+LANIP=$(uci -q get network.lan.ipaddr 2>/dev/null)
+[ -n "$LANIP" ] || LANIP=$(ip -4 addr show br-lan 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -1)
+LEASES=/tmp/dhcp.leases
+NLEASE=0; [ -f "$LEASES" ] && NLEASE=$(wc -l < "$LEASES" 2>/dev/null)
+
+# ---- output ----------------------------------------------------------------
+if [ "$JSON" = "1" ]; then
+	printf '{'
+	printf '"model":"%s","fw":"%s","kernel":"%s","uptime":"%s",' "$MODEL" "$FW" "$KERN" "$UP"
+	printf '"mac":"%s","sn":"%s","loid":"%s","oui":"%s","prov_src":"%s",' "$MAC" "$SN" "$LOID" "$OUI" "$PROVSRC"
+	printf '"onu_state":%s,"onu_state_name":"%s","online":"%s","los":%s,' "$ST" "$STNAME" "$ONLINE" "${LOS:-0}"
+	printf '"rx_dbm":"%s","tx_dbm":"%s","onu_id":"%s","distance":"%s",' "$RXDBM" "$TXDBM" "$ONUID" "$DIST"
+	printf '"us_grants":"%s","us_sent":"%s","us_hint":"%s",' "${BWM:-}" "${GEMUS:-}" "$USHINT"
+	printf '"wan_proto":"%s","wan_up":"%s","wan_ip":"%s","wan_gw":"%s","wan_dns":"%s","wan_mac":"%s",' \
+		"$WANPROTO" "$WANUP" "$WANIP" "$WANGW" "$WANDNS" "$WANMAC"
+	printf '"lan_ip":"%s","lan_clients":%s,"load":"%s","mem":"%s"' "$LANIP" "${NLEASE:-0}" "$LOAD" "$MEMU"
+	printf '}\n'
+	exit 0
+fi
+
+echo "============== ONU DIAGNOSTIC =============="
+printf "Host/FW   : %s | %s\n" "${HOST:-?}" "${FW:-?}"
+printf "Model     : %s | kernel %s\n" "$MODEL" "$KERN"
+printf "Uptime    : %s | load %s | mem %s\n" "$UP" "$LOAD" "$MEMU"
+echo   "-- Identity (provisioning source: ${PROVSRC:-?}) --"
+printf "MAC       : %s\n" "${MAC:-MISSING}"
+printf "SN        : %s\n" "${SN:-MISSING}"
+printf "LOID      : %s   OUI: %s   OLT-mode: %s\n" "${LOID:-?}" "${OUI:-?}" "${OLTMODE:-?}"
+echo   "-- GPON / Fiber --"
+printf "ONU state : O%s%s  [%s]\n" "$ST" "${STNAME:+ ($STNAME)}" "$( [ $ONLINE = yes ] && echo ONLINE || echo offline )"
+printf "RX power  : %s dBm     TX power: %s dBm     LOS: %s\n" "$RXDBM" "$TXDBM" "${LOS:-?}"
+printf "ONU-ID    : %s     OLT distance: %s\n" "${ONUID:-n/a}" "${DIST:-n/a}"
+printf "Upstream  : grants=%s us_sent=%s  [%s]\n" "${BWM:-?}" "${GEMUS:-?}" "$USHINT"
+echo   "-- WAN (GPON, ${WANPROTO:-?}) --"
+printf "State     : %s\n" "$WANUP"
+printf "IP        : %s/%s   gw %s\n" "${WANIP:-none}" "${WANMASK:-?}" "${WANGW:-?}"
+printf "DNS       : %s\n" "${WANDNS:-none}"
+printf "WAN MAC   : %s   dev %s\n" "${WANMAC:-?}" "${WANDEV:-?}"
+echo   "-- LAN --"
+printf "br-lan IP : %s   DHCP clients: %s\n" "${LANIP:-?}" "${NLEASE:-0}"
+if [ -f "$LEASES" ] && [ "${NLEASE:-0}" -gt 0 ]; then
+	awk '{printf "  %-17s %-15s %s\n", $2, $3, $4}' "$LEASES" 2>/dev/null | head -20
+fi
+echo   "-- Ethernet ports --"
+for n in /sys/class/net/*; do
+	i=${n##*/}
+	case "$i" in lo|br-*|wlan*|*.*) continue;; esac
+	[ -e "$n/operstate" ] || continue
+	op=$(cat "$n/operstate" 2>/dev/null)
+	sp=$(cat "$n/speed" 2>/dev/null); dx=$(cat "$n/duplex" 2>/dev/null)
+	carr=$(cat "$n/carrier" 2>/dev/null)
+	[ "$op" = up ] && spd="${sp:-?}Mbps ${dx:-?}" || spd="-"
+	printf "  %-8s %-5s %s\n" "$i" "$op" "$spd"
+done
+echo   "-- Wi-Fi --"
+if have iw; then
+	iw dev 2>/dev/null | awk '/Interface/{i=$2} /ssid/{s=$2} /type/{t=$2}
+		/channel/{c=$2} END{}' >/dev/null
+	for w in $(iw dev 2>/dev/null | sed -n 's/.*Interface //p'); do
+		ssid=$(iw dev "$w" info 2>/dev/null | sed -n 's/.*ssid //p')
+		typ=$(iw dev "$w" info 2>/dev/null | sed -n 's/.*type //p')
+		chan=$(iw dev "$w" info 2>/dev/null | sed -n 's/.*channel \([0-9]*\).*/\1/p')
+		nsta=$(iw dev "$w" station dump 2>/dev/null | grep -c '^Station')
+		printf "  %-6s %-4s ssid '%s' ch %s  clients %s\n" "$w" "$typ" "${ssid:-?}" "${chan:-?}" "$nsta"
+	done
+	[ -z "$(iw dev 2>/dev/null | sed -n 's/.*Interface //p')" ] && echo "  (no wlan interfaces up)"
+else
+	echo "  (iw not available)"
+fi
+echo "============================================"

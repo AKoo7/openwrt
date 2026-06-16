@@ -1,0 +1,31 @@
+#!/bin/sh
+# Per-board WiFi personalization (runs at boot, before netifd brings up wireless).
+# Many ONUs share one RF zone, so derive a UNIQUE SSID from the board MAC to
+# avoid SSID collisions, and default to WPA2-PSK (never open). See CLAUDE.md
+# "WiFi defaults". The PSK below is a per-board-unique DEFAULT derived from
+# MAC+SN; the operator should override it from provisioning.
+
+# Authoritative per-board MAC/SN from this unit's own flash (same source as the
+# GPON identity), with a netdev fallback.
+MAC=$(/usr/sbin/rtk_factory -p config mac 2>/dev/null | tr 'A-F' 'a-f')
+[ -n "$MAC" ] || MAC=$(cat /sys/class/net/eth0/address 2>/dev/null)
+SN=$(/usr/sbin/rtk_factory -p config sn 2>/dev/null)
+
+# SSID = ONU-<last 3 MAC octets> (e.g. 98:c7:a4:32:82:ae -> ONU-3282AE).
+SUFFIX=$(echo "$MAC" | awk -F: 'NF>=6 { printf "%s%s%s", toupper($4), toupper($5), toupper($6) }')
+[ -n "$SUFFIX" ] || SUFFIX="000000"
+SSID="ONU-$SUFFIX"
+
+# Per-board-unique default PSK (>=8 chars). Operator overrides via provisioning.
+PSK=$(printf '%s' "${MAC}${SN}" | sha256sum 2>/dev/null | cut -c1-12)
+[ "${#PSK}" -ge 8 ] || PSK="onu-${SUFFIX}-wifi"
+
+uci -q batch <<EOF
+set wireless.default_radio0.ssid='$SSID'
+set wireless.default_radio0.encryption='psk2'
+set wireless.default_radio0.key='12345678'
+set wireless.radio0.country='BO'
+commit wireless
+EOF
+
+exit 0

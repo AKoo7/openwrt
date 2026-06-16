@@ -3,6 +3,9 @@
 		"description": "Grant access to GPON ONU provisioning",
 		"read": {
 			"uci": [ "gpon" ],
+			"ubus": {
+				"gpon": [ "status" ]
+			},
 			"file": {
 				"/usr/sbin/rtk_factory": [ "exec" ]
 			}
