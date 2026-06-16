@@ -139,10 +139,10 @@ static int r960_run(const struct rtl960x_ops *o,
 /* misc */
 #define C1B_R_SDS1_CFG	0x1B000088u	/* SerDes lane-1 mode select [4:0]   */
 #define C1B_R_SOFT_RST	0x1B000044u	/* queue reset pulse @bit3           */
-#define C1B_R_PMISC_PON	0x1B020408u	/* PON port misc (undersize allow)   */
-#define C1B_R_ACC_LEN_PON	0x1B023038u	/* PON RX accept max length          */
+#define C1B_R_PMISC_PON	0x1B020028u	/* P_MISC: base 0x20008 + PON port 1 * stride 0x20 */
+#define C1B_R_ACC_LEN_PON	0x1B023054u	/* ACCEPT_MAX_LEN: 0x23034 + PON port 1 * stride 0x20 */
 #define C1B_R_ACC_LEN_UTP	0x1B023034u	/* UTP RX accept max length          */
-#define C1B_R_TX_LEN_PON	0x1B01100Cu	/* PON TX max length                 */
+#define C1B_R_TX_LEN_PON	0x1B011028u	/* TX_MAX_LEN: 0x11008 + PON port 1 * stride 0x20 */
 #define C1B_R_TX_LEN_UTP	0x1B011008u	/* UTP TX max length                 */
 #define C1B_R_PORT_CLK	0x1B020450u	/* per-port MAC clock select @bit2   */
 
@@ -488,7 +488,7 @@ static int rtl9601b_serdes_cdr_reset(const struct rtl960x_ops *o)
 #define C3_SOFTWARE_RST		0x1b0000e0u /* global soft-reset command word     */
 #define C3_SDS_CFG		0x1b000200u /* SerDes lane mode select            */
 #define C3_DYNGASP_CTRL		0x1b00021cu /* dying-gasp comparator control      */
-#define C3_P_MISC_PON		0x1b020404u /* per-port misc, PON port (port 4)   */
+#define C3_P_MISC_PON		0x1b020084u /* P_MISC: base 0x20004 + PON port 4 * stride 0x20 */
 #define C3_PON_INBW_LBOUND	0x1b023180u /* DS in-band accumulation low bound  */
 #define C3_WSDS_DIG_00		0x1b040030u /* SerDes digital: clock control      */
 #define C3_WSDS_DIG_02		0x1b040038u /* SerDes digital: BEN power-down      */
@@ -510,6 +510,7 @@ static int rtl9601b_serdes_cdr_reset(const struct rtl960x_ops *o)
 #define C3_PON_BW_THRES		0x1bf021a0u /* upstream BW request thresholds     */
 #define C3_PON_OMCI_CFG		0x1bf021a4u /* OMCI flow/SID select               */
 #define C3_PON_SCH_CTRL		0x1bf021e4u /* scheduler control                  */
+#define C3_PON_SID2QID		0x1bf0210cu /* flow(SID) -> physical queue (7-bit/elem) */
 
 /* fixed chip parameters for the GPON datapath */
 #define C3_SID_COUNT		128	/* classifier SID / flow slots          */
@@ -521,6 +522,14 @@ static inline void c3_sidvalid(const struct rtl960x_ops *o, u32 idx, u32 v)
 	u8 b = idx & 31u;
 
 	rtl960x_rfwr(o, C3_PON_SIDVALID + (idx >> 5) * 4u, b, b, v);
+}
+
+/* SID2QID: 7-bit physical-queue field per flow, 4 flows per 32-bit word */
+static void c3_flow2queue(const struct rtl960x_ops *o, u32 flow, u32 pqid)
+{
+	u32 lsb = (flow % 4u) * 7u;
+
+	rtl960x_rfwr(o, C3_PON_SID2QID + (flow / 4u) * 4u, lsb + 6u, lsb, pqid);
 }
 
 /*
@@ -619,10 +628,15 @@ static int c3_gpon_mode_set(const struct rtl960x_ops *o)
 	u32 f;
 	int rc;
 
-	/* park every data flow's SID as invalid; OMCI flow is armed afterwards */
-	for (f = 0; f < C3_SID_COUNT - 1u; f++)
+	/* park every data flow's SID as invalid + map to the default queue; the
+	 * OMCI flow is armed afterwards. Without the SID2QID map the OMCI SID is
+	 * valid but bound to no queue and no traffic passes. */
+	for (f = 0; f < C3_SID_COUNT - 1u; f++) {
 		c3_sidvalid(o, f, 0);
+		c3_flow2queue(o, f, 0x7f);
+	}
 	c3_sidvalid(o, C3_OMCI_FLOW, 1);		/* OMCI flow: SID valid    */
+	c3_flow2queue(o, C3_OMCI_FLOW, 0x7f);		/* OMCI flow -> queue      */
 	rtl960x_rfwr(o, C3_PON_OMCI_CFG, 6, 0, C3_OMCI_FLOW); /* OMCI SID select   */
 
 	rc = r960_run(o, c3_sds_pre,  ARRAY_SIZE(c3_sds_pre));

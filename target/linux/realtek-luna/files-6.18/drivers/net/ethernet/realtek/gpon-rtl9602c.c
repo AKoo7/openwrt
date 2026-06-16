@@ -4877,21 +4877,35 @@ static int __init rtl9602c_gpon_init(void)
 	 * usable and /proc/gpon reports the live state for diagnosis.
 	 */
 	{
-		int sret = family_lib
-			? rtl960x_ponmac_mode_set(RTL960X_CHIP_9602C, RTL960X_REV_A,
-						  RTL960X_SUBTYPE_NONE, RTL960X_MODE_GPON,
-						  &rtl9602c_r960_ops)
-			: (serdes_stock_seq ? gpon_serdes_init_stock() : gpon_serdes_init());
+		const char *via;
+		int sret;
+
+		if (family_lib) {
+			/* bring up via the clean-room family lib (the open-source path) */
+			sret = rtl960x_ponmac_mode_set(RTL960X_CHIP_9602C, RTL960X_REV_A,
+						       RTL960X_SUBTYPE_NONE,
+						       RTL960X_MODE_GPON, &rtl9602c_r960_ops);
+			via = "family-lib 9602C";
+			/* STABILITY fallback: if the lib path ever fails to bring the analog
+			 * ready, fall back to the months-tested inline bring-up so the board
+			 * always comes up. (The lib path is a faithful translation, so this is
+			 * a belt-and-suspenders safety net, not an expected path.) */
+			if (sret) {
+				pr_warn("rtl9602c-gpon: family-lib SerDes not ready (0x%08x) -> inline fallback\n",
+					sw_rd(FIB_EXT_REG21));
+				sret = gpon_serdes_init();
+				via = "inline fallback";
+			}
+		} else {
+			sret = serdes_stock_seq ? gpon_serdes_init_stock() : gpon_serdes_init();
+			via = serdes_stock_seq ? "stock rev-A order" : "GPON mode";
+		}
 
 		if (sret)
 			pr_warn("rtl9602c-gpon: SerDes analog-ready not seen (%s, FIB_EXT_REG21=0x%08x)\n",
-				family_lib ? "family-lib" :
-				(serdes_stock_seq ? "stock-seq" : "ours"),
-				sw_rd(FIB_EXT_REG21));
+				via, sw_rd(FIB_EXT_REG21));
 		else
-			pr_info("rtl9602c-gpon: PON SerDes up (%s, analog ready)\n",
-				family_lib ? "family-lib 9602C" :
-				(serdes_stock_seq ? "stock rev-A order" : "GPON mode"));
+			pr_info("rtl9602c-gpon: PON SerDes up (%s, analog ready)\n", via);
 	}
 
 	/*
