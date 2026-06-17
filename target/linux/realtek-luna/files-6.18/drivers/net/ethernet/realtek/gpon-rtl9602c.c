@@ -644,7 +644,7 @@ MODULE_PARM_DESC(apc_off, "skip bosa_apc_calibrate (1=A4 image alone; 0=run APC 
  * keeps EN_L burst-gated (NOT CW, DS-safe), and aborts on MPD/no-feedback.
  * Stock O5 targets: R29(0x31d)=0x3f, R30(0x31e)=0xa0, 0x204=0x8e (EN_L=0).
  */
-static bool apc_offk;		/* default FALSE: ships safe; gpon.apc_offk=1 -> rtl8290b_apc_init OFFK ignition + runtime servo (WIP: OFFK phases 4,5 not yet converging) */
+static bool apc_offk;		/* default OFF: OFFK converges (R29=0x3f) but does NOT lift WAN rate; not the WAN root cause */
 module_param(apc_offk, bool, 0444);
 MODULE_PARM_DESC(apc_offk, "run rtl8290b_apc_init B-variant OFFK ignition (completes modulator offset cal; default 0 = unchanged)");
 /* TEMP default true (LAN+WiFi ACCESS build): hold the ONU FSM at O1 (no ranging),
@@ -1653,168 +1653,145 @@ static void __init bosa_apc_calibrate(void)
  */
 static void __init rtl8290b_apc_init(void)
 {
-	/* Per-board DCL setpoints (rtl8290b.data[0x542..0x544] for Board C). */
-	const u8 P0 = 0x26, P1 = 0x50, Pavg = 0x50;
-	/* Operating bias/mod LUT @25C (per-board optical cal; 12-bit DAC = byte<<4).
-	 * Stock O5 mod converges higher (0x69) once OFFK completes; we load the
-	 * calibrated LUT entry and let the servo converge — NEVER above the LUT. */
-	const u8 lut_bias = 0x18, lut_mod = 0x34;
+	/* Exact stock rtl8290b_apc_init (GPON/pon=1), transcribed verbatim from
+	 * europa_drv.ko @0x9ae4 with dpoConfig @ rtl8290b.data+0x578. setReg ->
+	 * bosa_write_reg, setRegBit -> bosa_set_bit, setRegBits -> bosa_set_field
+	 * (val shifted into the mask's low bit, == stock). The OFFK offset
+	 * compute+write (0x243/0x245) is GATED on dpo[0x72]!=0 in stock; ours is 0,
+	 * so stock SKIPS it -> we MUST NOT write it (the spurious write parked R29 at
+	 * 0x0e). The terminal OFFK latch ((R29 0x31d &0x3c)==0x3c) is done by the
+	 * runtime servo in gpon_fsm_poll, once the laser bursts at O5. */
 	static const u8 w77_a[] = { 0xa8, 0xb0, 0xd0, 0xd8, 0xe8, 0xe0 };
 	static const u8 w77_b[] = { 0xb0, 0xd0, 0xb8, 0xb0, 0xd0, 0xc0 };
-	int i, j, r29 = 0, off;
+	int i, j;
 	u8 t8;
 
-	pr_info("rtl9602c-gpon: rtl8290b_apc_init: B-variant OFFK ignition start\n");
+	pr_info("rtl9602c-gpon: rtl8290b_apc_init: B-variant OFFK (exact stock seq, base 0x578)\n");
 
-	/* --- per-board DCL setpoints (W58/W59/W61) --- */
-	bosa_write_reg(0x23a, P0);		/* W58 DCL P0   */
-	bosa_write_reg(0x23b, P1);		/* W59 DCL P1   */
-	bosa_write_reg(0x23d, Pavg);		/* W61 DCL Pavg */
-
-	/* --- power-on kick + gate (apc_init steps 2-4) ---
-	 * setReg(0x380,1); require getReg(0x380)==1 else there is no MCU to run the
-	 * OFFK FSM -> abort. Then ~10ms MCU settle. */
-	bosa_write_reg(0x380, 1);
+	/* step 1: MCU power-on kick + gate + ~11ms settle */
+	bosa_write_reg(0x380, 0x01);
 	if ((bosa_read_reg(0x380) & 0xff) != 1) {
-		pr_warn("rtl9602c-gpon: rtl8290b_apc_init: MCU power-on kick (0x380!=1) failed -> abort\n");
+		pr_warn("rtl9602c-gpon: rtl8290b_apc_init: MCU power-on (0x380!=1) -> abort\n");
 		return;
 	}
-	mdelay(10);
+	for (i = 0; i < 11; i++)
+		udelay(1000);
 
-	/* --- CHECK_READY (rtl8290b_powerOnStatus_get): two-stage poll ---
-	 * stage1: (0x383 & 0xe0)==0xc0 ; stage2: (0x301 & 0x80)!=0. ~20000-iter
-	 * bound each (stock counter). Warn but continue on timeout — the OFFK gate
-	 * below is the real arbiter. */
+	/* CHECK_READY: (0x383&0xe0)==0xc0, then (0x301 b7) */
 	for (i = 0; i < 20000; i++) {
-		int s = bosa_read_reg(0x383);
+		int sret = bosa_read_reg(0x383);
 
-		if (s >= 0 && (s & 0xe0) == 0xc0)
+		if (sret >= 0 && (sret & 0xe0) == 0xc0)
 			break;
 		udelay(50);
 	}
-	if (i == 20000)
-		pr_warn("rtl9602c-gpon: rtl8290b_apc_init: CHECK_READY stage1 (0x383&0xe0!=0xc0) timeout\n");
-	if (!bosa_poll_bit(0x301, 7, 1, 50, 20000))
-		pr_warn("rtl9602c-gpon: rtl8290b_apc_init: CHECK_READY stage2 (0x301 b7) timeout\n");
+	bosa_poll_bit(0x301, 7, 1, 50, 20000);
 
-	/* --- OFFK enable trio (apc_init steps 5-7), the B precursors our non-B flow
-	 * never wrote: W78 b7, then W62=0xfd, W63=0xfd (OFFK_EN + all OFFK_FSM
-	 * phases). Order matters: 0x24e b7 first, then 0x23e, then 0x23f. --- */
-	bosa_set_bit(0x24e, 7, 1);		/* W78 b7 */
-	bosa_write_reg(0x23e, 0xfd);		/* W62 OFFK_EN */
-	bosa_write_reg(0x23f, 0xfd);		/* W63 OFFK_EN + FSM phases */
-	bosa_set_field(0x23a, 0xff, P0);	/* re-assert W58 P0 after enable */
+	/* step 2: OFFK enable trio (W78 b7; W62=W63=0xfd full bytes) */
+	bosa_set_bit(0x24e, 7, 1);
+	bosa_write_reg(0x23e, 0xfd);
+	bosa_write_reg(0x23f, 0xfd);
 
-	/* --- APC bias/mod ceiling + servo params (apc_init steps 8-20).
-	 * These mirror the analog-front-end arm in bosa_apc_calibrate idx2; the
-	 * bias-max/min are the ignition ceilings the servo stays below. --- */
-	bosa_set_field(0x245, 0xff, 0x10);
-	bosa_set_field(0x245, 0x0c, 0x00);
-	bosa_write_reg(0x284, 0x01);		/* W88 ERC chopper region */
-	bosa_write_reg(0x27c, 0x08);		/* W80 */
-	bosa_write_reg(0x247, 0x05);
-	bosa_write_reg(0x248, 0x86);		/* W72 bias-max */
-	bosa_write_reg(0x239, 0xfc);
-	bosa_set_bit(0x24a, 3, 1);
-	bosa_write_reg(0x249, 0x06);		/* W73 bias-min */
-	bosa_write_reg(0x24c, 0x71);
-	bosa_write_reg(0x24c, 0x72);
-	bosa_write_reg(0x247, 0x06);
-	bosa_write_reg(0x248, 0x87);		/* W72 bias-max final */
-	bosa_write_reg(0x232, 0x07);
-	bosa_write_reg(0x244, 0xf8);
-	bosa_set_bit(0x252, 3, 1);
-	bosa_set_field(0x239, 0xff, 0xfc);
-	bosa_set_field(0x23c, 0xff, 0xfd);	/* W60 TIA */
+	/* step 3: per-field config (dpoConfig@0x578, pon=1 values) */
+	bosa_write_reg(0x23a, 0x00);		/* apcIavg = 0			*/
+	bosa_set_field(0x23b, 0xf0, 0x02);	/* apcEr (dpo[0x1e]=2)		*/
+	bosa_set_field(0x23b, 0x0c, 0x03);	/* apcApcTimer = 3		*/
+	bosa_set_field(0x23b, 0x03, 0x03);	/* apcErcTimer = 3		*/
+	bosa_set_field(0x240, 0x03, 0x00);	/* apcLpfBw = 0			*/
+	bosa_set_bit(0x23e, 0, 0);		/* txsdMode = 0			*/
+	bosa_set_field(0x24c, 0xe0, 0x01);	/* txsdTh = 1			*/
+	bosa_set_bit(0x24c, 4, 1);		/* txsdTiaGain = 1		*/
+	bosa_set_bit(0x24c, 3, 1);		/* txsdHighLoopGain = 1		*/
+	for (i = 0; i < 11; i++)
+		udelay(1000);
+	bosa_read_reg(0x31d);
 
-	/* --- W77 (0x24d) MCU-command handshake BATCH 1 (apc_init steps 21-26) ---
-	 * each: write CMD, ~10ms settle, read R29(0x31d) (MCU consumes). */
+	/* step 4: W77 (0x24d) MCU-command walk BATCH 1 */
 	for (j = 0; j < ARRAY_SIZE(w77_a); j++) {
 		bosa_write_reg(0x24d, w77_a[j]);
-		mdelay(10);
+		for (i = 0; i < 11; i++)
+			udelay(1000);
 		bosa_read_reg(0x31d);
 	}
 
-	/* ERC chopper + W80 b3 toggle (apc_init steps 27-29). */
-	bosa_set_bit(0x243, 7, 1);		/* W67 b7 */
+	/* step 5: ERC chopper + W80 b3 toggle */
+	bosa_set_bit(0x243, 7, 1);
+	bosa_set_bit(0x284, 6, 1);
+	bosa_set_bit(0x284, 5, 1);
+	bosa_set_bit(0x284, 4, 1);		/* apcErcChopperEn = 1 (b6/b5/b4) */
 	t8 = bosa_read_reg(0x27c) & 0xff;
-	bosa_write_reg(0x27c, t8 & 0xf7);	/* W80 clear b3 */
-	bosa_write_reg(0x27c, t8 | 0x08);	/* W80 set b3 */
+	bosa_write_reg(0x27c, t8 & 0xf7);
+	bosa_write_reg(0x27c, t8 | 0x08);
 
-	/* --- W77 handshake BATCH 2 (apc_init steps 30-35) --- */
+	/* step 6: W77 walk BATCH 2 */
 	for (j = 0; j < ARRAY_SIZE(w77_b); j++) {
 		bosa_write_reg(0x24d, w77_b[j]);
-		mdelay(10);
-		r29 = bosa_read_reg(0x31d);	/* s2 = last R29 read */
+		for (i = 0; i < 11; i++)
+			udelay(1000);
+		bosa_read_reg(0x31d);
 	}
 
-	pr_info("rtl9602c-gpon: rtl8290b_apc_init: post-W77 R29=0x%02x R30=0x%02x 0x383=0x%02x 0x301=0x%02x\n",
-		r29 & 0xff, bosa_read_reg(0x31e) & 0xff,
-		bosa_read_reg(0x383) & 0xff, bosa_read_reg(0x301) & 0xff);
+	/* step 7: OFFK offset compute+write -- STOCK SKIPS IT (dpo[0x72]=0). */
 
-	/* ★OFFK OFFSET APPLY (this write was MISSING -> R29 stalled at 0x0c).
-	 * The W77 command-byte walk above MEASURED the modulator offset into R29
-	 * (s2 = last read after cmd 0xc0). Compute the correction code and WRITE it
-	 * to the OFFK offset DAC 0x245, bracketed by 0x243 0x82->0xa2. For GPON
-	 * fsu_offset_param (dpo[0x72]) = 0 (base-independent) so off = s2 & 0x7f.
-	 * Without applying it the FSU FSM never reaches phases 4,5 (R29 &0x3c). */
-	off = r29 & 0x7f;
-	bosa_set_bit(0x243, 7, 1);
-	bosa_write_reg(0x243, 0x82);
-	bosa_write_reg(0x245, off);		/* apply measured OFFK offset (was omitted) */
-	bosa_write_reg(0x243, 0xa2);
-	pr_info("rtl9602c-gpon: rtl8290b_apc_init: OFFK offset applied s2=0x%02x -> 0x245=0x%02x\n",
-		r29 & 0xff, off);
-
-	/* --- DCL loop mode (apc_init steps 40-42): W80[7:6]=3 (DCL) --- */
-	bosa_set_field(0x27c, 0xc0, 0x03);
-
-	/* --- Ibias/Imod init codes via the shared 0x23d b7 strobe (clear->load->set).
-	 * Ibias hi8=0x236, lo nibble 0x238[3:0]; Imod hi8=0x237, hi nibble 0x238[7:4].
-	 * Pre-seat the calibrated LUT so OFFK converges around the right operating
-	 * point (NEVER above the per-temperature LUT byte = laser safety). --- */
+	/* step 8: bias/mod init-code seeds (dpo[0x65]=0 -> manual path) + loop mode */
 	bosa_set_bit(0x23d, 7, 0);
-	bosa_set_field(0x236, 0xff, lut_bias);
-	bosa_set_field(0x238, 0x0f, 0x00);
+	bosa_set_field(0x236, 0xff, 0x10);	/* Ibias init 0x100 >> 4 (stock seed)	*/
+	bosa_set_field(0x238, 0x0f, 0x00);	/* Ibias[3:0] = 0		*/
 	bosa_set_bit(0x23d, 7, 1);
 	bosa_set_bit(0x23d, 7, 0);
-	bosa_set_field(0x237, 0xff, lut_mod);
-	bosa_set_field(0x238, 0xf0, 0x00);
+	bosa_set_field(0x237, 0xff, 0x20);	/* Imod init 0x200 >> 4 (stock seed)	*/
+	bosa_set_field(0x238, 0xf0, 0x00);	/* Imod[3:0] = 0		*/
 	bosa_set_bit(0x23d, 7, 1);
+	bosa_set_field(0x27c, 0xc0, 0x03);	/* apcLoopMode DCL (remap 1->3)	*/
+	bosa_set_bit(0x24a, 4, 0);		/* apcLoopModeEx = 0		*/
+	bosa_set_field(0x23d, 0x70, 0x04);	/* apcLaserOnDelay = 4		*/
+	bosa_set_field(0x23d, 0x03, 0x02);	/* apcSettleCnt = 2		*/
+	bosa_set_field(0x239, 0x38, 0x05);	/* apcApcLoopGain = 5		*/
+	bosa_set_field(0x23c, 0x07, 0x00);	/* apcCmpd = 0			*/
+	bosa_set_field(0x239, 0x07, 0x03);	/* apcErcLoopGain = 3		*/
+	bosa_set_field(0x23c, 0xf8, 0x05);	/* apcErTrim = 5		*/
 
-	/* Disarm the MPD high/low fault-detect for the OFFK window only (re-armed,
-	 * minus the false-tripping MPD bits, at the end). The LUT clamp above holds
-	 * laser safety; we re-check the real MPD feedback after ignition. */
-	bosa_set_field(0x235, 0xff, 0x00);
+	/* step 9: FSU config (the previously-guessed block, now exact) */
+	bosa_set_bit(0x241, 6, 1);		/* fsuMode = 1			*/
+	bosa_set_field(0x241, 0x30, 0x01);	/* fsuApcLoopGain = 1 (b4-5)	*/
+	bosa_set_field(0x241, 0x0c, 0x01);	/* fsuApcRampb = 1 (b2-3)	*/
+	bosa_set_field(0x241, 0x03, 0x03);	/* fsuApcRampm = 3		*/
+	bosa_set_bit(0x242, 7, 1);		/* fsuRstCount = 1		*/
+	bosa_set_field(0x242, 0x60, 0x02);	/* fsuSettleCount = 2 (b5-6)	*/
+	bosa_set_field(0x242, 0x18, 0x02);	/* fsuErcLoopGain = 2 (b3-4)	*/
+	bosa_set_field(0x242, 0x06, 0x00);	/* fsuErcRampm = 0 (b1-2)	*/
 
-	/* --- FSU / OFFK-FSM config block (apc_init steps 48-65). fsuMode b6=0. --- */
-	bosa_set_bit(0x241, 6, 0);		/* fsuMode 0 (W65 b6) */
-	bosa_set_field(0x230, 0xff, 0x00);
+	/* step 10: txsd off-rst */
+	bosa_set_bit(0x27c, 3, 1);		/* txsdOffRstCount = 1		*/
 
-	/* Final OFFK strobe arm + commit (apc_init steps 66-68). */
+	/* step 11: ceilings + enables (modmax 0xcc, biasmax 0x4d, biasmin 0x01) */
+	bosa_set_bit(0x246, 2, 0);
+	bosa_set_field(0x247, 0xff, 0xcc);
+	bosa_set_bit(0x246, 2, 1);		/* apcModMax = 0xcc		*/
+	bosa_set_bit(0x246, 1, 0);
+	bosa_set_field(0x248, 0xff, 0x4d);
+	bosa_set_bit(0x246, 1, 1);		/* apcBiasMax = 0x4d		*/
+	bosa_set_bit(0x284, 7, 0);		/* apcCrossEn = 0		*/
+	bosa_set_bit(0x246, 0, 0);
+	bosa_set_field(0x249, 0xff, 0x01);
+	bosa_set_bit(0x246, 0, 1);		/* apcBiasMin = 0x01		*/
+	bosa_set_bit(0x246, 5, 1);		/* apcModMaxEn = 1		*/
+	bosa_set_bit(0x246, 3, 1);		/* apcBiasMinEn = 1		*/
+	bosa_set_field(0x283, 0xff, 0x01);	/* apcCrossStr = 1		*/
+
+	/* step 12: FSU ARM (0x27c b5=0->b4=1->0x20e b7=1->0x27c b5=1) + commit */
+	bosa_set_bit(0x27c, 5, 0);
+	bosa_set_bit(0x27c, 4, 1);
+	bosa_set_bit(0x20e, 7, 1);
+	bosa_set_bit(0x27c, 5, 1);
 	bosa_write_reg(0x232, 0xc0);
 	bosa_write_reg(0x24a, 0x60);
 
-	/* --- DIGITAL_POWER_ON + FSU ARM (the OFFK measurement window) ---
-	 * fsuEnable_set(enable=1): 0x27c b5=0; 0x27c b4=1; 0x20e b7=1; 0x27c b5=1.
-	 * This brackets the OFFK measurement; EN_L stays burst-gated (NOT pinned CW)
-	 * — the modulator is nulled BETWEEN bursts, which is what keeps DS-RX alive. */
-	bosa_set_bit(0x380, 0, 1);		/* digital power-on */
-	bosa_set_bit(0x27c, 5, 0);		/* FSU arm: W80 b5 low */
-	bosa_set_bit(0x27c, 4, 1);		/*          W80 b4 high */
-	bosa_set_bit(0x20e, 7, 1);		/*          W14 b7 high (LOADIN) */
-	bosa_set_bit(0x27c, 5, 1);		/*          W80 b5 high (path strobe) */
-
-	/* OFFK convergence is NOT done here. A 12s cold-__init poll left R29=0x03:
-	 * the FSU/OFFK FSM only converges while the laser is BURSTING at O5 (stock
-	 * latches it via the continuous europa_LoopMon servo, not at cold boot), and
-	 * igniting EN_L CW here deafens the shared DS-RX while the modulator is still
-	 * un-nulled. So leave the FSU ARMED (above); do NOT poll/latch/ignite here
-	 * (the normal bosa_tx_enable burst path already leases ~50%). The runtime
-	 * servo in gpon_fsm_poll latches OFFK once the laser bursts at O5. */
-	(void)r29;
 	apc_offk_armed = 1;
-	pr_info("rtl9602c-gpon: rtl8290b_apc_init: OFFK config + FSU armed; runtime servo latches at O5 (R29 0x31d -> &0x3c==0x3c)\n");
+	pr_info("rtl9602c-gpon: rtl8290b_apc_init: armed; post-cfg R29=0x%02x R30=0x%02x 0x241=0x%02x 0x242=0x%02x 0x247=0x%02x 0x248=0x%02x; servo latches at O5\n",
+		bosa_read_reg(0x31d) & 0xff, bosa_read_reg(0x31e) & 0xff,
+		bosa_read_reg(0x241) & 0xff, bosa_read_reg(0x242) & 0xff,
+		bosa_read_reg(0x247) & 0xff, bosa_read_reg(0x248) & 0xff);
 }
 
 static void __init bosa_probe(void)
@@ -5011,8 +4988,12 @@ static void gpon_fsm_poll(struct timer_list *t)
 	 * O5, latch the RTL8290B modulator-offset cal. Runs in this same softirq as
 	 * bosa_laser_maint() (serialized BOSA I2C). Strobe 0x24d=0xb0, read R29
 	 * (0x31d); on (&0x3c)==0x3c latch (clr FSU arm 0x20e.b7 + 0x27c.b4) once. */
-	if (apc_offk_armed && !apc_offk_latched && gpon_fsm_state == 5 &&
-	    (gpon_fsm_ticks % 10) == 0) {
+	/* Run from boot (NOT gated on O5): stock's europa_LoopMon converges OFFK
+	 * continuously from driver init, so the modulator is nulled BEFORE the OLT
+	 * ranges -> the first real bursts are clean. Gating on O5 latched ~17s too
+	 * late (after deact churn started). OFFK uses an internal ref, no burst
+	 * needed. Poll every ~50ms until latched. */
+	if (apc_offk_armed && !apc_offk_latched && (gpon_fsm_ticks % 5) == 0) {
 		int r;
 
 		bosa_write_reg(0x24d, 0xb0);
