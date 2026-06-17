@@ -26,10 +26,25 @@
 #include <asm/reboot.h>
 #include <asm/time.h>
 
-/* SoC watchdog control (KSEG1). bit31 = enable. */
+/*
+ * SoC watchdog timer (KSEG1), TC block. Forcing a WDT timeout is the only reset
+ * that actually re-enters the boot ROM: the control register's RESET_MODE=0 is a
+ * H/W full-chip reset (resets the CPU AND the PLL/analog/SerDes domains, ~= a
+ * power-on reset). Poking the swcore software-reset register (0x1b0000e0 bit7)
+ * only resets the switch core, leaving the CPU spinning -> the board hangs and
+ * never reboots, which also defeats the GPON WAN cold-start auto-recovery
+ * (a clean reboot is what re-rolls the non-deterministic upstream analog lock).
+ *
+ * BSP_WDTCTRLR @0x18003268: [31] enable, [30:29] clk-scale (0=2^25 .. 3=2^28
+ * LX clocks/unit), [26:22] phase-1 timeout (5b), [19:15] phase-2 timeout (5b),
+ * [1:0] reset-mode (0=full chip, 1=CPU+IPSec, 2=S/W). Kick reg @0x18003260.
+ */
 #define LUNA_WDT_CTRL		((void __iomem *)CKSEG1ADDR(0x18003268))
-/* Software-reset register (KSEG1). bit7 = system reset. */
-#define LUNA_SOFT_RESET		((void __iomem *)CKSEG1ADDR(0x1b0000e0))
+#define LUNA_WDT_E		BIT(31)		/* watchdog enable          */
+#define LUNA_WDT_CLK_SC_SHIFT	29		/* overflow scale           */
+#define LUNA_WDT_PH1_TO_SHIFT	22		/* phase-1 timeout          */
+#define LUNA_WDT_PH2_TO_SHIFT	15		/* phase-2 timeout          */
+#define LUNA_WDT_RST_FULLCHIP	0u		/* RESET_MODE = full chip   */
 
 extern char __dtb_start[];
 void prom_putchar(char c);	/* bring-up bisect markers (remove later) */
@@ -37,10 +52,20 @@ void prom_putchar(char c);	/* bring-up bisect markers (remove later) */
 static void luna_machine_restart(char *command)
 {
 	local_irq_disable();
-	pr_emerg("Restarting via SoC soft-reset...\n");
+	pr_emerg("Restarting via SoC watchdog full-chip reset...\n");
+	/*
+	 * Full-chip reset, fastest scale (2^25 LX clocks ~ 0.17s), phase-1=1,
+	 * phase-2=0, enabled; do NOT kick it -> it times out almost immediately
+	 * and the boot ROM takes over. Spin until the reset lands.
+	 */
+	__raw_writel(LUNA_WDT_E |
+		     (0u << LUNA_WDT_CLK_SC_SHIFT) |
+		     (1u << LUNA_WDT_PH1_TO_SHIFT) |
+		     (0u << LUNA_WDT_PH2_TO_SHIFT) |
+		     LUNA_WDT_RST_FULLCHIP,
+		     LUNA_WDT_CTRL);
 	while (1)
-		__raw_writel(__raw_readl(LUNA_SOFT_RESET) | BIT(7),
-			     LUNA_SOFT_RESET);
+		cpu_relax();
 }
 
 static void luna_machine_halt(void)
