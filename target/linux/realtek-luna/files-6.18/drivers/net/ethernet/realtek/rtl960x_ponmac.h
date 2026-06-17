@@ -79,4 +79,5 @@ int rtl960x_ponmac_mode_set(enum rtl960x_chip chip, int rev, int subtype,
 int rtl960x_ponmac_serdes_cdr_reset(enum rtl960x_chip chip,
 				    const struct rtl960x_ops *o);
 
+extern int rtl960x_c2_postmode_perturb;
 #endif /* _RTL960X_PONMAC_H */

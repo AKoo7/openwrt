@@ -585,6 +585,15 @@ static bool family_lib = true;	/* default ON: the clean-room rtl960x_ponmac fami
 				 * translation of gpon_serdes_init). gpon.family_lib=0 = legacy inline. */
 module_param(family_lib, bool, 0644);
 MODULE_PARM_DESC(family_lib, "1=bring up SerDes via rtl960x_ponmac family lib (9602C path, default); 0=inline gpon_serdes_init");
+/* serdes_postmode_perturb: the family-lib path performs TWO US-TX serializer edges
+ * AFTER GPON mode is committed that stock rev-A does NOT (DIG_1D[16] reset-B
+ * re-sync + a post-mode serdesCdr_reset pulse). These were NEVER cleanly A/B'd
+ * (the serdes_cdr_reset param does not gate the family-lib path). DEFAULT 0
+ * (=stock-matching: skip them) — prime suspect for cold-start serializer-phase
+ * jitter (WAN ~50%). gpon.serdes_postmode_perturb=1 restores legacy behavior. */
+static bool serdes_postmode_perturb;	/* default false: skip post-mode perturbations (stock rev-A) */
+module_param(serdes_postmode_perturb, bool, 0644);
+MODULE_PARM_DESC(serdes_postmode_perturb, "1=do post-GPON-mode DIG_1D resync + serdesCdr_reset (legacy); 0=skip (stock rev-A, default)");
 
 /* Register accessor the family lib injects: absolute phys -> KSEG1 uncached MMIO
  * (phys < 0x20000000 on this SoC: swcore 0x1b000000 / PON-IP 0x1bf00000). */
@@ -5095,6 +5104,7 @@ static int __init rtl9602c_gpon_init(void)
 		const char *via;
 		int sret;
 
+		rtl960x_c2_postmode_perturb = serdes_postmode_perturb;	/* A/B: skip the post-GPON-mode US-TX perturbations (default = skip, stock rev-A) */
 		if (family_lib) {
 			/* bring up via the clean-room family lib (the open-source path) */
 			sret = rtl960x_ponmac_mode_set(RTL960X_CHIP_9602C, RTL960X_REV_A,

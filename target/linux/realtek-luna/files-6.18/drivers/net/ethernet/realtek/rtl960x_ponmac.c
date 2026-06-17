@@ -1399,12 +1399,25 @@ static const struct r960_op c2_sds_tx[] = {
  * re-sync (DIG_1D[16] 0->1) so the TX serializer re-locks onto the connected
  * framer data now that GPON mode is live.
  */
+/* A/B knob set by the board (gpon.serdes_postmode_perturb). When 0, skip the TWO
+ * post-GPON-mode US-TX serializer perturbations that stock rev-A does NOT do: the
+ * DIG_1D[16] reset-B re-sync (c2_sds_txresync below) and the post-mode
+ * serdesCdr_reset pulse. These late edges on the already-running serializer are
+ * the prime suspect for per-boot serializer-phase jitter (cold-start WAN ~50%).
+ * Default 1 = legacy behavior. */
+int rtl960x_c2_postmode_perturb = 1;
+
 static const struct r960_op c2_sds_mode[] = {
 	FLD(C2_SDS_ANA_MISC_REG02, 13, 13, 1),	/* signal-detect value = 1        */
 	FLD(C2_SDS_ANA_MISC_REG02, 12, 12, 1),	/* force signal-detect            */
 	DLY(10),
 	FLD(C2_SDS_CFG, 4, 0, C2_SDS_MODE_GPON),/* select GPON mode (very last)   */
 	DLY(50),
+};
+
+/* Post-GPON-mode TX-interface reset-B re-sync (DIG_1D[16] 0->1) — stock rev-A
+ * OMITS this; gated by rtl960x_c2_postmode_perturb. */
+static const struct r960_op c2_sds_txresync[] = {
 	FLD(C2_WSDS_DIG_1D, 16, 16, 0),		/* TX interface reset-B 0         */
 	DLY(2),
 	FLD(C2_WSDS_DIG_1D, 16, 16, 1),		/* TX interface reset-B 1         */
@@ -1456,14 +1469,19 @@ static int rtl9602c_ponmac_mode_set(const struct rtl960x_ops *o,
 	if (ret)
 		return ret;
 
-	/* Steps 7a + 7b + TX reset-B re-sync. */
+	/* Step 7a + 7b: force-SD + commit GPON mode. */
 	ret = r960_run(o, c2_sds_mode, ARRAY_SIZE(c2_sds_mode));
 	if (ret)
 		return ret;
 
-	/* US-TX serdesCdr_reset pulse (serdes_cdr_reset = TRUE default), after GPON
-	 * mode + the TX reset-B re-sync so the analog-ready poll confirms recovery. */
-	rtl9602c_serdes_cdr_reset(o);
+	/* The TX reset-B re-sync + the post-mode serdesCdr_reset pulse are the two
+	 * perturbations stock rev-A omits; do them only when explicitly enabled. */
+	if (rtl960x_c2_postmode_perturb) {
+		ret = r960_run(o, c2_sds_txresync, ARRAY_SIZE(c2_sds_txresync));
+		if (ret)
+			return ret;
+		rtl9602c_serdes_cdr_reset(o);
+	}
 
 	/* Keep the MAC clock ungated. */
 	rtl960x_rfwr(o, C2_WSDS_DIG_00, 0, 0, 0);
