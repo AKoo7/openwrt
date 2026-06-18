@@ -1,0 +1,66 @@
+Add --preserve-client-edns option (default off): a forwarder only adds an EDNS0
+OPT to an upstream query when the client's query already carried one (or DNSSEC
+needs it). Lets dnsmasq resolve via upstreams that silently drop OPT-bearing
+queries (e.g. anti-amplification gateways) while keeping EDNS/DNSSEC for clients
+that ask for it. Clean-room addition for the RTL960x ONU; SPDX unchanged.
+--- SPDX-License-Identifier: GPL-2.0
+
+--- a/src/dnsmasq.h
++++ b/src/dnsmasq.h
+@@ -289,7 +289,8 @@
+ #define OPT_DO_0x20        75
+ #define OPT_AUTH_LOG       76
+ #define OPT_LEASEQUERY     77
+-#define OPT_LAST           78
++#define OPT_PRESERVE_EDNS  78
++#define OPT_LAST           79
+ 
+ #define OPTION_BITS (sizeof(unsigned int)*8)
+ #define OPTION_SIZE ( (OPT_LAST/OPTION_BITS)+((OPT_LAST%OPTION_BITS)!=0) )
+--- a/src/option.c
++++ b/src/option.c
+@@ -197,6 +197,7 @@
+ #define LOPT_DO_ENCODE     388
+ #define LOPT_LEASEQUERY    389
+ #define LOPT_SPLIT_RELAY   390
++#define LOPT_PRESERVE_EDNS 391
+ 
+ #ifdef HAVE_GETOPT_LONG
+ static const struct option opts[] =  
+@@ -344,6 +345,7 @@
+     { "rebind-localhost-ok", 0, 0,  LOPT_LOC_REBND },
+     { "add-mac", 2, 0, LOPT_ADD_MAC },
+     { "strip-mac", 0, 0, LOPT_STRIP_MAC },
++    { "preserve-client-edns", 0, 0, LOPT_PRESERVE_EDNS },
+     { "add-subnet", 2, 0, LOPT_ADD_SBNET },
+     { "strip-subnet", 0, 0, LOPT_STRIP_SBNET },
+     { "add-cpe-id", 1, 0 , LOPT_CPE_ID },
+@@ -551,6 +553,7 @@
+   { LOPT_TEST, 0, NULL, gettext_noop("Check configuration syntax."), NULL },
+   { LOPT_ADD_MAC, ARG_DUP, "[=base64|text]", gettext_noop("Add requestor's MAC address to forwarded DNS queries."), NULL },
+   { LOPT_STRIP_MAC, OPT_STRIP_MAC, NULL, gettext_noop("Strip MAC information from queries."), NULL },
++  { LOPT_PRESERVE_EDNS, OPT_PRESERVE_EDNS, NULL, gettext_noop("Only add EDNS0 OPT to upstream queries the client sent with one."), NULL },
+   { LOPT_ADD_SBNET, ARG_ONE, "<v4 pref>[,<v6 pref>]", gettext_noop("Add specified IP subnet to forwarded DNS queries."), NULL },
+   { LOPT_STRIP_SBNET, OPT_STRIP_ECS, NULL, gettext_noop("Strip ECS information from queries."), NULL },
+   { LOPT_CPE_ID, ARG_ONE, "<text>", gettext_noop("Add client identification to forwarded DNS queries."), NULL },
+--- a/src/forward.c
++++ b/src/forward.c
+@@ -513,8 +513,16 @@
+ 
+   forwarded = 0;
+ 
+-  /* Advertise the size of UDP reply we can accept. */
+-  plen = add_pseudoheader(header, plen, (unsigned char *)(header + daemon->edns_pktsz), 0, NULL, 0, 0, 0);
++  /* Advertise the size of UDP reply we can accept. With preserve-client-edns,
++     only normalise an EDNS OPT the client (or DNSSEC's add_do_bit, above) already
++     supplied — never add an OPT to a plain client query. Some upstreams silently
++     drop OPT-bearing queries from certain sources; a forwarder may preserve the
++     client's EDNS state (RFC6891) so the ONU's own non-EDNS system queries still
++     resolve. DNSSEC/EDNS-client queries keep their OPT and are unaffected. */
++  if (!option_bool(OPT_PRESERVE_EDNS) ||
++      option_bool(OPT_DNSSEC_VALID) ||
++      find_pseudoheader(header, plen, NULL, NULL, NULL, NULL))
++    plen = add_pseudoheader(header, plen, (unsigned char *)(header + daemon->edns_pktsz), 0, NULL, 0, 0, 0);
+ 
+   /* check for send errors here (no route to host) 
+      if we fail to send to all nameservers, send back an error

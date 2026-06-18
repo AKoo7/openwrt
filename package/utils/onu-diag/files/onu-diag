@@ -90,7 +90,10 @@ if have ubus; then
 		WANIP=$(echo "$WS" | sed -n 's/.*"address": *"\([0-9.]*\)".*/\1/p' | head -1)
 		WANMASK=$(echo "$WS" | sed -n 's/.*"mask": *\([0-9]*\).*/\1/p' | head -1)
 		WANGW=$(echo "$WS" | sed -n 's/.*"nexthop": *"\([0-9.]*\)".*/\1/p' | head -1)
-		WANDNS=$(echo "$WS" | grep -o '"[0-9.]*"' | tr -d '"' | tr '\n' ' ')
+		# only the "dns-server" array (flatten newlines, take the [...] block) —
+		# NOT a blanket grep of every dotted-quad (that also caught the WAN
+		# address, the 0.0.0.0 route target and the nexthop -> bogus DNS list).
+		WANDNS=$(echo "$WS" | tr '\n' ' ' | sed -n 's/.*"dns-server": *\[\([^]]*\)\].*/\1/p' | grep -o '[0-9][0-9.]*' | tr '\n' ' ')
 	fi
 fi
 [ -n "$WANDEV" ] && WANMAC=$(cat /sys/class/net/$WANDEV/address 2>/dev/null)

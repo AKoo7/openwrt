@@ -106,11 +106,38 @@ provision() {
 	# bridge device sections for netifd to apply (best-effort; the GPON identity
 	# exported below is the authoritative per-board data for the ONU stack).
 	if [ -n "$mac" ] && [ -f /etc/config/network ]; then
-		local sec
+		local sec cid
 		for sec in $(uci -q show network 2>/dev/null | \
 			     sed -n "s/^network\.\([^.=]*\)\.type='bridge'\$/\1/p"); do
 			uci -q set "network.$sec.macaddr=$mac"
 		done
+		# Pin a STABLE, per-board WAN DHCP client-id (option 61 = 01:<MAC>, like a
+		# normal Ethernet host). This image RAM-boots with no persistent storage, so
+		# without this OpenWrt generates a fresh RFC4361 UUID-DUID client-id every boot;
+		# the OLT-side DHCP server (dnsmasq) keys leases on the client-id, so each boot
+		# looked like a NEW client and consumed a new pool address -> pool exhaustion ->
+		# no DHCP OFFER (no WAN). A MAC-derived client-id is stable per board + unique
+		# across the 1000-board fleet, so each board keeps a single lease.
+		# Derive the WAN (gpon0) MAC = LAN MAC + 3 (this model's stock offset, CONFIRMED
+		# from the live stock firmware's own DHCP lease: hostname RTK_GW, MAC ..b1 =
+		# LAN ..ae + 3, client-id 01:..b1; the 2nd ONU agrees, base ..a2 -> WAN ..a5 = +3).
+		# MUST match the driver's wan_mac_offset (default 3). 48-bit add (bash, carries up).
+		local wanoff=3 lannum wannum wanhex
+		lannum=$(printf '%d' "0x$(echo "$mac" | tr 'A-F' 'a-f' | tr -d ':')" 2>/dev/null)
+		wannum=$((lannum + wanoff))
+		wanhex=$(printf '%012x' "$wannum")
+		# Stable per-board WAN DHCP client-id (option 61 = 01:<WAN-MAC>), EXACTLY like stock
+		# (RTK_GW used 01:..b1). Stable across reboots + unique per board -> one lease, no
+		# pool exhaustion (this RAM-boot image otherwise emits a random DUID client-id/boot).
+		uci -q set "network.wan.clientid=01$wanhex"
+		# ROOT fix: pin a STABLE, MAC-derived system DUID. This RAM-boot image has no
+		# persistent /etc/machine-id, so OpenWrt otherwise generates a fresh RANDOM
+		# DUID-UUID every boot (from boot_id) -> the DHCPv4 RFC4361 client-id AND the
+		# DHCPv6 DUID change every boot -> the OLT-side server treats each boot as a new
+		# client and burns a fresh lease -> DHCP pool exhaustion (no OFFER -> no WAN), and
+		# would do the same fleet-wide. A DUID-LL (type 3, hw 1) derived from the per-board
+		# MAC is stable across reboots and unique per board, fixing IPv4 + IPv6.
+		uci -q set "network.globals.dhcp_default_duid=00030001$wanhex"
 		uci -q commit network 2>/dev/null
 	fi
 
