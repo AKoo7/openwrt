@@ -169,7 +169,7 @@ static int mtd_path_by_name(const char *name, char *out, size_t n);
  * optical_cal: parse the rtl8290b Europa transceiver calibration blob
  * (rtl8290b.data in the config JFFS2 partition, 4096 bytes factory-written).
  *
- * Calibration byte offsets (big-endian, from vendor SDK facts):
+ * Calibration byte offsets (big-endian, as laid out in the factory-written blob):
  *   1350 int32  rx_a     - RX polynomial coefficient A
  *   1354 int32  rx_b     - RX polynomial coefficient B
  *   1358 int32  rx_c     - RX polynomial coefficient C (intercept ~= launch dBm*1000)

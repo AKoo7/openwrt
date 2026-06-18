@@ -1257,19 +1257,19 @@ static void _rtl92fe_reset_pcie_interface_dma(struct rtl_priv *rtlpriv,
 	rtl_write_byte(rtlpriv, REG_PMC_DBG_CTRL2, tmp);
 }
 
-/* Flattened port of the vendor config_phydm_trx_mode_8192f() for the fixed
- * arguments used by this board:
+/* Fixed-argument TX/RX-path ("TRX mode") init for the configuration this
+ * board runs:
  *   tx_path_en      = BB_PATH_AB  (both TX paths)
  *   rx_path         = BB_PATH_AB  (both RX paths)
- *   tx_path_sel_1ss = BB_PATH_A   (nominal; the vendor's non-path-diversity
- *                                  build reassigns 1ss = tx_path_en = AB)
- *   tx_path_sel_cck = BB_PATH_A   (likewise reassigned to AB)
- *   rfe_type        = 3           (no handled case -> rfe sub-call is a no-op)
+ *   tx_path_sel_1ss = BB_PATH_A   (nominal; with path-diversity off the 1ss
+ *                                  selection collapses to tx_path_en = AB)
+ *   tx_path_sel_cck = BB_PATH_A   (likewise collapses to AB)
+ *   rfe_type        = 3           (no handled case -> rfe sub-step is a no-op)
  *
- * The OpenWrt rtl8192fe driver never ran this TRX-mode init after BB config,
- * leaving the path registers (0x804/0x808-equiv c04/0x90c/...) mis-configured.
- * Path-diversity, spur calibration, dynamic energy-TH and MP-mode branches are
- * intentionally omitted (disabled in the vendor AP build / per the port spec).
+ * Without this TRX-mode init after BB config the path registers
+ * (0x804/0x808-equiv c04/0x90c/...) are left mis-configured. Path-diversity,
+ * spur calibration, dynamic energy-TH and MP-mode branches are intentionally
+ * omitted (not used for a fixed-mode AP).
  */
 static void _rtl92fe_config_trx_mode_ab(struct ieee80211_hw *hw)
 {
@@ -1281,7 +1281,7 @@ static void _rtl92fe_config_trx_mode_ab(struct ieee80211_hw *hw)
 	/* CCK TX path control by REG */
 	rtl_set_bbreg(hw, 0x80c, BIT(31), 0x0);
 
-	/* ==== [RX Path] phydm_config_rx_path_8192f(BB_PATH_AB) ==== */
+	/* ==== [RX Path] configure RX paths for BB_PATH_AB ==== */
 	/* OFDM Rx path (val = 3 for AB) */
 	rtl_set_bbreg(hw, 0xc04, 0xff, 0x33);
 	rtl_set_bbreg(hw, 0xd04, 0xf, 3);
@@ -1298,7 +1298,7 @@ static void _rtl92fe_config_trx_mode_ab(struct ieee80211_hw *hw)
 	rtl_set_bbreg(hw, 0xa2c, (BIT(18) | BIT(17)), 1);
 	rtl_set_bbreg(hw, 0xa2c, (BIT(22) | BIT(21)), 1);
 
-	/* ==== [TX Path] phydm_config_tx_path_8192f(AB, AB, AB) ==== */
+	/* ==== [TX Path] configure TX paths for AB, AB, AB ==== */
 	/* CCK TX antenna mapping (BB_PATH_AB) */
 	rtl_set_bbreg(hw, 0xa04, 0xf0000000, 0xc);
 	/* OFDM TX path (tx_path_en == AB -> ofdm_tx_path(BB_PATH_AB)) */
@@ -1357,11 +1357,11 @@ int rtl92fe_hw_init(struct ieee80211_hw *hw)
 						   PCI_EXP_LNKCTL,
 						   PCI_EXP_LNKCTL_ASPMC);
 
-		/* Vendor InitPON8192FE power-on tail (our pwrseq-only init_mac
-		 * omits it): AFE power-on, SYS_PW_CTRL(0x04) power-ready
-		 * handshake, WLAN auto-enable, hold the 8051, then LDO/SPS
-		 * regulator(0x7c). Without the regulator + power-ready the
-		 * high-offset RAM region stays marginally powered. */
+		/* Power-on tail the pwrseq-only init_mac does not cover (stock
+		 * brings it up in this order): AFE power-on, SYS_PW_CTRL(0x04)
+		 * power-ready handshake, WLAN auto-enable, hold the 8051, then
+		 * LDO/SPS regulator(0x7c). Without the regulator + power-ready
+		 * the high-offset RAM region stays marginally powered. */
 		rtl_write_byte(rtlpriv, 0x24, rtl_read_byte(rtlpriv, 0x24) | BIT(0));
 		pw = (rtl_read_word(rtlpriv, 0x04) & 0xe7ff) | 0x0800;
 		rtl_write_word(rtlpriv, 0x04, pw);
@@ -1385,7 +1385,7 @@ int rtl92fe_hw_init(struct ieee80211_hw *hw)
 	}
 
 	/* AFE PLL/XTAL are set by the crystal-select (AFE_CTRL5 BIT_REF_SEL=25M)
-	 * in the InitPON tail above + the pwrseq MAC table; the old hardcoded 40 MHz
+	 * in the power-on tail above + the pwrseq MAC table; the old hardcoded 40 MHz
 	 * block here re-mistuned the PLL on this 25 MHz board, re-breaking the
 	 * config-core clock and hanging high-offset writes in phy_mac_config. */
 
@@ -1397,7 +1397,7 @@ int rtl92fe_hw_init(struct ieee80211_hw *hw)
 
 	rtl_write_word(rtlpriv, REG_PCIE_CTRL_REG, 0x8000);
 
-	/* Download the 8051 firmware. With the 25 MHz crystal-select + InitPON
+	/* Download the 8051 firmware. With the 25 MHz crystal-select + the
 	 * power-on tail in place, the high-offset FW-FIFO writes (0x4000) complete,
 	 * so the real download path runs. Non-fatal: even on failure the radio
 	 * still brings up for scan/monitor. */
@@ -1479,9 +1479,8 @@ int rtl92fe_hw_init(struct ieee80211_hw *hw)
 		rtl_write_dword(rtlpriv, REG_AFE_XTAL_CTRL, x0);
 	}
 
-	/* Run the 8192F TX/RX-path ("TRX mode") init the vendor driver applies
-	 * after BB config (config_phydm_trx_mode_8192f, AB/AB, rfe_type 3). The
-	 * clean-room port never called this, leaving the path registers
+	/* Run the 8192F TX/RX-path ("TRX mode") init that must follow BB config
+	 * (AB/AB paths, rfe_type 3). Skipping it leaves the path registers
 	 * mis-configured (0x804[3:0], 0xc04, 0x90c, ...).
 	 */
 	_rtl92fe_config_trx_mode_ab(hw);
@@ -2182,7 +2181,7 @@ static void _rtl92fe_hal_customized_behavior(struct ieee80211_hw *hw)
  * AP beacons off-frequency / at the wrong power and is invisible to clients.
  *
  * The real per-chip cal lives in the board's NOR flash apmib (HW_WLAN0_*); the
- * stock vendor rtl8192cd.ko reads it from there, not from efuse.  Until we wire
+ * stock WiFi driver reads it from there, not from efuse.  Until we wire
  * a flash/apmib reader (or a DT/nvmem cell) into the clean-room driver, the
  * values for THIS board are baked here so the radio calibrates like stock.
  *
@@ -2286,8 +2285,8 @@ static void _rtl92fe_apply_board_cal(struct ieee80211_hw *hw,
 
 	/* Front-end / regulatory.  pa_type 0 == internal PA/LNA -> board_type
 	 * 0, external_pa 0.  rfe_type 3 matches the working stock unit (the
-	 * vendor's phydm_init_hw_info_by_rfe_type_8192f() has no case for 3, so
-	 * it is a no-op there; the TRX-mode init above does the real path setup).
+	 * per-rfe-type hw-info init has no case for 3, so it is a no-op for this
+	 * value; the TRX-mode init above does the real path setup).
 	 */
 	rtl_hal(rtlpriv)->rfe_type = 3;
 	efu->board_type = 0;

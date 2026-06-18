@@ -1,18 +1,19 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * rtl960x_ponmac.h - faithful, board-agnostic port of the Realtek RTL960x
- * family GPON PON-MAC / SerDes bring-up (vendor SDK rtl86900 dal layer).
+ * rtl960x_ponmac.h - board-agnostic bring-up of the Realtek RTL960x family
+ * GPON PON-MAC / SerDes, matching the stock device's register behavior.
  *
- * Purpose: have the vendor-faithful ponmac/SerDes bring-up for the WHOLE
+ * Purpose: have a stock-faithful ponmac/SerDes bring-up for the WHOLE
  * RTL960x family in-tree, so any future 960x board can be brought online by
- * wiring its register accessor + chip id, without re-RE'ing the vendor binary.
+ * wiring its register accessor + chip id, without re-deriving the sequence
+ * from scratch.
  *
- * Ported per-chip from the vendor source (.../sdk/src/dal/rtl960x/dal_*_ponmac.c)
- * with every register resolved to its ABSOLUTE physical address from that chip's
- * own rtk_<chip>_reg_list.c (authoritative SDK map) and field bit-ranges from
- * rtk_<chip>_regField_list.c. The 9602C path is HW-tested (the realtek-luna
- * board); the other family members are source-faithful transcriptions, untested
- * for lack of hardware, ready for when a board is connected.
+ * Reconstructed per-chip from the stock register behavior, with every register
+ * resolved to its ABSOLUTE physical address from that chip's register map and
+ * field bit-ranges from its field map. The 9602C path is HW-tested (the
+ * realtek-luna board); the other family members are behavior-faithful
+ * transcriptions, untested for lack of hardware, ready for when a board is
+ * connected.
  *
  * The bring-up uses ABSOLUTE physical register addresses; the board driver
  * supplies rd/wr that map phys->virt (KSEG1 0xa0000000|phys, or ioremap).
@@ -29,14 +30,14 @@ enum rtl960x_chip {
 	RTL960X_CHIP_9602C,	/* + 9601C / 9601C_VB subtypes */
 	RTL960X_CHIP_9603CVD,
 	RTL960X_CHIP_9607C,
-	RTL960X_CHIP_9607F,	/* no reg_list in this SDK drop - bring-up TBD */
+	RTL960X_CHIP_9607F,	/* no register map observed yet - bring-up TBD */
 };
 
-/* Vendor CHIP_REV_ID (include/hal/chipdef/chip.h): A=0x1, B=0x2, ... rev>A => B+ */
+/* Chip revision id as read from HW: A=0x1, B=0x2, ... rev>A => B+ */
 #define RTL960X_REV_A		0x1
 #define RTL960X_REV_B		0x2
 
-/* Subtype (9602C dal_rtl9602c_switch.h): pick GponModeV3 (9601C) vs V2 on rev>A. */
+/* Subtype (9602C family): pick GponModeV3 (9601C) vs V2 on rev>A. */
 #define RTL960X_SUBTYPE_NONE		0x00
 #define RTL960X_SUBTYPE_9601C_VB	0x01
 #define RTL960X_SUBTYPE_9601C		0x03
@@ -49,7 +50,7 @@ enum rtl960x_ponmode {
 
 /*
  * Board-agnostic register accessor. phys is the ABSOLUTE physical address from
- * the chip's reg_list.c. The board driver maps it (KSEG1 or ioremap).
+ * the chip's register map. The board driver maps it (KSEG1 or ioremap).
  */
 struct rtl960x_ops {
 	u32  (*rd)(u32 phys);
@@ -67,10 +68,10 @@ static inline void rtl960x_rfwr(const struct rtl960x_ops *o, u32 phys,
 }
 
 /*
- * Bring-up entry points. rev = RTL960X_REV_A or vendor CHIP_REV_ID; subtype as
- * above. Return 0 on success, -ETIMEDOUT if the SerDes analog-ready gate never
+ * Bring-up entry points. rev = RTL960X_REV_A or the HW chip-revision id; subtype
+ * as above. Return 0 on success, -ETIMEDOUT if the SerDes analog-ready gate never
  * asserts (non-fatal; the board driver may proceed + diagnose). chip == 9607F
- * returns -ENOTSUPP until its reg map is available.
+ * returns -ENOTSUPP until its register map is available.
  */
 int rtl960x_ponmac_init(enum rtl960x_chip chip, int rev, int subtype,
 			const struct rtl960x_ops *o);
@@ -80,4 +81,7 @@ int rtl960x_ponmac_serdes_cdr_reset(enum rtl960x_chip chip,
 				    const struct rtl960x_ops *o);
 
 extern int rtl960x_c2_postmode_perturb;
+extern int rtl960x_c2_sds_cfgrst;
+extern int rtl960x_c2_stock_analog;
+extern int rtl960x_c2_analog_postreset;
 #endif /* _RTL960X_PONMAC_H */

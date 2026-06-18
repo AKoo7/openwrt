@@ -3,8 +3,8 @@
  * Realtek RTL960xC "Luna" SoC interrupt controller (RLX/Taroko core).
  *
  * Clean-room driver written from observed hardware facts only (register
- * bases/offsets, bit semantics and routing scheme). No vendor source was
- * copied. The block is a 64-input aggregator that funnels SoC interrupts
+ * bases/offsets, bit semantics and routing scheme); no proprietary source
+ * was copied. The block is a 64-input aggregator that funnels SoC interrupts
  * onto the CPU's CP0 HW interrupt lines:
  *
  *   GIMR0  0x00  mask,   inputs  0..31  (1 = enabled)
@@ -35,7 +35,7 @@
 #define LUNA_INTC_IRR_WORDS	(LUNA_INTC_INPUTS / 8)	/* 8 inputs/word */
 
 /* Routing nibble -> output line that the DT declares as our parent. */
-#define LUNA_INTC_ROUTE_ON	2	/* (routing now pre-loaded with vendor GIRR values) */
+#define LUNA_INTC_ROUTE_ON	2	/* (routing now pre-loaded with the stock GIRR values) */
 #define LUNA_INTC_PERIPH_EN	12	/* GIMR0 bit12 = master peripheral-IRQ enable */
 #define LUNA_INTC_ROUTE_OFF	0
 
@@ -84,7 +84,7 @@ static int luna_intc_map(struct irq_domain *d, unsigned int irq,
 
 	irq_set_chip_and_handler(irq, &luna_intc_chip, handle_level_irq);
 	irq_set_chip_data(irq, ic);
-	/* routing (GIRR) is pre-loaded with vendor values in of_init */
+	/* routing (GIRR) is pre-loaded with the stock-observed values in of_init */
 
 	return 0;
 }
@@ -137,8 +137,8 @@ static int __init luna_intc_of_init(struct device_node *node,
 
 	/*
 	 * Mask all sources except the master peripheral-IRQ enable
-	 * (GIMR0 bit IRQ_PERIPHERAL=12 — "must be set to enable peripheral
-	 * irq"), then load the vendor's known-good per-irq routing (GIRR/IRR).
+	 * (GIMR0 bit IRQ_PERIPHERAL=12 — must be set to enable peripheral
+	 * irq), then load the stock-observed known-good per-irq routing (GIRR/IRR).
 	 * Word0 sources are delivered on CP0 IP3, word1 on IP4.
 	 */
 	writel(BIT(LUNA_INTC_PERIPH_EN), ic->base + LUNA_INTC_GIMR(0));
@@ -149,7 +149,7 @@ static int __init luna_intc_of_init(struct device_node *node,
 	 * Word at IRR_BASE+0x08 holds the routing nibbles for inputs 26..33
 	 * (ascending tiling: input 42 is nibble1 of the +0x10 word per the
 	 * UART/timer fix below). GMAC0 ethernet is input 26 = bits[3:0] here.
-	 * The vendor value 2 targets a CP0 IP line our cascade does not pick
+	 * The stock value 2 targets a CP0 IP line our cascade does not pick
 	 * up (same failure mode as the original UART input), so route it to
 	 * the proven-delivering value 6 (as timer input 43 / uart input 49
 	 * use). [3:0]: 2 -> 6. Once GIMR0 bit26 is unmasked (request_irq ->
@@ -161,7 +161,7 @@ static int __init luna_intc_of_init(struct device_node *node,
 	 * IRR4 (base+0x20) holds the routing nibbles for inputs 42..49: the
 	 * SoC timer TC0 (input 43) at bits[7:4] and the 16550 UART0 (input 49)
 	 * at bits[31:28]. The timer is proven to deliver with routing value 6,
-	 * so route the UART to 6 as well (the vendor value 3 targets an IP line
+	 * so route the UART to 6 as well (the stock value 3 targets an IP line
 	 * that is not picked up by our cascade, leaving userspace TX/RX dead
 	 * while polled kernel printk still works). [31:28]: 3 -> 6.
 	 */

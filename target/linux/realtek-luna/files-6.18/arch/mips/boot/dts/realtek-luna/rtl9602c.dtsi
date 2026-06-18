@@ -3,8 +3,8 @@
  * Realtek RTL9602C "Europa" GPON ONU SoC (RLX "Taroko" core).
  *
  * Clean-room device description derived from observed hardware facts
- * (register bases, IRQ numbers and clocks read from a running unit); no
- * vendor source was used.
+ * (register bases, IRQ numbers and clocks read from a running unit by
+ * probing the live device).
  */
 
 / {

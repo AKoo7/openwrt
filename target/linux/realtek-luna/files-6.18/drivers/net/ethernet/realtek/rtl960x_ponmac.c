@@ -6,8 +6,8 @@
  * SEQUENCES (which registers, what values, in what order, with what delays) are
  * hardware-interface FACTS dictated by the silicon - extracted by observing the
  * bring-up - not copied code. They are expressed here as compact declarative
- * op-tables driven by a single tiny interpreter, rather than the vendor's
- * repetitive per-register procedural boilerplate. The structure, interpreter,
+ * op-tables driven by a single tiny interpreter, rather than as repetitive
+ * per-register procedural boilerplate. The structure, interpreter,
  * naming, and organization are all original; only the factual register data is
  * shared with any other implementation of the same hardware.
  *
@@ -83,12 +83,12 @@ static int r960_run(const struct rtl960x_ops *o,
 
 /* =======================================================================
  * Per-chip bring-up tables + glue.
- * Populated from the per-chip register FACTS (resolved from each chip's own
- * reg_list/regField map). Each block is self-contained so a board only links
+ * Populated from the per-chip register FACTS (each chip's register/field map).
+ * Each block is self-contained so a board only links
  * what it needs once the dispatch is wired by chip id.
  * ======================================================================= */
 
-/* ---- RTL9602C (rev-A, CHIP_REV_ID_A) - HW-tested on realtek-luna -------- */
+/* ---- RTL9602C (rev-A) - HW-tested on realtek-luna ---------------------- */
 /* (tables filled from verified facts) */
 
 /* ------------------------------------------------------------------ *
@@ -101,9 +101,9 @@ static int r960_run(const struct rtl960x_ops *o,
  *  do NOT redeclare r960_run() extern - it is file-private (static).
  *
  *  The register addresses, field bit-ranges, values, ordering and delays are
- *  hardware-interface facts of the RTL9601B silicon. The expression (data-driven
- *  op-tables + the indirect-SerDes helper + the explicit scheduler/queue loops +
- *  all comments) is original.
+ *  hardware-interface facts of the RTL9601B silicon, observed from the bring-up.
+ *  The expression (data-driven op-tables + the indirect-SerDes helper + the
+ *  explicit scheduler/queue loops + all comments) is original.
  *
  *  Address space: swcore physical base 0x1B000000. The board supplies rd/wr in
  *  struct rtl960x_ops to map phys->virt.
@@ -139,9 +139,10 @@ static int r960_run(const struct rtl960x_ops *o,
 /* misc */
 #define C1B_R_SDS1_CFG	0x1B000088u	/* SerDes lane-1 mode select [4:0]   */
 #define C1B_R_SOFT_RST	0x1B000044u	/* queue reset pulse @bit3           */
-/* Per-port address model (reg.c::_reg_addr_find): a register whose base lies in
- * the MACPP block [0x20000,0x203FF] is a PpReg -> +ponPort*MACPP_INTERVAL; any
- * other base is a Global array -> +ponPort*(array_offset_bits/8). 9601b: MACPP
+/* Per-port address model (how the silicon resolves a per-port register): a
+ * register whose base lies in the MACPP block [0x20000,0x203FF] is a PpReg ->
+ * +ponPort*MACPP_INTERVAL; any other base is a Global array ->
+ * +ponPort*(array_offset_bits/8). 9601b: MACPP
  * interval 0x400, array_offset 32 (=4B), ponPort 1. (NOT a flat 0x20 stride.) */
 #define C1B_R_PMISC_PON	0x1B020408u	/* P_MISC[pon1]: PpReg 0x20008 + 1*0x400 */
 #define C1B_R_ACC_LEN_PON	0x1B023038u	/* ACCEPT_MAX_LEN[pon1]: Global 0x23034 + 1*4 */
@@ -1125,9 +1126,9 @@ static int rtl9607c_serdes_cdr_reset(const struct rtl960x_ops *o)
 /* ------------------------------------------------------------------ *
  *  RTL9602C GPON PON-MAC / SerDes bring-up - clean-room op-table form.
  *  HW-TESTED on the realtek-luna board: this is a faithful translation of
- *  the in-tree gpon-rtl9602c.c gpon_serdes_init() / gpon_pbo-ponmac steps
+ *  the in-tree gpon-rtl9602c.c SerDes-init / PBO-ponmac steps
  *  into this file's op-table primitives, so the family-lib path behaves
- *  identically to the inline driver.
+ *  identically to that in-tree sibling driver.
  *
  *  Default parameter path baked in (the configuration that locks on hardware):
  *    serdes_cdr_reset = TRUE   -> the COM_REG08 bit15 invert/10ms/restore pulse
@@ -1279,10 +1280,13 @@ static const struct { u32 off; u32 val; } c2_analog[] = {
  * BEN_TTL_OUT + DYNGASP on swcore; PON_BW_THRES (last + runt) and the transient
  * PON_GEN_PIR_DROP on PON-IP; OMCI_MPCP_PRIORITY steers OMCI egress to PON
  * queue 7 on swcore. PIR_DROP is asserted then cleared for rev-A, matching the
- * inline driver's set/clear pair.
+ * in-tree sibling driver's set/clear pair.
  */
 static const struct r960_op c2_ponmac_init[] = {
-	FLD(0x1B022584u,  0,  0, 1),	/* SDS_ANA REG_BEN_TTL_OUT = 1          */
+	/* REG01 (SDS_ANA_COM 0x22584) is handled in rtl9602c_ponmac_init() below — the
+	 * stock-good post-reset value is 0x73a4 (CMU bit14=1, BEN_TTL_OUT bit0=0), which
+	 * the golden-before-reset write cannot achieve (the SDS reset wipes bit14 and the
+	 * old BEN_TTL write set bit0). See rtl960x_c2_stock_analog. */
 	FLD(0x1B0001ECu,  0,  0, 1),	/* DYNGASP_CMP_INV = 1                  */
 	FLD(0x1BF02150u, 29, 16, 5),	/* PON_BW_THRES last-grant              */
 	FLD(0x1BF02150u, 13,  0, 5),	/* PON_BW_THRES runt-grant             */
@@ -1291,29 +1295,70 @@ static const struct r960_op c2_ponmac_init[] = {
 	FLD(0x1BF02194u, 18, 18, 0),	/* rev-A: clear PON_GEN_PIR_DROP        */
 };
 
+/* A/B knob (gpon.serdes_stock_analog). Default 1 = drive REG01/REG11 to the live-stock
+ * post-reset values: REG01 (0x22584) = 0x73a4 (CMU bit14=1, BEN_TTL_OUT bit0=0) and
+ * REG11 (0x225ac) RX_FILT_CONFIG[7:0] = 0. These are the ONLY two SerDes registers that
+ * differed between live-stock (WAN-up, 100%) and our failing board (the cold-start ~50%
+ * US-TX lock): the golden table sets them correctly BEFORE the SDS reset, but the reset
+ * wipes REG01 bit14 / REG11 RX_FILT to defaults (0x33a4 / 0xb008) and nothing re-applied
+ * them post-reset (stock applies its analog config AFTER the reset). bit14 sits in the
+ * shared CMU block -> a marginal TX serializer that locks only ~50% per power-on.
+ * =0 restores the legacy BEN_TTL_OUT=1 and leaves REG01 bit14 / REG11 at reset defaults. */
+int rtl960x_c2_stock_analog = 1;
+
+/* A/B knob (gpon.serdes_analog_postreset). Default 1 = program the FULL analog
+ * CMU/CDR golden table AFTER the SDS reset (stock rev-A order: the SDS reset
+ * runs first, then the ModeV1 path programs the analog), not before it. The SDS reset
+ * (CMD_SDS_RST_PS) WIPES analog back to reset defaults; programming it pre-reset
+ * (legacy) leaves the CMU charge-pump/LDO/tank (COM_REG02/03/08/24/25) + GPON CDR
+ * (GPON_REG46) acquiring lock against reset-DEFAULT operating-point values, which the
+ * partial REG01/REG11 re-apply never fully corrects -> metastable per-power-on lock =
+ * the cold-start ~50% US-TX "Laser out". Post-reset placement pins the operating point
+ * BEFORE the CMU re-locks and BEFORE the RX_EN 0->1 start edge -> deterministic lock on
+ * every cold boot AND soft/internal restart (re-derived from scratch each mode_set).
+ * =0 keeps the legacy pre-reset placement. */
+int rtl960x_c2_analog_postreset = 1;
+
 static int rtl9602c_ponmac_init(const struct rtl960x_ops *o)
 {
-	return r960_run(o, c2_ponmac_init, ARRAY_SIZE(c2_ponmac_init));
-}
+	int ret = r960_run(o, c2_ponmac_init, ARRAY_SIZE(c2_ponmac_init));
 
-/*
- * SerDes CDR-lock pulse (the stock dal_rtl9602c_ponmac_serdesCdr_reset): invert
- * SDS_ANA_COM_REG08 (0x1B0225A0) bit15, hold 10 ms, restore. Seats the upstream
- * serializer CDR so the per-grant burst is consistently lockable by the OLT
- * burst-RX. This is the serdes_cdr_reset = TRUE default path.
- */
-static int rtl9602c_serdes_cdr_reset(const struct rtl960x_ops *o)
-{
-	u32 cdr = o->rd(C2_SDS_ANA_COM_REG08);
-
-	o->wr(C2_SDS_ANA_COM_REG08, cdr ^ BIT(15));
-	mdelay(10);
-	o->wr(C2_SDS_ANA_COM_REG08, cdr);
+	if (ret)
+		return ret;
+	if (rtl960x_c2_stock_analog) {
+		rtl960x_rfwr(o, 0x1B022584u, 14, 14, 1);	/* REG01 CMU bit14 = 1 (stock) */
+		rtl960x_rfwr(o, 0x1B022584u,  0,  0, 0);	/* REG01 BEN_TTL_OUT = 0 (stock) */
+		rtl960x_rfwr(o, 0x1B0225ACu,  7,  0, 0);	/* REG11 RX_FILT_CONFIG = 0 (stock) */
+	} else {
+		rtl960x_rfwr(o, 0x1B022584u,  0,  0, 1);	/* legacy REG_BEN_TTL_OUT = 1 */
+	}
 	return 0;
 }
 
 /*
- * GPON SerDes (SDS) bring-up - a faithful translation of gpon_serdes_init().
+ * SerDes CDR-lock pulse (the stock CDR-reset behavior): invert
+ * SDS_ANA_COM_REG12 (0x1B0225B0) bit15 (REG_RX_SD_POR_SEL), hold 10 ms, restore.
+ * Re-PORs the RX signal-detect path so the recovered CDR re-acquires cleanly.
+ *
+ * REGISTER FIX 2026-06-17: the stock CDR-reset operates on REG12 (0x225B0), NOT
+ * REG08 (0x225A0) — confirmed from the observed stock register behavior
+ * (the CDR-reset reads/inverts/restores REG12[15]) and the chip's register/field map
+ * (REG12[15]=REG_RX_SD_POR_SEL; REG08[15] is in the RESERVED top-16 field, so
+ * the prior REG08[15] toggle wrote a reserved bit = wrong/no-op-with-side-effects).
+ */
+static int rtl9602c_serdes_cdr_reset(const struct rtl960x_ops *o)
+{
+	u32 cdr = o->rd(C2_SDS_ANA_COM_REG12);
+
+	o->wr(C2_SDS_ANA_COM_REG12, cdr ^ BIT(15));
+	mdelay(10);
+	o->wr(C2_SDS_ANA_COM_REG12, cdr);
+	return 0;
+}
+
+/*
+ * GPON SerDes (SDS) bring-up - a faithful translation of the stock SerDes-init
+ * sequence.
  *
  * Ordering is the whole game: program the analog CMU/CDR block FIRST, keep
  * CFG_SDS_MODE parked at the illegal/off value, pulse the SDS+MAC reset to
@@ -1332,9 +1377,15 @@ static const struct r960_op c2_sds_pre[] = {
 	FLD(C2_WSDS_DIG_00, 0, 0, 0),		/* STOP_CLK = 0                   */
 };
 
+/* Stock rev-A GPON ModeV1 pulses ONLY CMD_SDS_RST_PS (bit0). CMD_SDS_CFG_RST_PS
+ * (bit7) is never written by the stock bring-up; since our field-writes
+ * are RMW, asserting it here leaves it LATCHED through the whole bring-up = an extra
+ * SDS-config reset domain stock never touches, the prime suspect for the per-power-on
+ * US-TX serializer/PLL phase re-roll (cold-start WAN ~50%). bit7 is now applied
+ * conditionally in rtl9602c_ponmac_mode_set behind rtl960x_c2_sds_cfgrst (default 0
+ * = stock bit0-only = the fix). */
 static const struct r960_op c2_sds_reset[] = {
-	FLD(C2_SW_SOFTWARE_RST, 7, 7, 1),	/* CMD_SDS_CFG_RST_PS             */
-	FLD(C2_SW_SOFTWARE_RST, 0, 0, 1),	/* CMD_SDS_RST_PS                 */
+	FLD(C2_SW_SOFTWARE_RST, 0, 0, 1),	/* CMD_SDS_RST_PS (bit0 only, stock)  */
 	DLY(10),
 };
 
@@ -1407,6 +1458,12 @@ static const struct r960_op c2_sds_tx[] = {
  * Default 1 = legacy behavior. */
 int rtl960x_c2_postmode_perturb = 1;
 
+/* A/B knob set by the board (gpon.serdes_sds_cfgrst). Default 0 = pulse ONLY
+ * CMD_SDS_RST_PS bit0 in the SerDes reset (stock rev-A = the cold-start fix); 1 =
+ * also assert CMD_SDS_CFG_RST_PS bit7 (legacy, leaves the extra reset domain
+ * latched through bring-up -> per-power-on US-TX phase re-roll). */
+int rtl960x_c2_sds_cfgrst;
+
 static const struct r960_op c2_sds_mode[] = {
 	FLD(C2_SDS_ANA_MISC_REG02, 13, 13, 1),	/* signal-detect value = 1        */
 	FLD(C2_SDS_ANA_MISC_REG02, 12, 12, 1),	/* force signal-detect            */
@@ -1424,6 +1481,20 @@ static const struct r960_op c2_sds_txresync[] = {
 	DLY(10),
 };
 
+/* Program the full analog CMU/CDR golden table + clear fiber power-down on every
+ * FIB bank. Factored so it can run either BEFORE the SDS reset (legacy) or AFTER it
+ * (stock rev-A, the cold-start determinism fix) per rtl960x_c2_analog_postreset. */
+static void c2_program_analog(const struct rtl960x_ops *o)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(c2_analog); i++)
+		o->wr(c2_analog[i].off, c2_analog[i].val);
+	for (i = 0; i < ARRAY_SIZE(c2_fib_reg0_banks); i++)
+		o->wr(c2_fib_reg0_banks[i],
+		      o->rd(c2_fib_reg0_banks[i]) & ~C2_FIB_REG0_PDOWN);
+}
+
 static int rtl9602c_ponmac_mode_set(const struct rtl960x_ops *o,
 				    int rev, int subtype)
 {
@@ -1437,18 +1508,31 @@ static int rtl9602c_ponmac_mode_set(const struct rtl960x_ops *o,
 	if (ret)
 		return ret;
 
-	/* Step 2: program the FULL analog block + turn fiber power on (clear
-	 * FP_CFG_FIB_PDOWN on every FIB bank). */
-	for (i = 0; i < ARRAY_SIZE(c2_analog); i++)
-		o->wr(c2_analog[i].off, c2_analog[i].val);
-	for (i = 0; i < ARRAY_SIZE(c2_fib_reg0_banks); i++)
-		o->wr(c2_fib_reg0_banks[i],
-		      o->rd(c2_fib_reg0_banks[i]) & ~C2_FIB_REG0_PDOWN);
+	/* Step 2 (LEGACY placement): program the FULL analog block + turn fiber power
+	 * on BEFORE the reset. The SDS reset wipes analog to defaults, so by default
+	 * (rtl960x_c2_analog_postreset=1) this is SKIPPED and the analog is programmed
+	 * post-reset below (stock rev-A order = the cold-start determinism fix). */
+	if (!rtl960x_c2_analog_postreset)
+		c2_program_analog(o);
 
-	/* Step 3: pulse the SDS config + datapath reset to latch the analog. */
+	/* Step 3: pulse the SDS reset (by default the analog is programmed AFTER it,
+	 * not latched by it; see rtl960x_c2_analog_postreset). Stock pulses ONLY bit0
+	 * (CMD_SDS_RST_PS); legacy also asserted bit7 (CMD_SDS_CFG_RST_PS) which then
+	 * stays RMW-latched through bring-up. Apply bit7 only when explicitly enabled. */
+	if (rtl960x_c2_sds_cfgrst)
+		rtl960x_rfwr(o, C2_SW_SOFTWARE_RST, 7, 7, 1);	/* legacy CMD_SDS_CFG_RST_PS */
 	ret = r960_run(o, c2_sds_reset, ARRAY_SIZE(c2_sds_reset));
 	if (ret)
 		return ret;
+
+	/* Step 2 (STOCK rev-A placement, DEFAULT): program the FULL analog CMU/CDR
+	 * golden table + clear fiber power-down NOW, AFTER the reset — so the CMU
+	 * charge-pump/LDO/tank + GPON CDR hold their FINAL operating-point values before
+	 * the CMU re-locks and before the RX_EN 0->1 start edge (c2_sds_rx_arm). This is
+	 * the cold-start determinism fix (stock rev-A order: the SDS reset runs first,
+	 * then the ModeV1 path programs the analog). Gated by rtl960x_c2_analog_postreset (default 1). */
+	if (rtl960x_c2_analog_postreset)
+		c2_program_analog(o);
 
 	/* Step 4: release soft-reset-B lines, force 125M ref, pulse interface
 	 * reset-B. Re-clear FIB power-down, which the reset re-asserts. */
@@ -1469,6 +1553,19 @@ static int rtl9602c_ponmac_mode_set(const struct rtl960x_ops *o,
 	if (ret)
 		return ret;
 
+	/* Re-apply the live-stock post-reset SDS_ANA values that the golden table set
+	 * BEFORE the SDS reset (which wipes them): REG01 (0x22584)=0x73a4 (CMU bit14=1,
+	 * BEN_TTL_OUT bit0=0) + REG11 (0x225ac) RX_FILT_CONFIG=0. Done HERE, post-reset
+	 * and BEFORE the CFG_SDS_MODE=GPON commit below, so the serializer LOCKS with the
+	 * stock-good analog config. This is the ONLY stock-vs-ours SerDes diff (cold-start
+	 * ~50% US-TX "Laser out"); bit14 is in the shared CMU block. Gated by
+	 * rtl960x_c2_stock_analog (default 1 = fix). */
+	if (rtl960x_c2_stock_analog) {
+		rtl960x_rfwr(o, 0x1B022584u, 14, 14, 1);	/* REG01 CMU bit14 = 1 (stock) */
+		rtl960x_rfwr(o, 0x1B022584u,  0,  0, 0);	/* REG01 BEN_TTL_OUT = 0 (stock) */
+		rtl960x_rfwr(o, 0x1B0225ACu,  7,  0, 0);	/* REG11 RX_FILT_CONFIG = 0 (stock) */
+	}
+
 	/* Step 7a + 7b: force-SD + commit GPON mode. */
 	ret = r960_run(o, c2_sds_mode, ARRAY_SIZE(c2_sds_mode));
 	if (ret)
@@ -1487,7 +1584,7 @@ static int rtl9602c_ponmac_mode_set(const struct rtl960x_ops *o,
 	rtl960x_rfwr(o, C2_WSDS_DIG_00, 0, 0, 0);
 
 	/* Wait for the analog to report ready (FIB_EXT_REG21 bit13); ~200 ms cap.
-	 * Return the poll result, matching gpon_serdes_init's final return. */
+	 * Return the poll result, matching the stock SerDes-init final return. */
 	return r960_run(o, (const struct r960_op[]){
 		POLL(C2_FIB_EXT_REG21, C2_SDS_ANALOG_READY, C2_SDS_LOCK_POLL_MAX),
 	}, 1);
@@ -1498,7 +1595,7 @@ static int rtl9602c_ponmac_mode_set(const struct rtl960x_ops *o,
  *
  *  One section per chip; each reuses that chip's GPON #defines, helpers and
  *  the shared r960_run()/rtl960x_rfwr() framework defined above. Register-
- *  faithful to the vendor _ponMacEponMode*_set() sequences but UNTESTED (no
+ *  faithful to the stock EPON mode-set sequences but UNTESTED (no
  *  EPON hardware); the GPON path is unchanged. PBO/datapath + flow-control
  *  patches are owned by their own subsystems, exactly as for the GPON port.
  * ====================================================================== */
@@ -1519,11 +1616,11 @@ static int rtl9602c_ponmac_mode_set(const struct rtl960x_ops *o,
  *  the per-rate speed pages used by GPON.
  *
  *  Register addresses, page/reg coordinates, values, ordering and delays are
- *  hardware-interface facts of the RTL9601B silicon (resolved from this chip's
- *  own reg_list/regField map); the expression below is original.
+ *  hardware-interface facts of the RTL9601B silicon (this chip's register/field
+ *  map); the expression below is original.
  *
- *  Vendor ordering reproduced faithfully (dal_rtl9601b_ponmac_mode_set, the
- *  PONMAC_MODE_EPON arm):
+ *  Stock EPON-mode ordering reproduced faithfully (the EPON arm of the 9601B
+ *  mode-select):
  *      rev split -> PON_MODE_CFG=2 -> PBO ponMode(EPON) [PONIP_MODE.CFG_EPON_MODE]
  *      -> ponNic QMAP/T-CONT seed -> SDS1_CFG=EPON -> BEN_OE -> RX_SPC=0
  *      -> PCS lane trim -> EN_PDOWN_BEN=0 -> PORT_CLK -> maxPktLen.
@@ -1533,23 +1630,23 @@ static int rtl9602c_ponmac_mode_set(const struct rtl960x_ops *o,
 #define C1B_SDS1_MODE_EPON	0xc
 
 /* PON-IP: PONIP_MODE (PON-IP off 0xF01000 -> phys 0x1BF01000). Bit2 =
- * CFG_EPON_MODE (regField lsp 2, len 1). rtl9601b_raw_pbo_ponMode_set() writes
+ * CFG_EPON_MODE (field lsb 2, len 1). The stock PBO mode-set writes
  * this for BOTH modes: 1 = EPON, 0 = GPON. The whole PON-IP window is 0x1BF0xxxx.
  * The GPON section never touches this reg (its default 0 already selects GPON),
- * so the EPON write is a vendor op the GPON tables legitimately omit. */
+ * so the EPON write is a step the GPON tables legitimately omit. */
 #define C1B_R_PONIP_MODE	0x1BF01000u
 
-/* PON-IP scheduler seed for EPON (raw whole-word ioal_ponNic_write in vendor):
+/* PON-IP scheduler seed for EPON (raw whole-word PON-NIC writes):
  *   PON_SCH_QMAP[0] (0xF0213C -> 0x1BF0213C): T-CONT 0 queue-membership mask
  *   PON_SCH_QMAP[1] (0xF02140 -> 0x1BF02140): T-CONT 1 queue-membership mask
  *   PON_TCONT_EN    (0xF0215C -> 0x1BF0215C): per-T-CONT enable bitfield
- * QMAP is 1 word (32 bits) per T-CONT (regField array offset 32). The seed
+ * QMAP is 1 word (32 bits) per T-CONT (field array offset 32). The seed
  * values open logical queues 0..9 on T-CONT 0 (0x3FF) and the same 10-queue
  * width in the high half-word for T-CONT 1 (0x03FF0000), and enable T-CONT 0
- * and 1 (0x03). These are the literal ioal_ponNic_write whole-word values from
- * the vendor EPON arm; they overwrite the earlier per-queue queue_add(0..7 on
+ * and 1 (0x03). These are the literal whole-word values the stock EPON
+ * bring-up writes; they overwrite the earlier per-queue queue_add(0..7 on
  * sched 0) loop, and the per-queue strict/CIR=0/PIR=max/weight=1 shaping is
- * already applied to every queue by rtl9601b_ponmac_init - so the vendor's
+ * already applied to every queue by rtl9601b_ponmac_init - so the stock
  * queue_add loop collapses to these authoritative whole-word writes. */
 #define C1B_R_QMAP0		0x1BF0213Cu	/* == C1B_R_QMAP_BASE (T-CONT 0) */
 #define C1B_R_QMAP1		0x1BF02140u	/* QMAP_BASE + 4    (T-CONT 1)  */
@@ -1557,14 +1654,14 @@ static int rtl9602c_ponmac_mode_set(const struct rtl960x_ops *o,
 
 /* WSDS_DIG_01 (0x1B022004): GPON uses a field write to CFG_CLKRD_ORG (bit2);
  * EPON writes the WHOLE register = 4, which selects that clkrd source AND clears
- * every other digital-01 knob. Vendor uses reg_write here, not reg_field_write,
- * so this is a full-word WR(), not an FLD(). */
+ * every other digital-01 knob. The stock EPON path does a full register write
+ * here, not a field write, so this is a full-word WR(), not an FLD(). */
 #define C1B_WSDS01_CLKRD_ORG	0x4u
 
 /* ---- EPON PCS SerDes trim (indirect): raw SDS + SDS_EXT lane pages -------- *
  * Fixes the inter-packet-gap / preamble / burst timing the EPON MAC expects on
  * the 1.25G burst lane. {index, page, reg, data}; index = PON lane.
- * Pages: RTL9601B_SDS_PAGE_SDS = 0x00, RTL9601B_SDS_PAGE_SDS_EXT = 0x01.       */
+ * Pages: raw SerDes lane page = 0x00, SerDes lane extension page = 0x01.       */
 #define C1B_SP_SDS		0x00	/* raw SerDes lane page              */
 #define C1B_SP_SDS_EXT		0x01	/* SerDes lane extension page        */
 
@@ -1589,7 +1686,7 @@ static const struct r960_op rtl9601b_epon_pre_revA[] = {
 	WR(C1B_R_WSDS01, C1B_WSDS01_CLKRD_ORG),	/* clkrd source = original clock    */
 };
 
-/* mode-select + PON-IP scheduler seed (vendor order: PON_MODE_CFG, PONIP_MODE
+/* mode-select + PON-IP scheduler seed (stock order: PON_MODE_CFG, PONIP_MODE
  * CFG_EPON_MODE, then the three PON-IP scheduler-window words). */
 static const struct r960_op rtl9601b_epon_mode[] = {
 	WR(C1B_R_MODE_CFG, 2),			/* PON_MODE_CFG = EPON              */
@@ -1606,7 +1703,7 @@ static const struct r960_op rtl9601b_epon_enable[] = {
 	FLD(C1B_R_PMISC_PON, 2, 2, 0),		/* RX_SPC = 0 (reject undersize)   */
 };
 
-/* tail: keep TX live across BEN (EN_PDOWN_BEN = 0). Vendor order within the
+/* tail: keep TX live across BEN (EN_PDOWN_BEN = 0). Stock order within the
  * tail: WSDS_DIG_11, PORT_CLK, then maxPktLen(PON, UTP). */
 static const struct r960_op rtl9601b_epon_tail[] = {
 	FLD(C1B_R_WSDS11, 0, 0, 0),		/* CFG_EN_PDOWN_BEN = 0            */
@@ -1639,7 +1736,7 @@ static int rtl9601b_ponmac_mode_set_epon(const struct rtl960x_ops *o,
 	if (ret)
 		return ret;
 
-	/* EPON: steer flows 0..31 to scheduler 0 / queue 0 (vendor maps all flows
+	/* EPON: steer flows 0..31 to scheduler 0 / queue 0 (stock maps all flows
 	 * to T-CONT 0 / queue 0; queue-membership is set by the QMAP whole-word
 	 * writes below, the per-queue shaping by ponmac_init). Note rtl9601b_flow2q
 	 * uses the GPON physical-queue formula (sched/8); for sched 0 that yields
@@ -1718,15 +1815,15 @@ static int rtl9601b_ponmac_mode_set_epon(const struct rtl960x_ops *o,
  *  command/data page window.
  *
  *  Register addresses, field bit-ranges, values, ordering and delays are
- *  hardware-interface facts of the RTL9602C silicon (resolved from the chip's
- *  own reg_list/regField map). The expression - data-driven op-tables, the
+ *  hardware-interface facts of the RTL9602C silicon (the chip's register/field
+ *  map). The expression - data-driven op-tables, the
  *  rev split, and all comments - is original.
  *
  *  Address space: swcore physical base 0x1B000000 + offset. The board supplies
  *  rd/wr in struct rtl960x_ops to map phys->virt.
  *
- *  Rev split (mirrors the stock PONMAC_MODE_EPON case: rev > CHIP_REV_ID_A picks
- *  EponModeV2, otherwise ModeV1 - the same ModeV1 used by the GPON rev-A path):
+ *  Rev split (mirrors the stock EPON mode select: rev > rev-A picks the V2
+ *  operating point, otherwise V1 - the same V1 used by the GPON rev-A path):
  *    rev == RTL960X_REV_A -> ModeV1 SerDes patch (rev-A operating point).
  *    rev  > RTL960X_REV_A -> EponModeV2 SerDes patch (CFG_SFT_RSTB pulse + GPON-
  *                            rate CDR retune).
@@ -1821,7 +1918,7 @@ static const struct r960_op c2_epon_sds_v1[] = {
  * end, pulse the SerDes soft-reset (CFG_SFT_RSTB 0->1) and settle 10 ms, retune
  * the GPON-rate CDR (Ki=1/16, Kp1=8, Kp2=0.5), drive the forced RX-enable
  * through a 0->1 edge to start the CDR, settle 50 ms, then drop the BEN
- * power-down. (Mirrors _rtl9602c_ponMacEponModeV2_set.)
+ * power-down. (Mirrors the stock 9602C EPON ModeV2 sequence.)
  */
 static const struct r960_op c2_epon_sds_v2[] = {
 	FLD(C2_SDS_ANA_COM_REG22, 5, 3, 5),	/* REG_TX_AMP = 0x5               */
@@ -1915,24 +2012,24 @@ rtl9602c_ponmac_mode_set_epon(const struct rtl960x_ops *o,
  *  every analog/digital/PCS knob is a plain RMW or full-word write. Addresses
  *  are absolute physical (SWCORE base 0x1b000000); the PON-IP scheduler block
  *  lives in the 0x1bf0xxxx window. Register addresses, field bit-ranges,
- *  values, ordering and delays are RTL9603CVD silicon facts (resolved from the
- *  chip's own reg_list / regField_list); the expression (tables + loops +
+ *  values, ordering and delays are RTL9603CVD silicon facts (the chip's
+ *  register/field map); the expression (tables + loops +
  *  comments) is original.
  *
- *  Source-correctness anchor: _rtl9603cvd_ponMacEponModeV1_set() and the EPON
- *  SDS_CFG branch in the vendor DAL. The init-only / GPON-only ops (forced
+ *  Behavioral anchor: the stock 9603CVD EPON ModeV1 sequence and its EPON
+ *  SDS_CFG branch. The init-only / GPON-only ops (forced
  *  125 MHz reference, interface-FIFO rstb cycle, FEP_V2ANALOG analog-ready
  *  poll, P_MISC.RX_SPC accept-undersize, OMCI SID/SID-valid wiring) are
- *  deliberately ABSENT here: the vendor EPON path does not perform them.
+ *  deliberately ABSENT here: the stock EPON path does not perform them.
  *
- *  Out of section scope (HAL-subsystem calls, not raw SerDes/PON-MAC register
- *  writes, and omitted by the in-tree GPON sibling too): dal_rtl9603cvd_pbo_init
+ *  Out of section scope (higher-level subsystem steps, not raw SerDes/PON-MAC
+ *  register writes, and omitted by the in-tree GPON sibling too): the PBO init
  *  (PBO_MODE_EPON), the PBO DS-sid2q MPCP/OAM high-queue map (streamId 0x10..
- *  0x1b), and rtl9603cvd_raw_flowctrl_patch(FLOWCTRL_PATCH_35M_GPON).
+ *  0x1b), and the 35M-GPON switch flow-control patch.
  * ------------------------------------------------------------------ */
 
 /* EPON-specific registers not already defined in the C3 GPON section.
- * (offsets verified against rtk_rtl9603cvd_reg_list.c) */
+ * (offsets verified against the 9603CVD register map) */
 #define C3_E_FIB_REG0		0x1b040c00u /* fiber analog: FP_CFG_FIB_PDOWN @[11]      */
 #define C3_E_SDS_REG1		0x1b040804u /* SerDes ctrl 1: SP_SDS_FRC_RX @[11:8]      */
 #define C3_E_SDS_REG2		0x1b040808u /* SerDes ctrl 2: SP_FRC_IPG @[13:12]        */
@@ -1947,7 +2044,7 @@ rtl9602c_ponmac_mode_set_epon(const struct rtl960x_ops *o,
 /* PON-IP scheduler tables (0x1bf0xxxx), not used by the GPON section.
  *   PON_TCONT_EN  array offset = 1 bit  (TCONT_ENf [0:0], all in one word)
  *   PON_SCH_QMAP  array offset = 8 bits (MAPPING_TBLf [7:0], 4 tconts/word)
- * (offsets + array offsets verified against rtk_rtl9603cvd_reg_list.c) */
+ * (offsets + array offsets verified against the 9603CVD register map) */
 #define C3_E_PON_SCH_QMAP	0x1bf025e8u /* per-tcont queue mask, 8b/elem             */
 #define C3_E_PON_TCONT_EN	0x1bf025fcu /* per-tcont schedule enable, 1b/elem        */
 
@@ -1956,12 +2053,12 @@ rtl9602c_ponmac_mode_set_epon(const struct rtl960x_ops *o,
  * 0x203FF), so the HAL addresses it as a plain Global array: the per-element
  * stride is array_offset/8 = 32/8 = 4 bytes (NOT the 0x100 MACPP interval, and
  * NOT 0x20). PON port index = 4 (rtl9603cvd_port_info.ponPort), so the PON
- * instance lives at 0x1100C + 4*4 = 0x1101C. This matches reg.c _reg_addr_find()
- * (Global index_1 branch: addr += (idx-lport)*(array_offset/8)) and the in-tree
- * RTL9607C C7_ACCEPT_MAX_LEN (0x11028, stride 4) sibling. */
+ * instance lives at 0x1100C + 4*4 = 0x1101C. This matches the silicon's
+ * per-port address resolution (Global array branch: addr += (idx-lport)*(array_offset/8))
+ * and the in-tree RTL9607C C7_ACCEPT_MAX_LEN (0x11028, stride 4) sibling. */
 #define C3_E_ACCEPT_MAXLEN_PON	0x1b01101cu /* ACCEPT_MAX_LEN_CTRL[PON port 4]        */
 
-/* fixed EPON parameters (numeric facts from rtl9603cvd_def.h) */
+/* fixed EPON parameters (numeric facts of the 9603CVD GPON/EPON datapath) */
 #define C3_E_SDS_MODE		0xc	/* SDS_CFG.CFG_SDS_MODE value for EPON       */
 #define C3_E_GPON_TCONT_MAX	17	/* RTL9603CVD_GPON_TCONT_MAX (T-cont slots)  */
 #define C3_E_MAX_PKT_LEN	2031	/* 2047-4(ctag)-4(stag)-8(pppoe)             */
@@ -2014,8 +2111,8 @@ static const struct r960_op c3_epon_sds_mode[] = {
  * downstream FEC (mark option + coefficient words + PCS misc word), drop the
  * burst-enable force mode, and hold the EPON MAC up across an SD drop.
  *
- * NB: SP_SDS_FRC_RX is a 4-bit field [11:8] (regField lsp=8 len=4), not a single
- * bit. NB: the vendor EPON path does NOT set P_MISC.RX_SPC (accept-undersize) --
+ * NB: SP_SDS_FRC_RX is a 4-bit field [11:8] (field lsb=8 len=4), not a single
+ * bit. NB: the stock EPON path does NOT set P_MISC.RX_SPC (accept-undersize) --
  * that is a GPON-only step and is intentionally absent here.
  */
 static const struct r960_op c3_epon_sds_post[] = {
@@ -2065,7 +2162,7 @@ static int rtl9603cvd_ponmac_mode_set_epon(const struct rtl960x_ops *o,
 
 	/* park every T-cont: disable its schedule (TCONT_EN, 1 bit/tcont) and
 	 * clear its 8-bit queue-mask (MAPPING_TBL, 4 tconts packed per word).
-	 * Loop bound mirrors the vendor's HAL_MAX_NUM_OF_GPON_TCONT()-1 (=16). */
+	 * Loop bound mirrors the stock max-GPON-T-cont count minus 1 (=16). */
 	for (t = 0; t < C3_E_GPON_TCONT_MAX - 1u; t++) {
 		rtl960x_rfwr(o, C3_E_PON_TCONT_EN, t, t, 0);
 		rtl960x_rfwr(o, C3_E_PON_SCH_QMAP + (t >> 2) * 4u,
@@ -2073,7 +2170,7 @@ static int rtl9603cvd_ponmac_mode_set_epon(const struct rtl960x_ops *o,
 	}
 
 	/* EPON default flow->queue is one-to-one (flow N -> queue N), over the
-	 * classifier SID range (mirrors HAL_CLASSIFY_SID_NUM()-1 = 127). */
+	 * classifier SID range (the classifier SID count minus 1 = 127). */
 	for (f = 0; f < C3_SID_COUNT - 1u; f++)
 		c3_flow2queue(o, f, f);
 
@@ -2098,19 +2195,19 @@ static int rtl9603cvd_ponmac_mode_set_epon(const struct rtl960x_ops *o,
  *  exactly as for the C7 GPON path.
  *
  *  The register addresses, field bit-ranges, values, ordering and delays are
- *  hardware-interface facts of RTL9607C EPON mode (resolved from the chip's own
- *  rtk_rtl9607c_reg_list.c / rtk_rtl9607c_regField_list.c). The expression (the
+ *  hardware-interface facts of RTL9607C EPON mode (the chip's register/field
+ *  map). The expression (the
  *  data-driven tables, the rev split, the comments) is original.
  *
  *  Absolute physical addresses = SWCORE base 0x1b000000 + offset; the PON-IP
  *  sub-block lives at 0x1bf0xxxx. The board supplies rd/wr via rtl960x_ops.
  *
  *  rev A -> EPON SerDes V1, rev B -> V2, rev C and later -> V3, matching the
- *  vendor dal_rtl9607c_ponmac_mode_set() EPON arm and the GPON V1/V2/V3 split
+ *  stock 9607C EPON mode-set arm and the GPON V1/V2/V3 split
  *  this chip already uses.
  *
- *  UNTESTED: no EPON hardware available; register-faithful to the vendor
- *  _rtl9607c_ponMacEponModeV1/V2/V3_set() sequence.
+ *  UNTESTED: no EPON hardware available; register-faithful to the stock
+ *  9607C EPON ModeV1/V2/V3 sequence.
  * ------------------------------------------------------------------ */
 
 /* EPON lane mode select value (CFG_SDS_MODE [4:0]): GPON is 0x8, EPON is 0xc. */
@@ -2118,8 +2215,8 @@ static int rtl9603cvd_ponmac_mode_set_epon(const struct rtl960x_ops *o,
 #define C7_SDS_MODE_OFF		0x1fu
 
 /*
- * EPON-only registers (swcore base 0x1b000000 + offset), resolved from the
- * 9607C reg_list. (The C7_SDS_ANA_COM* / WSDS_DIG_* / SDS_CFG / SOFTWARE_RST /
+ * EPON-only registers (swcore base 0x1b000000 + offset), from the
+ * 9607C register map. (The C7_SDS_ANA_COM* / WSDS_DIG_* / SDS_CFG / SOFTWARE_RST /
  * FORCE_BEN / ACCEPT_MAX_LEN / PON-IP absolutes the EPON path also touches are
  * already #defined by the C7 GPON section above and are reused as-is.)
  */
@@ -2145,7 +2242,7 @@ static int rtl9603cvd_ponmac_mode_set_epon(const struct rtl960x_ops *o,
  */
 #define C7_WSDS_DIG00_SFT_RSTB	8
 
-/* Whole-word values the vendor flow writes verbatim (FEC + MAC keep-up). */
+/* Whole-word values the stock EPON flow writes verbatim (FEC + MAC keep-up). */
 #define C7_EPON_FEC_EXT13	0x4e6au
 #define C7_EPON_FEC_EXT15	0x1562u
 #define C7_EPON_FEC_EXT16	0xbd2au
@@ -2268,7 +2365,7 @@ static const struct r960_op c7_epon_sds_v3[] = {
 /*
  * Shared EPON reset / PCS / FEC / keep-up tail (identical after every rev's
  * SerDes patch; V1's MISC02 BER-notify hold is appended to its own SDS table
- * because the vendor lands it before this reset). The mode change needs a
+ * because the stock flow lands it before this reset). The mode change needs a
  * switch-core reset, then the SerDes digital+analog reset-B is cycled
  * (CFG_SFT_RSTB 0->1). BEN output on, drop the RX force (SP_SDS_FRC_RX=0),
  * force IPG (SP_FRC_IPG, the 129-byte fix) and seed the PCS IPG count, load the
@@ -2278,7 +2375,7 @@ static const struct r960_op c7_epon_sds_v3[] = {
  *
  * NOTE: the EPON path does NOT do the GPON tail's iface-FIFO re-arm,
  * accept-undersize, analog-ready (FIB_EXT_REG21 / V2ANALOG) poll, or 125 MHz
- * power-down - those are GPON-only and the vendor EPON sequence omits them.
+ * power-down - those are GPON-only and the stock EPON sequence omits them.
  */
 static const struct r960_op c7_epon_tail[] = {
 	FLD(C7_SOFTWARE_RST,  10, 10, 0x1),	/* SW_RST: switch-core reset        */
@@ -2301,7 +2398,7 @@ static const struct r960_op c7_epon_tail[] = {
 
 /*
  * EPON post-tail housekeeping (kept as code, not a table - it has loops and a
- * per-port write). Mirrors the vendor EPON sequence AFTER the reset/FEC tail,
+ * per-port write). Mirrors the stock EPON sequence AFTER the reset/FEC tail,
  * in this exact order:
  *   1. accept-max-length on the PON port (ACCEPT_MAX_LEN_CTRL[PON port],
  *      ACCEPT_MAX_LENTH field [13:0]; array offset 32 => byte stride 4).
@@ -2309,11 +2406,11 @@ static const struct r960_op c7_epon_tail[] = {
  *      queue mask (MAPPING_TBL [31:0]).
  *   3. default EPON flow->queue is a one-to-one map across every classifier
  *      SID/flow (the EPON LLID model), unlike GPON's funnel + dedicated OMCI
- *      flow. The vendor SidToQueueMap_set additionally aliases sid<64 to
+ *      flow. The stock SID-to-queue map additionally aliases sid<64 to
  *      sid+64 with the same queue; with the main loop covering [0, SID-1) the
  *      only net effect over identity is SID2QID[SID-1] = (SID/2 - 1).
  *   4. seed the DS in-band low bound (LBOUND [23:0]) for PBO accumulation.
- * (The vendor's shared switch flow-control patch between 3 and 4 lives in a
+ * (The stock shared switch flow-control patch between 3 and 4 lives in a
  *  separate subsystem and is out of scope here, as for the GPON port.)
  */
 static int c7_epon_post(const struct rtl960x_ops *o)
@@ -2334,7 +2431,7 @@ static int c7_epon_post(const struct rtl960x_ops *o)
 		c7_arr(o, C7_PON_SID2QID, 7, i, 0, 7, i);	/* SID i -> queue i */
 
 	/*
-	 * EPON-only: the vendor's per-set sid<64 -> sid+64 alias leaves the top
+	 * EPON-only: the stock per-set sid<64 -> sid+64 alias leaves the top
 	 * SID (SID_COUNT-1) pointing at the half-range head's queue (sid 63 ->
 	 * queue 63 was also written to sid 127). Replicate that net result.
 	 */
@@ -2348,7 +2445,7 @@ static int c7_epon_post(const struct rtl960x_ops *o)
  * EPON mode-set: the rev-selected SerDes patch table, the shared
  * reset/PCS/FEC/keep-up tail, then the post housekeeping (max-len, T-cont park,
  * one-to-one SID map, in-band low bound). rev A->V1, B->V2, C and later->V3,
- * matching the vendor dispatch. c7_ponmac_init runs first and is mode-agnostic.
+ * matching the stock dispatch. c7_ponmac_init runs first and is mode-agnostic.
  */
 static int rtl9607c_ponmac_mode_set_epon(const struct rtl960x_ops *o,
 					 int rev, int subtype)

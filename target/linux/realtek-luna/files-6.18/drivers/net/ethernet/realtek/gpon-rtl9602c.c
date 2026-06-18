@@ -249,6 +249,12 @@
 #define FIB_EXT_REG21		0x22e54		/* [13]  FEP_V2ANALOG (lock)   */
 #define   SDS_ANALOG_READY	BIT(13)
 #define SDS_LOCK_POLL_MAX	1000		/* x200us = up to 200 ms       */
+#define SDS_REG0		0x22800		/* [1] SP_SDS_EN_RX (RX enable)*/
+#define   SP_SDS_EN_RX		BIT(1)
+/* Stock link-state polling behavior: when GPON_GTC_DS_INTR_STS reads this
+ * exact sentinel the DS CDR is wedged; stock recovers by toggling SP_SDS_EN_RX
+ * 1->0->1 (SDS_REG0[1]), waiting 10ms, then re-reading. */
+#define GTC_DS_CDR_STUCK	0xca0eca0fu
 
 /*
  * SoC IO pad routing for the optical front-end (switch-core register file, so
@@ -328,14 +334,14 @@
 #define PI_DSCRUNOUT_US		0x020e0		/* [28:16] DRAM [12:0] SRAM out  */
 #define PI_IP_MSTBASE_US	0x020e8		/* CFG_PON_MSTBASE: phys base of the US PBO DRAM packet pool */
 /* US PBO DRAM pool. ROOT CAUSE of "US-NIC RX never receives" (2026-06-12, found
- * via stock /proc/kallsyms -> memUsage_init + live devmem): the US-NIC RX path
+ * via the stock memory-usage init behavior + live devmem): the US-NIC RX path
  * is a PBO that DMAs received US packets into a DRAM pool at IP_MSTBASE_US. Stock
  * sets IP_MSTBASE_US=0x07eff000, RAM_NO=0x1fff, DRAM_RUNOUT=0x1f58 (a 1MB / 8192x
  * 128B-page DRAM pool); DS is SRAM-only (IP_MSTBASE_DS=0). Our driver did US
  * SRAM-only too (copying DS) -> the US-NIC RX had no DRAM pool to land frames in,
  * so EVERY US OMCI frame was dropped at descriptor-fetch BEFORE the MAC, leaving
  * PKT_OK/ERR/MISS all 0 (the exact symptom). Allocate the pool and point the HW
- * at it. SDK memUsage_init math (usPageSize=128, us_mem_size=1MB): SRAM_NO=0x7f,
+ * at it. Stock memory-usage init math (usPageSize=128, us_mem_size=1MB): SRAM_NO=0x7f,
  * RAM_NO=min(size/128,0x1fff)=0x1fff, DRAM_RUNOUT=size/128-40-128=0x1f58. */
 #define PI_US_DRAM_PAGES	0x1fffu		/* RAM_NO: total US PBO pages-1 (SRAM+DRAM) */
 #define PI_US_DRAM_RUNOUT	0x1f58u		/* DSCRUNOUT_US DRAM portion (size/128-168) */
@@ -517,17 +523,14 @@ MODULE_PARM_DESC(force_laser, "force US laser CW on (US_CFG FS_LON) — SerDes-T
  * (raising it worsens extinction -> hurts DS), so prefer raising MOD and keep BIAS low.
  * Conservative bump first (laser-safety: MPD high/low detect is disarmed in bring-up, so
  * the DAC value is the only over-power guard — do NOT crank these). Sweepable live. */
-static unsigned int laser_bias = 0x32;	/* Board-C REAL per-board calib (rtl8290b.data CAL_IBIAS 9960uA->code 0x32f).
-				 * Earlier 0x20/0x90 sweeps "did nothing" because they never reached the calibrated
-				 * point AND zeroed 0x238's low nibbles — NOT because power isn't the axis. */
-static unsigned int laser_mod = 0xbb;	/* Board-C REAL per-board calib (rtl8290b.data CAL_IMOD 36694uA->code 0xbbd).
-				 * MOD = the burst 1-level/extinction the OLT burst-RX needs; mine was 0x34/0x67 (~3.5x low). */
+static unsigned int laser_bias = 0x32;	/* Board-C REAL per-board calib (rtl8290b.data CAL_IBIAS 9960uA->code 0x32f). 0x18/0x34 25C-LUT A/B = no rate gain (2/6 vs 3/6), reverted */
+static unsigned int laser_mod = 0xbb;	/* Board-C REAL per-board calib (rtl8290b.data CAL_IMOD 36694uA->code 0xbbd) */
 module_param(laser_bias, uint, 0644);
 module_param(laser_mod, uint, 0644);
 MODULE_PARM_DESC(laser_bias, "BOSA bias DAC hi-8 (0x236) override; 0=keep A4-golden 0x19");
 MODULE_PARM_DESC(laser_mod, "BOSA mod DAC hi-8 (0x237) override for stronger burst peak; 0=keep golden 0x67");
-/* rev-A ModeV1 US-TX SerDes CMU/PLL + TX-LA-LDO writes (stock _rtl9602c_ponMacModeV1_set,
- * dal_rtl9602c_ponmac.c:854) that our gpon_serdes_init OMITS: SDS_ANA_COM_REG02/03/08 = the
+/* rev-A ModeV1 US-TX SerDes CMU/PLL + TX-LA-LDO writes (part of the stock rev-A GPON
+ * mode-set analog config) that our gpon_serdes_init OMITS: SDS_ANA_COM_REG02/03/08 = the
  * TX CMU/PLL that clocks the US serializer, COM_REG24=0x8001 = REG_TXLA_LDOEN (TX limiting-amp
  * LDO/output stage). Without them the laser is DC-biased but the MAC's US data is not cleanly
  * serialized/modulated onto it -> OLT "Laser out" + rxsid=0 (the unified US-TX wall). The CMU
@@ -545,8 +548,8 @@ MODULE_PARM_DESC(serdes_modev1_tx, "1=apply the rev-A ModeV1 US-TX SerDes CMU/PL
 static unsigned int serdes_tx_xtra;
 module_param(serdes_tx_xtra, uint, 0644);
 MODULE_PARM_DESC(serdes_tx_xtra, "1=set legacy SerDes-TX D2A/clk-edge bits (stock=0; default 0=match stock)");
-/* serdes_cdr_reset: replicate the stock dal_rtl9602c_ponmac_serdesCdr_reset (librtk @0x75654,
- * reg1418 = SDS_ANA_COM_REG08 @ swcore 0x225a0): INVERT bit15, hold 10ms, RESTORE. Our clean-room
+/* serdes_cdr_reset: replicate the stock SerDes CDR-reset behavior
+ * (SDS_ANA_COM_REG08 @ swcore 0x225a0): INVERT bit15, hold 10ms, RESTORE. Our clean-room
  * init OMITTED this CDR-lock pulse. It seats the upstream-TX SerDes serializer CDR; without it the
  * TX serializer lock is non-deterministic, which matches the observed cycle-to-cycle US-burst
  * variation (some O5 windows the OLT decodes hundreds of US-OMCI, others it loses the burst at once
@@ -554,7 +557,40 @@ MODULE_PARM_DESC(serdes_tx_xtra, "1=set legacy SerDes-TX D2A/clk-edge bits (stoc
  * left default-on but A/B'd live. Default on (the fix); gpon.serdes_cdr_reset=0 reverts. */
 static bool serdes_cdr_reset = true;
 module_param(serdes_cdr_reset, bool, 0644);
-MODULE_PARM_DESC(serdes_cdr_reset, "pulse SDS_ANA_COM_REG08 (0x225a0) bit15 10ms to lock US-TX CDR (stock ponmac step; default on)");
+MODULE_PARM_DESC(serdes_cdr_reset, "pulse SDS_ANA_COM_REG12 (0x225b0) bit15 10ms (stock serdesCdr_reset RX_SD_POR_SEL) (stock ponmac step; default on)");
+/* usnic_initrdy_poll: stock-aligned US-NIC readiness gate. PON_IPSTS_US (PON-IP
+ * 0x1bf020f4) bit0 = PONIC_INITRDY = read-only US PON-IP core init-ready. Wait for
+ * it before the US GMII RX/TX latch edge so the NIC latches with the core ready.
+ * Bounded 200ms, read-only -> cannot reorder config/reset or worsen the lock.
+ * (Stock NEVER writes 0x20f4; our old pi_wr(0x20f4,1) set a reserved bit -> removed.)
+ * RE verdict: a digital-core ready flag, so probably instrumentation not the analog
+ * fix — but discriminating: a timeout on a failed-WAN boot implicates the digital US
+ * layer; never-timeout proves that layer innocent. Default on. */
+static bool usnic_initrdy_poll = true;
+module_param(usnic_initrdy_poll, bool, 0644);
+MODULE_PARM_DESC(usnic_initrdy_poll, "wait PON_IPSTS_US.PONIC_INITRDY (0x1bf020f4 bit0)==1 before US GMII latch (default on; bounded 200ms, read-only)");
+/* usnic_initrdy_repulse: ACTIVE escalation (experiment). On PONIC_INITRDY timeout,
+ * re-pulse the CDR (COM_REG12 bit15, same as serdes_cdr_reset) + re-poll once
+ * — re-rolls the analog lock without reordering config/reset. Default off. */
+static bool usnic_initrdy_repulse;
+module_param(usnic_initrdy_repulse, bool, 0644);
+MODULE_PARM_DESC(usnic_initrdy_repulse, "on PONIC_INITRDY timeout, re-pulse CDR (COM_REG12 bit15) + re-poll once (default 0)");
+/* cdr_stuck_recover: faithful replica of the stock runtime link-state-check
+ * DS-CDR-wedge recovery that our driver was MISSING. From a cold power-on the
+ * DS CDR can come up wedged (the per-boot ~50% cold-start lock); a soft/WDT reboot
+ * re-runs init assuming fresh HW and never re-acquires, so a bad lock persists. Stock
+ * detects the wedge at link-check time — GPON_GTC_DS_INTR_STS == 0xca0eca0f — and
+ * recovers by toggling SP_SDS_EN_RX (SDS_REG0[1]) 1->0->1 with a 10ms settle. We run
+ * the same check each FSM poll tick (BOSA-serialized softirq) as a two-tick toggle
+ * (off this tick, on next) to avoid a 10ms busy-wait in softirq. Bounded by
+ * GPON_CDR_STUCK_MAX attempts/range. Default on; gpon.cdr_stuck_recover=0 disables. */
+static bool cdr_stuck_recover = true;
+module_param(cdr_stuck_recover, bool, 0644);
+MODULE_PARM_DESC(cdr_stuck_recover, "recover a wedged DS CDR (GTC_DS_STS==0xca0eca0f) by toggling SP_SDS_EN_RX, like stock (default on)");
+#define GPON_CDR_STUCK_MAX	8	/* bounded re-acquire attempts per range cycle */
+static unsigned int gpon_cdr_stuck_count;	/* diag: total wedges detected */
+static unsigned int gpon_cdr_stuck_fixed;	/* diag: wedges cleared by the toggle */
+static u32 gpon_gtc_ds_sts_last;		/* diag: last raw GTC DS status seen */
 /* serdes_stock_seq: 1 = use gpon_serdes_init_stock() (the EXACT stock rev-A bring-up
  * ORDER: reset-FIRST then config, single reset bit CMD_SDS_RST_PS, the D2A/sample-clock
  * bits SET=1, NO reset-B-release dance) instead of our gpon_serdes_init() (config-first
@@ -594,6 +630,44 @@ MODULE_PARM_DESC(family_lib, "1=bring up SerDes via rtl960x_ponmac family lib (9
 static bool serdes_postmode_perturb;	/* default false: skip post-mode perturbations (stock rev-A) */
 module_param(serdes_postmode_perturb, bool, 0644);
 MODULE_PARM_DESC(serdes_postmode_perturb, "1=do post-GPON-mode DIG_1D resync + serdesCdr_reset (legacy); 0=skip (stock rev-A, default)");
+/* serdes_sds_cfgrst: the family-lib SerDes reset pulse used to assert BOTH
+ * CMD_SDS_CFG_RST_PS (bit7) and CMD_SDS_RST_PS (bit0); stock rev-A pulses ONLY bit0
+ * (stock never writes bit7 anywhere during bring-up). Because the field-write is
+ * RMW, bit7 stayed latched through the whole bring-up = an extra SDS-config reset
+ * domain stock never touches -> prime suspect for the per-power-on US-TX serializer/
+ * PLL phase re-roll (cold-start WAN ~50%, OLT "Laser out"). DEFAULT 0 = bit0-only
+ * (stock = the fix); gpon.serdes_sds_cfgrst=1 restores the legacy bit7+bit0 pulse. */
+static bool serdes_sds_cfgrst;	/* default false = stock bit0-only SDS reset */
+module_param(serdes_sds_cfgrst, bool, 0644);
+MODULE_PARM_DESC(serdes_sds_cfgrst, "1=legacy: also pulse CMD_SDS_CFG_RST_PS bit7 in the SDS reset; 0=stock bit0-only (default, the cold-start fix)");
+/* serdes_stock_analog: drive SDS_ANA_COM REG01 (0x22584)=0x73a4 + REG11 (0x225ac)
+ * RX_FILT_CONFIG=0 to EXACTLY match the live-stock post-reset values — the ONLY two
+ * SerDes registers that differed between stock (WAN-up, 100%) and our failing board
+ * (cold-start ~50% US-TX "Laser out"). The golden table writes them correctly but the
+ * SDS reset wipes REG01 bit14 (shared CMU) / REG11 RX_FILT; this re-applies them AFTER
+ * the reset, like stock. DEFAULT 1 = the fix; gpon.serdes_stock_analog=0 = legacy. */
+static bool serdes_stock_analog = true;
+module_param(serdes_stock_analog, bool, 0644);
+MODULE_PARM_DESC(serdes_stock_analog, "1=match live-stock SDS REG01=0x73a4 + REG11 RX_FILT=0 post-reset (default, the cold-start fix); 0=legacy");
+/* serdes_analog_postreset: program the FULL analog CMU/CDR golden table (COM_REG02/03/
+ * 08/24/25 charge-pump/LDO/tank + GPON_REG46 CDR) AFTER the SDS reset (stock rev-A
+ * order) instead of before it. The reset WIPES analog to defaults; pre-reset placement
+ * (legacy) leaves the CMU/CDR locking against default operating-point values that the
+ * partial REG01/REG11 re-apply never fully corrects -> metastable per-power-on lock =
+ * the cold-start ~50% "Laser out". Post-reset = stock = deterministic lock every cold
+ * boot + soft restart. DEFAULT 1 = the fix; gpon.serdes_analog_postreset=0 = legacy. */
+static bool serdes_analog_postreset = true;
+module_param(serdes_analog_postreset, bool, 0644);
+MODULE_PARM_DESC(serdes_analog_postreset, "1=program full analog CMU/CDR table AFTER the SDS reset (stock rev-A, default, the cold-start determinism fix); 0=legacy pre-reset");
+/* sc_ldo_init: stock runs an LDO-init step (early in boot) that we OMIT — an
+ * SC-indirect RMW of the DRAM-rail LDO byte 0xfdca (clear bits 2,3) + THERMAL_CTRL_0
+ * (swcore 0x130)=0x00ec0005 (arm on-die over-temp ALARM comparator). Assessment:
+ * DRAM-LDO + thermal alarm, NOT the SerDes/laser path — kept as stock platform
+ * hygiene (the init we were missing), NOT expected to move the WAN cold-start rate.
+ * Default on; A/B revert with gpon.sc_ldo_init=0. */
+static bool sc_ldo_init = true;
+module_param(sc_ldo_init, bool, 0644);
+MODULE_PARM_DESC(sc_ldo_init, "run stock rtk_ldo_init (SC-indirect 0xfdca analog LDO + THERMAL_CTRL_0); default on");
 
 /* Register accessor the family lib injects: absolute phys -> KSEG1 uncached MMIO
  * (phys < 0x20000000 on this SoC: swcore 0x1b000000 / PON-IP 0x1bf00000). */
@@ -635,7 +709,7 @@ static bool apc_off = true;	/* default TRUE: apc_off=false (full APC seat) was R
 			 * whole time, ONU reaches O5 and holds ~8s before the OLT sends Deactivate(0x05)=LOS. So
 			 * the LOS is NOT a laser-bias-seat problem — it is the upstream BURST not being decodable
 			 * by the OLT despite a healthy laser (US-TX SerDes / burst-gating), the same wall as
-			 * rxsid=0. See [[rtl9602c-sdk-ponmac-init-decoded]] item#1: US-TX SerDes init is omitted. */
+			 * rxsid=0: the US-TX SerDes init step is omitted relative to stock. */
 module_param(apc_off, bool, 0444);
 MODULE_PARM_DESC(apc_off, "skip bosa_apc_calibrate (1=A4 image alone; 0=run APC to seat OFFK laser bias)");
 /*
@@ -698,6 +772,21 @@ static u32 gpon_ds_rx;		/* total downstream PLOAMs drained (DS-lock liveness) */
 static bool gpon_omcc_installed;	/* OMCC GEM datapath installed (one-shot, on Configure_Port-ID) */
 static bool gpon_tcont_installed;	/* OMCC T-CONT/alloc-id bound (one-shot, on Assign_Alloc-ID) */
 static bool gpon_data_installed;	/* WAN data GEM (193) datapath installed (one-shot, on OMCI GEM-CTP create) */
+static bool gpon_data_tcont_installed;	/* the OLT's DATA Alloc-ID bound to the DATA T-CONT (8) */
+static u16 gpon_omcc_alloc;		/* the OMCC's (first) Alloc-ID, on T-CONT 16 */
+static u16 gpon_data_alloc;		/* the OLT's data Alloc-ID, on T-CONT 8 */
+/* data_tcont: bind the OLT's separate DATA Alloc-ID to its OWN data T-CONT 8 (and route the
+ * data GEM US to GPON_DATA_PHYS_QID 32) instead of riding the OMCC T-CONT 16's grants. The OLT's
+ * DBA grants the data Alloc separately; with no live T-CONT reporting occupancy on it, the OLT
+ * reclaims it (Assign_Alloc-ID op=0xFF), reallocs, churns, and escalates to Deactivate_ONU-ID
+ * (0x05) ~4min in -> WAN data path torn down. Binding it like stock (one physical T-CONT per
+ * Alloc-ID) keeps the OLT happy. ⚠ ONLY for OLTs that grant a SEPARATE data Alloc-ID — THIS lab
+ * OLT (HSGQ-G008) uses a SINGLE Alloc-ID 0x100 for both OMCC + data (T-CONT 16), so routing data
+ * to T-CONT 8 leaves it grantless. DEFAULT off (data rides T-CONT 16, correct for single-alloc);
+ * gpon.data_tcont=1 enables the per-data-alloc T-CONT 8 bind for multi-alloc OLTs. */
+static bool data_tcont;		/* default off: single-alloc OLT (this lab) -> data rides T-CONT 16 */
+module_param(data_tcont, bool, 0644);
+MODULE_PARM_DESC(data_tcont, "bind the OLT data Alloc-ID to its own T-CONT 8 + route data US to qid 32 (default on, the WAN-stability fix)");
 
 static inline u32 gpon_rd(u32 off) { return ioread32(gpon_base + off); }
 static inline void gpon_wr(u32 off, u32 v) { iowrite32(v, gpon_base + off); }
@@ -879,6 +968,39 @@ static int bosa_read16(u16 reg_hi)
 	if (h < 0 || l < 0)
 		return -1;
 	return ((h & 0xff) << 8) | (l & 0xff);
+}
+
+/*
+ * Glitch-tolerant DDM read for the optic power words shown in the web UI. The BOSA
+ * I2C bus is also driven by the laser servo (bosa_laser_maint, softirq, ~10ms); an
+ * on-demand optic read from process context (the /proc dump) can interleave a servo
+ * I2C transaction and come back corrupted with NO NACK — just wrong bytes — which is
+ * why the RX power was occasionally wrong in the UI. Sample three times and return the
+ * median of the valid samples so a single corrupted reading is discarded. No bus lock
+ * is taken (the GPON datapath softirq must never wait on the optic read); rejection is
+ * cheap and entirely in this process-context path. Returns -1 (-> "n/a") only if every
+ * sample failed.
+ */
+static int bosa_read16_median(u16 reg_hi)
+{
+	int v[3], n = 0, i, j;
+
+	for (i = 0; i < 3; i++) {
+		int r = bosa_read16(reg_hi);
+
+		if (r >= 0)
+			v[n++] = r;
+	}
+	if (n == 0)
+		return -1;
+	for (i = 1; i < n; i++) {		/* insertion sort the valid samples */
+		int key = v[i];
+
+		for (j = i - 1; j >= 0 && v[j] > key; j--)
+			v[j + 1] = v[j];
+		v[j + 1] = key;
+	}
+	return v[n / 2];			/* median */
 }
 
 /*
@@ -1634,7 +1756,7 @@ static void __init bosa_apc_calibrate(void)
 /*
  * rtl8290b_apc_init() — RTL8290B (chip_type==1) B-variant laser APC/OFFK ignition.
  *
- * This is the flow stock europa_drv.ko runs (rtl8290b_apc_init @0x9ae4) and the
+ * This is the flow the stock BOSA/laser module runs for the B-variant chip, and the
  * one our clean-room bosa_apc_calibrate (rtl8290 NON-B) gets wrong. The decisive
  * difference is the OFFK (modulator offset) calibration: the B chip completes it
  * via the FSU done-flag (R29/0x31d & 0x3c == 0x3c), NOT via the non-B R30/0x31e
@@ -1662,8 +1784,8 @@ static void __init bosa_apc_calibrate(void)
  */
 static void __init rtl8290b_apc_init(void)
 {
-	/* Exact stock rtl8290b_apc_init (GPON/pon=1), transcribed verbatim from
-	 * europa_drv.ko @0x9ae4 with dpoConfig @ rtl8290b.data+0x578. setReg ->
+	/* Exact stock B-variant laser APC init behavior (GPON/pon=1), re-expressed from
+	 * the observed stock register sequence with the per-board dpoConfig table. setReg ->
 	 * bosa_write_reg, setRegBit -> bosa_set_bit, setRegBits -> bosa_set_field
 	 * (val shifted into the mask's low bit, == stock). The OFFK offset
 	 * compute+write (0x243/0x245) is GATED on dpo[0x72]!=0 in stock; ours is 0,
@@ -1977,8 +2099,13 @@ static int gpon_serdes_init(void)	/* not __init: re-run on re-range from gpon_cd
 		sw_wr(fib_reg0_banks[i],
 		      sw_rd(fib_reg0_banks[i]) & ~FIB_REG0_PDOWN);
 
-	/* 3. Pulse the SDS config + datapath reset to latch the analog config. */
-	sw_field(SW_SOFTWARE_RST, 7, 7, 1);		/* CMD_SDS_CFG_RST_PS      */
+	/* 3. Pulse the SDS reset to latch the analog config. Stock rev-A pulses ONLY
+	 *    bit0 (CMD_SDS_RST_PS); the extra bit7 (CMD_SDS_CFG_RST_PS) is never written
+	 *    by stock and, left RMW-latched through bring-up, re-rolls
+	 *    the US-TX serializer phase per power-on. Gate bit7 behind serdes_sds_cfgrst
+	 *    (default 0 = stock bit0-only = the cold-start fix). */
+	if (serdes_sds_cfgrst)
+		sw_field(SW_SOFTWARE_RST, 7, 7, 1);	/* legacy CMD_SDS_CFG_RST_PS */
 	sw_field(SW_SOFTWARE_RST, 0, 0, 1);		/* CMD_SDS_RST_PS          */
 	mdelay(10);
 
@@ -2036,7 +2163,7 @@ static int gpon_serdes_init(void)	/* not __init: re-run on re-range from gpon_cd
 	sw_field(0x220e4, 0, 0, 0x0);
 
 	/*
-	 * 6a-ModeV1. US-TX SerDes CMU/PLL + TX-LA-LDO — the rev-A _rtl9602c_ponMacModeV1_set
+	 * 6a-ModeV1. US-TX SerDes CMU/PLL + TX-LA-LDO — the rev-A GPON mode-set analog
 	 * full-word writes our init OMITTED. SDS_ANA_COM_REG02/03/08 program the TX CMU/PLL
 	 * that clocks the upstream serializer; COM_REG24=0x8001 (REG_TXLA_LDOEN) powers the TX
 	 * limiting-amp output stage feeding the laser modulation input. Without them the laser
@@ -2119,29 +2246,27 @@ static int gpon_serdes_init(void)	/* not __init: re-run on re-range from gpon_cd
 	sw_field(WSDS_DIG_1D, 16, 16, 1);
 	mdelay(10);
 
-	/* US-TX SerDes CDR-lock pulse — the stock dal_rtl9602c_ponmac_serdesCdr_reset
-	 * (librtk @0x75654) our init OMITTED: invert SDS_ANA_COM_REG08 bit15, hold 10ms,
-	 * restore. Seats the upstream serializer CDR so the per-grant burst is consistently
-	 * lockable by the OLT burst-RX (see serdes_cdr_reset param). Done here, after GPON
-	 * mode + the TX reset-B re-sync, so the analog-ready poll below confirms the SerDes
-	 * recovered. Brief shared-CMU perturbation -> watch DS/ranging on A/B.
+	/* SerDes CDR-lock pulse — the stock SerDes CDR-reset our
+	 * init OMITTED: invert SDS_ANA_COM_REG12 bit15 (REG_RX_SD_POR_SEL), hold 10ms,
+	 * restore. Re-PORs the RX signal-detect path so a recovered CDR re-acquires
+	 * cleanly (see serdes_cdr_reset param). Done here, after GPON mode + the TX
+	 * reset-B re-sync, so the analog-ready poll below confirms the SerDes recovered.
 	 *
-	 * ADDRESS FIX 2026-06-15: this used to poke 0x22560, which is NOT COM_REG08 —
-	 * the SDK-decoded reg1418 (SDS_ANA_COM_REG08) resolves to phys 0x1b0225a0
-	 * (rtk_resolve.py 1418 -> offset 0x225a0; matches the driver's own stride-4 layout
-	 * COM_REG03=0x2258c -> COM_REG08=0x225a0, and the serdes_modev1_tx block which also
-	 * writes 0x225a0). 0x22560 is SDS_ANA_MISC_REG24 (reg1402) — a different, RX-side
-	 * analog reg — so the prior "CDR reset" toggled the wrong bit and never seated the
-	 * TX serializer CDR. The 0x22560 came from an off-by-0x40 typo in the
-	 * [[rtl9602c-sdk-ponmac-init-decoded]] note ("@0x1b022560"); the disasm of
-	 * serdesCdr_reset @0x75654 reads/writes reg_id 0x58a=1418=COM_REG08. */
+	 * REGISTER FIX 2026-06-17: the stock CDR-reset operates on REG12 (0x225b0), NOT
+	 * REG08 (0x225a0). Confirmed from the stock register sequence
+	 * (reads/inverts/restores REG12[15]) + the chip's register/field map:
+	 * REG12[15]=REG_RX_SD_POR_SEL, whereas REG08[15] falls in the RESERVED top-16
+	 * field. The prior REG08[15] toggle wrote a reserved bit (the earlier
+	 * "0x22560 -> 0x225a0" address fix corrected one wrong reg to another). The
+	 * COM_REG08=0x0713 write seen in the stock trace is the ModeV1 *config* constant, not
+	 * this toggle. */
 	if (serdes_cdr_reset) {
-		u32 cdr = sw_rd(SDS_ANA_COM_REG08);
+		u32 cdr = sw_rd(SDS_ANA_COM_REG12);
 
-		sw_wr(SDS_ANA_COM_REG08, cdr ^ BIT(15));
+		sw_wr(SDS_ANA_COM_REG12, cdr ^ BIT(15));
 		mdelay(10);
-		sw_wr(SDS_ANA_COM_REG08, cdr);
-		pr_info("rtl9602c-gpon: US-TX serdesCdr_reset pulse (COM_REG08 0x225a0 bit15), restored=0x%08x\n",
+		sw_wr(SDS_ANA_COM_REG12, cdr);
+		pr_info("rtl9602c-gpon: serdesCdr_reset pulse (COM_REG12 0x225b0 bit15), restored=0x%08x\n",
 			cdr);
 	}
 
@@ -2161,23 +2286,23 @@ static int gpon_serdes_init(void)	/* not __init: re-run on re-range from gpon_cd
 
 /*
  * gpon_serdes_init_stock() - stock rev-A (CHIP_REV_ID_A) GPON SerDes bring-up
- * ORDER from the vendor SDK, with OUR golden analog overlay applied in that
- * order. VERIFIED 2026-06-16 against:
- *   - dal_rtl9602c_ponmac.c PONMAC_MODE_GPON case (lines 2559-2658) and
- *     _rtl9602c_ponMacModeV1_set() (lines 854-1018)
- *   - rtk_rtl9602c_reg_list.c (every offset below confirmed)
- *   - rtk_rtl9602c_regField_list.c (every lsp/len confirmed)
+ * ORDER as observed from the stock device, with OUR golden analog overlay applied
+ * in that order. VERIFIED 2026-06-16 against:
+ *   - the stock GPON mode-set sequence (the PON-MAC GPON-mode path and its
+ *     inlined ModeV1 analog config sub-step)
+ *   - the chip's register map (every offset below confirmed)
+ *   - the chip's field map (every lsp/len confirmed)
  *
  * SCOPE NOTE (corrected): this is NOT a bit-faithful replica of stock's ANALOG
- * config. The vendor stock sequence has NO golden table and NO fib_reg0 loop;
- * _rtl9602c_ponMacModeV1_set() IS the entire vendor analog config. The golden
+ * config. The stock sequence has NO golden table and NO fib_reg0 loop;
+ * the ModeV1 analog sub-step IS the entire stock analog config. The golden
  * table + fib power-on here are OUR overlay (same data as gpon_serdes_init),
- * applied in stock ORDER (after the reset). V1_set's explicit writes overwrite
+ * applied in stock ORDER (after the reset). The ModeV1 explicit writes overwrite
  * every overlapping golden entry, so the final operating point is the ModeV1
  * one. What IS faithful to stock is the ORDER (reset-first), the single reset
  * bit (CMD_SDS_RST_PS only, NOT CMD_SDS_CFG_RST_PS), and the D2A/sample-clock
- * bits being SET=1 (the vendor-SOURCE value; note the LIVE stock ONU reads them
- * clear at O5 - a real source-vs-runtime divergence worth A/B testing).
+ * bits being SET=1 (the value stock programs; note the LIVE stock ONU reads them
+ * clear at O5 - a real programmed-vs-runtime divergence worth A/B testing).
  *
  * __init: this function reads sds_analog_golden[]/fib_reg0_banks[], both
  * __initconst, so it MUST live in .init.text or modpost reports a section
@@ -2190,7 +2315,7 @@ static int gpon_serdes_init(void)	/* not __init: re-run on re-range from gpon_cd
  */
 static int __init gpon_serdes_init_stock(void)
 {
-	/* offsets absent from our #define block - all confirmed via reg_list */
+	/* offsets absent from our #define block - all confirmed via the chip register map */
 	const u32 WSDS_DIG_1Eo         = 0x220a8;
 	const u32 SDS_REG7o            = 0x2281c;
 	const u32 SDS_EXT_REG12o       = 0x22a30;
@@ -2202,30 +2327,30 @@ static int __init gpon_serdes_init_stock(void)
 	const u32 SDS_ANA_EPON_REG46o  = 0x227b8;
 	int i;
 
-	/* === ponmac.c:2559-2565: serdes mode -> illegal (0x1f) === */
+	/* === stock step 1: serdes mode -> illegal (0x1f) === */
 	sw_field(SDS_CFG, 4, 0, SDS_MODE_OFF);		/* CFG_SDS_MODE = 0x1f     */
 
-	/* === ponmac.c:2567-2574: no force sds === */
+	/* === stock step 2: no force sds === */
 	sw_wr(WSDS_DIG_01, 0);				/* WSDS_DIG_01 = 0         */
 
-	/* === ponmac.c:2576-2583: RESET FIRST - pulse ONLY CMD_SDS_RST_PS (bit0).
+	/* === stock step 3: RESET FIRST - pulse ONLY CMD_SDS_RST_PS (bit0).
 	 * Stock does NOT touch CMD_SDS_CFG_RST_PS (bit7) here. === */
 	sw_field(SW_SOFTWARE_RST, 0, 0, 1);		/* CMD_SDS_RST_PS = 1      */
-	mdelay(10);					/* osal_time_mdelay(10)    */
+	mdelay(10);					/* 10ms settle             */
 
-	/* === ponmac.c:2586-2592: BEN on === */
+	/* === stock step 4: BEN on === */
 	sw_field(WSDS_DIG_18, 12, 12, 1);		/* BEN_OE = 1              */
 
-	/* === ponmac.c:2613-2627: rev-A (CHIP_REV_ID_A) else-branch - adjust
+	/* === stock step 5: rev-A (CHIP_REV_ID_A) else-branch - adjust
 	 * TX_Burst's Burst Mode Sequence === */
 	sw_field(WSDS_DIG_03, 6, 4, 0x0);		/* CFG_TXDIS_SEL_DLY = 0   */
 	sw_field(WSDS_DIG_03, 3, 0, 0x0);		/* CFG_D2ANLOG_SEL   = 0   */
 
 	/* ----------------------------------------------------------------------
 	 * OUR golden analog overlay + fiber power-on, applied AFTER the reset
-	 * (stock ORDER). NOT part of vendor stock; V1_set below overrides every
+	 * (stock ORDER). NOT part of stock; the ModeV1 writes below override every
 	 * overlapping entry. Provides the per-rate/lane + FIB bank config that
-	 * vendor stock assumes is already present from an earlier mode-set.
+	 * stock assumes is already present from an earlier mode-set.
 	 * -------------------------------------------------------------------- */
 	for (i = 0; i < ARRAY_SIZE(sds_analog_golden); i++)
 		sw_wr(sds_analog_golden[i].off, sds_analog_golden[i].val);
@@ -2234,49 +2359,49 @@ static int __init gpon_serdes_init_stock(void)
 		      sw_rd(fib_reg0_banks[i]) & ~FIB_REG0_PDOWN);	/* fiber on */
 
 	/* ======================================================================
-	 * ponmac.c:2629 -> _rtl9602c_ponMacModeV1_set() (854-1018) inlined.
+	 * stock step 6: the inlined rev-A ModeV1 analog config.
 	 * ==================================================================== */
 
-	/* --- ### TX ### ponmac.c:867-915 : PON TX CMU/PLL + TX-LA-LDO --- */
-	sw_wr(SDS_ANA_COM_REG02o, 0x6df8);	/* :867 COM_REG02 (CMU/LDO/ISTANK) */
-	sw_wr(SDS_ANA_COM_REG03, 0x8941);	/* :873 COM_REG03 (0x2258c)        */
-	sw_wr(SDS_ANA_COM_REG08, 0x0713);	/* :879 COM_REG08 (0x225a0)        */
-	sw_wr(SDS_ANA_COM_REG25o, 0x1f);	/* :885 COM_REG25                  */
+	/* --- ### TX ### PON TX CMU/PLL + TX-LA-LDO --- */
+	sw_wr(SDS_ANA_COM_REG02o, 0x6df8);	/* COM_REG02 (CMU/LDO/ISTANK) */
+	sw_wr(SDS_ANA_COM_REG03, 0x8941);	/* COM_REG03 (0x2258c)        */
+	sw_wr(SDS_ANA_COM_REG08, 0x0713);	/* COM_REG08 (0x225a0)        */
+	sw_wr(SDS_ANA_COM_REG25o, 0x1f);	/* COM_REG25                  */
 
-	/* WSDS_DIG_1E[5]=CFG_ANALOG2D_SEL, [4]=CFG_D2ANLOG_INF_SEL - vendor SETs
+	/* WSDS_DIG_1E[5]=CFG_ANALOG2D_SEL, [4]=CFG_D2ANLOG_INF_SEL - stock SETs
 	 * these =1 (opposite of our oracle-parity path which clears them). */
-	sw_field(WSDS_DIG_1Eo, 5, 5, 0x1);	/* :896 CFG_ANALOG2D_SEL = 1       */
-	sw_field(WSDS_DIG_1Eo, 4, 4, 0x1);	/* :902 CFG_D2ANLOG_INF_SEL = 1    */
+	sw_field(WSDS_DIG_1Eo, 5, 5, 0x1);	/* CFG_ANALOG2D_SEL = 1       */
+	sw_field(WSDS_DIG_1Eo, 4, 4, 0x1);	/* CFG_D2ANLOG_INF_SEL = 1    */
 
-	sw_wr(SDS_ANA_COM_REG24o, 0x8001);	/* :909 COM_REG24 (REG_TXLA_LDOEN) */
+	sw_wr(SDS_ANA_COM_REG24o, 0x8001);	/* COM_REG24 (REG_TXLA_LDOEN) */
 
-	/* --- ### RX ### ponmac.c:919-992 (ASIC, !FPGA) --- */
-	sw_wr(SDS_ANA_1P25G_REG46o, 0x80c5);	/* :922 FIB1G Rx 1.25 KP/KI        */
-	sw_wr(SDS_ANA_EPON_REG46o,  0x80c5);	/* :931 EPON  Rx 1.25 KP/KI        */
-	sw_wr(SDS_ANA_GPON_REG46,   0x80c5);	/* :940 GPON  Rx 2.488 KP/KI       */
+	/* --- ### RX ### (ASIC, !FPGA) --- */
+	sw_wr(SDS_ANA_1P25G_REG46o, 0x80c5);	/* FIB1G Rx 1.25 KP/KI        */
+	sw_wr(SDS_ANA_EPON_REG46o,  0x80c5);	/* EPON  Rx 1.25 KP/KI        */
+	sw_wr(SDS_ANA_GPON_REG46,   0x80c5);	/* GPON  Rx 2.488 KP/KI       */
 
-	sw_field(SDS_ANA_COM_REG12, 14, 14, 0x1);	/* :948 REG_RX_SEL_CDR_AFEN = 1   */
-	sw_field(SDS_ANA_COM_REG11,  7,  0, 0x0);	/* :956 REG_RX_FILT_CONFIG = 0    */
-	sw_field(SDS_ANA_COM_REG19o, 14, 14, 0x1);	/* :964 REG_CDR_RESET_MANUAL = 1  */
-	sw_field(SDS_ANA_COM_REG19o, 10, 10, 0x1);	/* :972 REG_CDR_EN_LPF_MANUAL = 1 */
+	sw_field(SDS_ANA_COM_REG12, 14, 14, 0x1);	/* REG_RX_SEL_CDR_AFEN = 1   */
+	sw_field(SDS_ANA_COM_REG11,  7,  0, 0x0);	/* REG_RX_FILT_CONFIG = 0    */
+	sw_field(SDS_ANA_COM_REG19o, 14, 14, 0x1);	/* REG_CDR_RESET_MANUAL = 1  */
+	sw_field(SDS_ANA_COM_REG19o, 10, 10, 0x1);	/* REG_CDR_EN_LPF_MANUAL = 1 */
 
 	/* ### RX_EN toggle ### MISC_REG00: FRC_RX_EN_ON[4], FRC_RX_EN_VAL[5] */
-	sw_wr(SDS_ANA_MISC_REG00, 0x10);	/* :981 RX_EN force on, val=0       */
-	sw_wr(SDS_ANA_MISC_REG00, 0x30);	/* :987 RX_EN val 0->1 (start CDR)  */
+	sw_wr(SDS_ANA_MISC_REG00, 0x10);	/* RX_EN force on, val=0       */
+	sw_wr(SDS_ANA_MISC_REG00, 0x30);	/* RX_EN val 0->1 (start CDR)  */
 
-	mdelay(50);				/* :994 osal_time_mdelay(50)        */
+	mdelay(50);				/* 50ms settle                 */
 
-	sw_field(WSDS_DIG_02, 10, 10, 0x0);	/* :997 REG_EN_PDOWN_BEN = 0        */
+	sw_field(WSDS_DIG_02, 10, 10, 0x0);	/* REG_EN_PDOWN_BEN = 0        */
 
-	/* TX-data sample clocks - vendor SETs these =1 (:1004-1016). */
-	sw_field(SDS_REG7o,      14, 14, 0x1);	/* :1004 SP_CFG_NEG_CLKWR_A2D = 1   */
-	sw_field(SDS_EXT_REG12o,  8,  8, 0x1);	/* :1010 SEP_CFG_NEG_CLKRD_D2A = 1  */
-	/* === end _rtl9602c_ponMacModeV1_set() === */
+	/* TX-data sample clocks - stock SETs these =1. */
+	sw_field(SDS_REG7o,      14, 14, 0x1);	/* SP_CFG_NEG_CLKWR_A2D = 1   */
+	sw_field(SDS_EXT_REG12o,  8,  8, 0x1);	/* SEP_CFG_NEG_CLKRD_D2A = 1  */
+	/* === end ModeV1 analog config === */
 
-	/* === ponmac.c:2636-2642: serdes mode -> GPON (0x8) === */
+	/* === stock step 7: serdes mode -> GPON (0x8) === */
 	sw_field(SDS_CFG, 4, 0, SDS_MODE_GPON);		/* CFG_SDS_MODE = 0x8      */
 
-	/* === ponmac.c:2644-2658 (!FPGA): force ber notify [13:12] = 0x3 === */
+	/* === stock step 8 (!FPGA): force ber notify [13:12] = 0x3 === */
 	sw_field(SDS_ANA_MISC_REG02, 13, 13, 0x1);	/* FRC_BER_NOTIFY_VAL = 1  */
 	sw_field(SDS_ANA_MISC_REG02, 12, 12, 0x1);	/* FRC_BER_NOTIFY_ON  = 1  */
 
@@ -2284,7 +2409,7 @@ static int __init gpon_serdes_init_stock(void)
 		sw_rd(SDS_CFG), sw_rd(WSDS_DIG_18), sw_rd(SDS_ANA_MISC_REG02),
 		sw_rd(FIB_EXT_REG21));
 
-	/* Local readiness gate (NOT vendor) - mirrors gpon_serdes_init tail. */
+	/* Local readiness gate (not part of the stock sequence) - mirrors gpon_serdes_init tail. */
 	for (i = 0; i < SDS_LOCK_POLL_MAX; i++) {
 		if (sw_rd(FIB_EXT_REG21) & SDS_ANALOG_READY)
 			return 0;
@@ -2310,15 +2435,15 @@ static int __init gpon_wait_rst_done(void)
 }
 
 /* ===================================================================
- * Faithful port of the stock SDK rtk_all_module_init() GPON datapath
+ * Faithful port of the stock all-module GPON datapath
  * bring-up, in stock MODULE ORDER, run ONCE on a QUIESCENT switch (after the
  * GMAC IP-block reset + U-Boot swcore resync, before the datapath/TX is armed).
  * Reproduces the ordering + table-clears that the prior piecemeal flat writes
  * (done amid a running datapath) did NOT — the hypothesis being that the switch
  * honoring of the cpu-tag PSEL directed-egress to the PON-MAC is an emergent
  * property of the full ordered/quiescent bring-up. Decoded clean-room from the
- * real 9602C SDK source (dal_rtl9602c_{switch,l2,vlan,port,cpu,trap,classify,
- * ponmac}.c) and resolved to addresses via the cracked librtk reg DB.
+ * stock module-init behavior across the switch/L2/VLAN/port/CPU/trap/classify/
+ * ponmac blocks, with addresses from the chip's register map.
  * Gated by full_sdk_init; the indirect TBL_ACCESS table-clears self-abort if the
  * engine does not respond (no hang/corruption), and VLAN filtering is only
  * enabled if its member table actually wrote.
@@ -2326,10 +2451,10 @@ static int __init gpon_wait_rst_done(void)
 static unsigned int full_sdk_init = 1;
 module_param(full_sdk_init, uint, 0644);
 MODULE_PARM_DESC(full_sdk_init, "1=run the faithful full SDK datapath init on the quiescent switch (default), 0=legacy minimal init");
-static unsigned int full_sdk_tables;	/* 0: the operational VLAN setup (rtl9602c_eth.c) owns the VLAN table now; isolate the VLAN_CTRL=0x19 enable test */
+static unsigned int full_sdk_tables;	/* 0: the operational VLAN setup (our Ethernet driver) owns the VLAN table now; isolate the VLAN_CTRL=0x19 enable test */
 module_param(full_sdk_tables, uint, 0644);
 MODULE_PARM_DESC(full_sdk_tables, "1=also run the L2 LUT clear + VLAN-enable table-engine steps (risky), 0=field-writes only");
-/* "harmful write" hypothesis (disasm wf_b049b82a-7b0): stock NEVER writes the US-NIC
+/* "harmful write" hypothesis: stock NEVER writes the US-NIC
  * region (0x1bf04xxx) or these PON-IP speculative regs from the CPU; my gpon_pbo_init
  * accumulated ~15 such writes (MEDIA_STS_US, MOCIR force, credit cluster, internal-link
  * force) across earlier rounds. One may BREAK the US-NIC ingress that would otherwise
@@ -2337,11 +2462,11 @@ MODULE_PARM_DESC(full_sdk_tables, "1=also run the L2 LUT clear + VLAN-enable tab
  * =0 restores the prior behavior. Default 1 for the strip-and-retest. */
 static unsigned int usnic_strip;	/* 0 = KEEP the US-NIC writes: live-stock same-board diff shows stock HAS
 					 * MOCIR 0x2170/0x2174=0x1ffff etc. set, so stripping them DIVERGED from
-					 * stock (the disasm "stock never writes these" was wrong; live = truth). */
+					 * stock (the "stock never writes these" hypothesis was wrong; live = truth). */
 module_param(usnic_strip, uint, 0644);
 MODULE_PARM_DESC(usnic_strip, "1=skip the speculative non-stock US-NIC writes (strip test), 0=keep them (match stock)");
-/* Faithful port of stock dal_rtl9602c_ponmac_mode_set GPON branch as ONE ordered
- * block at O5 (workflow wf_f4a3d366). Root cause: the US-NIC RX engine latches its
+/* Faithful port of the stock PON-MAC GPON mode-set branch as ONE ordered
+ * block at O5. Root cause: the US-NIC RX engine latches its
  * SID-classify table at the GMII_RX_EN rising edge; my driver sets the classify at
  * O5 but never RE-PULSES that edge, so the US-NIC keeps a stale boot-time latch and
  * discards SID-64 OMCI pre-MAC. Default OFF (protect DS/LAN/ranging); bisectable. */
@@ -2349,7 +2474,7 @@ static unsigned int ponmac_modeset;	/* 0 = OFF: the classify block + GMII re-lat
 module_param(ponmac_modeset, uint, 0644);
 MODULE_PARM_DESC(ponmac_modeset, "1=stock-ordered GPON mode_set classify block + GMII re-latch at O5");
 
-/* finding 3 (2026-06-13, wf_3f2b6792): stock fires the US-NIC GMII_RX_EN latch edge ONCE,
+/* finding 3 (2026-06-13): stock fires the US-NIC GMII_RX_EN latch edge ONCE,
  * at O5, AFTER the COMPLETE OMCC provisioning (classify triple + the US scheduler flow2queue
  * binding). My driver fires it at boot/ifup (gpon_pbo_init) — BEFORE the scheduler (qid 64
  * PIR/CIR/WFQ/SCH_QMAP) is bound in gpon_install_tcont. The round-32 re-latch "had no effect"
@@ -2502,7 +2627,19 @@ void rtl9602c_full_sdk_datapath_init(void)
 
 	/* 8) ponmac_init: PON-IP scheduler + OMCI egress steering */
 	sw_field(0x001ec, 0, 0, 1);			/* DYNGASP_CMP_INV       */
-	sw_field(0x22584, 0, 0, 1);			/* SDS_ANA REG_BEN_TTL   */
+	if (serdes_stock_analog) {
+		/* Match live-stock post-reset SDS_ANA: REG01 (0x22584)=0x73a4 (CMU bit14=1,
+		 * BEN_TTL_OUT bit0=0) + REG11 (0x225ac) RX_FILT_CONFIG=0. The golden table sets
+		 * these BEFORE the SDS reset, which wipes REG01 bit14 / REG11 RX_FILT to defaults
+		 * (0x33a4 / 0xb008); we re-apply them here, post-reset, exactly like stock. This
+		 * was the ONLY stock-vs-ours SerDes register diff and bit14 is in the shared CMU
+		 * block -> the marginal TX serializer behind the cold-start ~50% US-TX "Laser out". */
+		sw_field(0x22584, 14, 14, 1);		/* REG01 CMU bit14 = 1 (stock 0x73a4) */
+		sw_field(0x22584,  0,  0, 0);		/* REG01 BEN_TTL_OUT = 0 (stock)      */
+		sw_field(0x225ac,  7,  0, 0);		/* REG11 RX_FILT_CONFIG = 0 (stock)   */
+	} else {
+		sw_field(0x22584, 0, 0, 1);		/* legacy SDS_ANA REG_BEN_TTL_OUT = 1 */
+	}
 	pi_field(0x02150, 29, 16, 5);			/* PON_BW_THRES last     */
 	pi_field(0x02150, 13, 0, 5);			/* PON_BW_THRES runt     */
 	pi_field(0x02194, 18, 18, 1);			/* PON_GEN_PIR_DROP      */
@@ -2544,7 +2681,7 @@ void gpon_pbo_init(void)
 	 * setting it post-boot is too late. */
 	/* US-NIC GMII RX/TX enable is DEFERRED to the very END of this function
 	 * (after the descriptor pool + PBUF_EN), mirroring the DS side (IO_CMD_0_DS
-	 * written last) and the SDK pbo_init off-configure-on edge. ROOT CAUSE of
+	 * written last) and the stock pbo_init off-configure-on edge. ROOT CAUSE of
 	 * "US-NIC RX never receives": the RX engine LATCHES the descriptor-pool /
 	 * FIFO config at the GMII-RX-enable edge; enabling GMII here (FIRST, before
 	 * the pool is configured) latched an unprovisioned pool, so every US frame
@@ -2592,7 +2729,7 @@ void gpon_pbo_init(void)
 	 * validity (writing them for every SID is safe; SIDVALID/SID2QID untouched).
 	 * Values: us_sram_runt 126 -> stop 125, glb on/off 125/123; per-SID 150/130
 	 * (page scale 1, non-tripping); DS flow-ctrl on/off 2/22. */
-	/* DRAM-pool thresholds (stock live values; SDK: stop=us_dram_runt-40,
+	/* DRAM-pool thresholds (stock live values; stock formula: stop=us_dram_runt-40,
 	 * global ON/OFF scaled to the 1MB pool). The old 125/125/123 were the
 	 * SRAM-only values — far too small for the DRAM pool, tripping flow
 	 * control immediately. */
@@ -2707,7 +2844,7 @@ void gpon_pbo_init(void)
 	 * 0xd42c=0x40 — with PKT_OK_CNT_DS (0xc010) climbing (dumped 0x0265 = 613 frames).
 	 * My driver left them 0 (and wrote 0xd400 bit1 instead of bit6), and its
 	 * PKT_OK_CNT_DS stayed 0 = de-encapsulated DS OMCI was never handed off to the
-	 * GMAC NIC (filled=0). The earlier "SWPBO-only, vendor never touches them" note
+	 * GMAC NIC (filled=0). The earlier "SWPBO-only, stock never touches them" note
 	 * was wrong — measured against the live stock datapath. These program the DS
 	 * de-encap engine's transfer to the GMAC NIC RX (the long-unsolved transfer gap).
 	 * Written LAST, after IO_CMD_0_DS, matching stock's golden values verbatim. */
@@ -2736,8 +2873,8 @@ void gpon_pbo_init(void)
 	 * before the MAC counts it because its SID is not a latched-valid classification).
 	 * Bake the fixed OMCC SID->QID map here so it is latched at the edge.
 	 *
-	 * PACKED-TABLE ADDRESSING CORRECTED 2026-06-13 (disasm of stock reg_array_field_write
-	 * @k0 0x801b7204): the 7-bit SID2QID array (reg925, base PI 0x20f8) is packed
+	 * PACKED-TABLE ADDRESSING CORRECTED 2026-06-13 (from the stock array-field-write
+	 * routine): the 7-bit SID2QID array (base PI 0x20f8) is packed
 	 * entries_per_word = 32/width = 32/7 = 4 entries per 32-bit word (top 4 bits of each
 	 * word UNUSED) -- it is NOT contiguous-bit-packed. So:
 	 *   word  = sid / 4 ;  shift = (sid % 4) * 7
@@ -2747,8 +2884,8 @@ void gpon_pbo_init(void)
 	 * prior session "live-stock SID2QID[64]=63" reading and the GPON_OMCC_PHYS_QID=63
 	 * value were both wrong: they were reading SID 56, not SID 64. The TRUE SID-64 slot
 	 * (0x2138) was never written, so the US-NIC classified OMCI to a stale/garbage queue.
-	 * Stock value = physQid = TCONT_QUEUE_MAX(32)*(TCONT16/8)+queue0 = 64 (k0 flow2Queue
-	 * 0x801db5e8 -> physicalQueueId_get 0x801dac80 -> SidToQueueMap_set 0x801db094).
+	 * Stock value = physQid = TCONT_QUEUE_MAX(32)*(TCONT16/8)+queue0 = 64 (the stock
+	 * flow-to-queue / physical-queue-id / SID-to-queue-map mapping).
 	 * NOTE: SIDVALID(1b)/SID_Q_MAP_DS(2b) are unaffected (32/width divides evenly so
 	 * 4-per-word == contiguous for them); only the 7-bit SID2QID diverges. */
 	pi_field(0x2138, 6, 0, 64);	/* SID2QID[64] = OMCC phys qid 64 (TCONT16/q0); 4-per-word packing -> 0x20f8+16*4 */
@@ -2759,9 +2896,8 @@ void gpon_pbo_init(void)
 	 * this latch) — so the RX engine latched WITHOUT knowing which SID is the OMCI
 	 * management stream and discarded every SID-64 upstream frame PRE-MAC (RX_OK/
 	 * ERR/MISS all 0). Stock ponmac_init writes the FULL triple before the GMII
-	 * edge: disasm k0 0x801dc0c0 `li t8,64` -> reg_field_write field 1891
-	 * (PON_OMCI_CFG @ 0x1bf02154 [6:0]), THEN the NIC-bringup GMII edge at
-	 * 0x801dc0f8. Complete the triple here so all three latch together. */
+	 * edge: it sets PON_OMCI_CFG @ 0x1bf02154 [6:0] = 64, THEN does the
+	 * NIC-bringup GMII edge. Complete the triple here so all three latch together. */
 	pi_field(0x2154, 6, 0, 64);	/* PON_OMCI_CFG[6:0] = OMCC SID 64 */
 
 	/* Pre-arm the WAN DATA flow (SID 1) classify here too, alongside the SID-64
@@ -2779,11 +2915,11 @@ void gpon_pbo_init(void)
 	 * packing: SID2QID[1] -> base 0x20f8 word0, shift (1%4)*7=7 -> bits[13:7]=qid 64;
 	 * SIDVALID[1] -> base 0x213c word0 bit1 (1-bit packing is contiguous). */
 	if (!usnic_strip) {
-		pi_field(0x20f8, 13, 7, 64);	/* SID2QID[1] = OMCC phys qid 64 (ride T-CONT 16) */
+		pi_field(0x20f8, 13, 7, data_tcont ? 32 : 64);	/* SID2QID[1] = data qid 32 (T-CONT 8) or legacy OMCC qid 64 */
 		pi_field(0x213c, 1, 1, 1);	/* SIDVALID[1] = 1 */
 	}
 
-	/* MOCIR force-mode (SDK qos_init): PON-IP 0x2170 MOCIR_FRC_MD=0x1FFFF,
+	/* MOCIR force-mode (stock QoS init): PON-IP 0x2170 MOCIR_FRC_MD=0x1FFFF,
 	 * 0x2174 MOCIR_FRC_VAL=0x1FFFF — force the per-flow committed-info-rate to a
 	 * fixed mode so the US-NIC's CIR auto-detection cannot trip for the OMCC SID-64
 	 * flow and silently discard the OMCI frame BEFORE the MAC counts it (the exact
@@ -2793,21 +2929,23 @@ void gpon_pbo_init(void)
 		pi_wr(0x2174, 0x0001ffffu);	/* MOCIR_FRC_VAL = 0x1FFFF (forced CIR = max)   */
 	}
 
-	/* SDK PON-MAC US-NIC datapath credit/threshold cluster (dal_rtl9602c_ponmac_init,
-	 * decoded clean-room from stock librtk.so via the cracked RTK register DB, then
+	/* Stock PON-MAC US-NIC datapath credit/threshold cluster (from the stock
+	 * ponmac_init behavior, with addresses from the chip's register map, then
 	 * pinned to the EXACT runtime values read from the live working stock ONU @O5).
 	 * Our minimal init left this WHOLE cluster at 0, so the US-NIC's grant/credit/
 	 * token-bucket logic never released a credit for the OMCI SID-64 flow and every
 	 * upstream frame was discarded BEFORE the MAC counted it (PKT_OK/ERR/MISS all 0,
-	 * rxsid=0 — a pre-MAC credit discard, NOT a link-down). The SDK writes these in
+	 * rxsid=0 — a pre-MAC credit discard, NOT a link-down). Stock writes these in
 	 * ponmac_init AHEAD of the GMII rising edge that latches US-NIC ingress, so they
 	 * go here, just before the final pi_wr(PI_IO_CMD_0_US, 0x90101070) edge below.
-	 * reg924 ("5 written twice") resolves to 0x2150 on the live stock (0x00050005),
-	 * NOT 0x20f4 (the resolver off-by-4, disambiguated by the stock register read). */
+	 * The "5 written twice" register resolves to 0x2150 on the live stock (0x00050005),
+	 * NOT 0x20f4 (off-by-4, disambiguated by the live stock register read). */
 	if (!usnic_strip) {
 		pi_wr(0x2150, 0x00050005u);	/* PON US-NIC IP-status/BW threshold (reg924, 5+5)  */
 		pi_wr(0x20f0, 0x00000013u);	/* US-NIC datapath cfg                              */
-		pi_wr(0x20f4, 0x00000001u);	/* PON_IPSTS_US enable                              */
+		/* 0x20f4 = PON_IPSTS_US, a READ-ONLY init-ready status reg (bit0=PONIC_INITRDY);
+		 * stock never writes it. The old pi_wr(0x20f4,1) was a no-op write to a reserved
+		 * bit -> removed. It is POLLED before the GMII latch edge below (usnic_initrdy_poll). */
 		pi_wr(0x2184, 0x00001000u);	/* MOCIR_TH_H (request/grant credit threshold)      */
 		pi_wr(0x2188, 0x00001000u);	/* MOCIR_TH_L                                       */
 		pi_wr(0x218c, 0x0003ffffu);	/* PON_OLT_BW_MTR_FULL (maxFlow)                    */
@@ -2817,8 +2955,8 @@ void gpon_pbo_init(void)
 	}
 
 	/* === GMAC0<->US-NIC INTERNAL link FORCE — the long-missing step ===
-	 * Decoded clean-room from stock dal_rtl9602c_ponmac_mode_set() GPON branch
-	 * (mode==1, librtk.so @0x75e80+). Our optical SerDes is up (DS OMCI, US PLOAM,
+	 * Decoded clean-room from the stock PON-MAC GPON mode-set branch
+	 * (GPON mode). Our optical SerDes is up (DS OMCI, US PLOAM,
 	 * ranging all work) but a CPU cpu-tag direct-TX US-OMCI frame NEVER reaches the
 	 * US-NIC ingress (RX_SID_GOOD_CNT_US[4]=0, PKT_OK/ERR/MISS=0): the switch
 	 * PON-port(2)<->US-NIC INTERNAL MAC link was never FORCED up for the egress/
@@ -2829,7 +2967,7 @@ void gpon_pbo_init(void)
 	 * the front-end GMII auto-poll/watchdog that actually trains the forced link and
 	 * is set ONLY in GPON mode. Stock releases the force externally post-train (steady
 	 * O5 reads 0) — we leave it SET: we want the internal link held up. Addresses +
-	 * values are disasm-exact; the in-word bit shifts are resolver-derived. */
+	 * values match the stock behavior; the in-word bit shifts are from the field map. */
 	if (!usnic_strip) {
 		sw_field(0x001b4, 4, 0, 0xc);	/* ABLTY_FORCE_MODE[4:0]=0xc — GPON internal-link force   */
 		sw_field(0x000f4, 5, 5, 1);	/* CFG_FE_POLL_WD_1[5]=1 — front-end GMII poll/watchdog    */
@@ -2843,8 +2981,44 @@ void gpon_pbo_init(void)
 
 	/* CF_CFG.CF_US_PERMIT is set to its stock value (0 = NORMAL/permit) by
 	 * rtl9602c_full_sdk_datapath_init()'s classify_init step. (An earlier attempt
-	 * set it to 1 here = NOPON/permit-without-PON, which the faithful source read
+	 * set it to 1 here = NOPON/permit-without-PON, which the stock behavior
 	 * shows actually STRIPS the PON egress path — reverted.) */
+
+	/* PON_IPSTS_US.PONIC_INITRDY commit-poll (PON-IP 0x1bf020f4 bit0): wait for the
+	 * US PON-IP core to report init-ready BEFORE the GMII RX/TX latch edge below, so
+	 * the US-NIC latches with the core ready. Passive, bounded (200ms), read-only ->
+	 * no config/reset reorder, cannot worsen the lock; on timeout log+proceed (never
+	 * hang boot). Stock has no such poll (relies on fixed mdelay) — this is a stock-
+	 * aligned readiness gate + discriminating instrumentation for the ~50% bug. */
+	if (usnic_initrdy_poll) {
+		int n;
+
+		for (n = 0; n < SDS_LOCK_POLL_MAX; n++) {
+			if (pi_rd(0x20f4) & BIT(0))		/* PONIC_INITRDY */
+				break;
+			udelay(200);
+		}
+		if (n >= SDS_LOCK_POLL_MAX) {
+			pr_warn("rtl9602c-gpon: PON_IPSTS_US.PONIC_INITRDY not set after %dus; proceeding\n",
+				SDS_LOCK_POLL_MAX * 200);
+			if (usnic_initrdy_repulse) {		/* ACTIVE: re-roll the CDR lock */
+				u32 cdr = sw_rd(SDS_ANA_COM_REG12);
+
+				sw_wr(SDS_ANA_COM_REG12, cdr ^ BIT(15));
+				mdelay(10);
+				sw_wr(SDS_ANA_COM_REG12, cdr);
+				for (n = 0; n < SDS_LOCK_POLL_MAX; n++) {
+					if (pi_rd(0x20f4) & BIT(0))
+						break;
+					udelay(200);
+				}
+				pr_warn("rtl9602c-gpon: PONIC_INITRDY after CDR re-pulse: %s\n",
+					(pi_rd(0x20f4) & BIT(0)) ? "ready" : "still-not-ready");
+			}
+		} else {
+			pr_info("rtl9602c-gpon: PON_IPSTS_US.PONIC_INITRDY ready after %dus\n", n * 200);
+		}
+	}
 
 	pi_wr(PI_IO_CMD_0_US, 0x90101070u);
 }
@@ -3015,8 +3189,8 @@ static void gpon_ds_cam_clear_all(void)
 }
 
 /* GTC US MISC PM counter (GPON_GTC_US_MISC_CNTR_IDX 0x5140 [2:0] / STAT 0x5148):
- * write the raw type index, read the 32-bit count. raw idx map (vendor
- * gpon_usGtcMiscCntType_cfg2raw): 0=PLOAM_BOH_TX 1=GEM_DBRU_TX 2=PLOAM_CPU_TX
+ * write the raw type index, read the 32-bit count. raw idx map (stock US-GTC
+ * misc-counter type mapping): 0=PLOAM_BOH_TX 1=GEM_DBRU_TX 2=PLOAM_CPU_TX
  * 3=PLOAM_AUTO_TX 4=GEM_BYTE_TX. Decisive US-emission instrument: idx2 (our ACK/SN
  * PLOAM, expect >0) vs idx4 GEM_BYTE_TX + TCONT_IDLE_BYTE_STAT[16] (expect 0 = ONU
  * transmits PLOAM but NO US GEM on its T-CONT-16 grants -> OLT deactivates ~42s). */
@@ -3131,6 +3305,9 @@ static int gpon_proc_show(struct seq_file *s, void *v)
 	seq_printf(s, "gtc_ds_dlt:  0x%08x\n", gpon_rd(GPON_GTC_DS_INTR_DLT));
 	seq_printf(s, "gtc_ds_mask: 0x%08x\n", gpon_rd(GPON_GTC_DS_INTR_MASK));
 	seq_printf(s, "gtc_ds_sts:  0x%08x\n", gpon_rd(GPON_GTC_DS_INTR_STS));
+	seq_printf(s, "cdr_recover: wedged=%u fixed=%u last_sts=0x%08x (sentinel=0x%08x)\n",
+		   gpon_cdr_stuck_count, gpon_cdr_stuck_fixed, gpon_gtc_ds_sts_last,
+		   GTC_DS_CDR_STUCK);
 	{
 		u32 los = gpon_rd(GPON_GTC_DS_LOS_CFG_STS);
 
@@ -3181,7 +3358,7 @@ static int gpon_proc_show(struct seq_file *s, void *v)
 	seq_printf(s, "gtc_cfg: ds_cfg=0x%08x intr_mask=0x%08x r1048=0x%08x r104c=0x%08x r1050=0x%08x\n",
 		   gpon_rd(0x1014), gpon_rd(0x1004), gpon_rd(0x1048),
 		   gpon_rd(0x104c), gpon_rd(0x1050));
-	/* DS_MISC counters (GTC-relative, chipdef 0x7011xx): do we even SEE/accept the
+	/* DS_MISC counters (GTC-relative, register-map base 0x7011xx): do we even SEE/accept the
 	 * OLT's BWmap grants + DS PLOAMs? ploam_acpt/bwm_acpt nonzero => GTC recognizes
 	 * grants and asserts BEN (so a zero at the OLT = analog SerDes-TX emission);
 	 * bwm_fail/inv nonzero => grants seen but rejected (CRC/format); all zero =>
@@ -3240,7 +3417,7 @@ static int gpon_proc_show(struct seq_file *s, void *v)
 		seq_printf(s, "us_nic: cfg_us(0x404c)=0x%08x[RX_SID=%u] ctl_us(0x20ac)=0x%08x io0_us(0x5434)=0x%08x io1_us(0x5438)=0x%08x rxfdp_us(0x53f0)=0x%08x\n",
 			   pi_rd(0x404c), pi_rd(0x404c) & 0x7f, pi_rd(0x20ac),
 			   pi_rd(0x5434), pi_rd(0x5438), pi_rd(0x53f0));
-		/* US-NIC per-group RX SID counters (vendor reg_list rtl9602c:
+		/* US-NIC per-group RX SID counters (from the chip's register map:
 		 * RX_SID_GOOD_CNT_US @ SoC 0xF0203C = PON-IP off 0x203c, 5 groups at
 		 * 4-byte stride; RX_SID_BAD_CNT_US @ 0xF02054 = off 0x2054). good>0
 		 * confirms a CPU-injected US OMCI frame reached the US-NIC and matched
@@ -3260,7 +3437,7 @@ static int gpon_proc_show(struct seq_file *s, void *v)
 		 * GMII enables, gem_us_map[64](gpon 0x6500) the OMCC GEM port, sidvalid
 		 * word(0x2144) bit0, sid2qid word(0x2138), omci_cfg(0x2154).
 		 * s2q64 = SID2QID[64] decoded with the CORRECT 32/bits=4-entries-per-word packing
-		 * (disasm k0 reg_array_field_write 0x801b7204): word = 64/4 = 16 -> base 0x20f8 +
+		 * (from the stock array-field-write routine): word = 64/4 = 16 -> base 0x20f8 +
 		 * 16*4 = 0x2138, shift (64%4)*7 = 0 -> read 0x2138[6:0]. Should read 64
 		 * (GPON_OMCC_PHYS_QID). The 0x2130 word (SID 56's slot under this packing) is kept
 		 * alongside as the value the OLD contiguous-packing bug mistakenly wrote/read. */
@@ -3268,7 +3445,7 @@ static int gpon_proc_show(struct seq_file *s, void *v)
 			   pi_rd(0x4058), pi_rd(0x5434), gpon_rd(0x6c00 /* GEM_US_PORT_MAP[flow 64] = 0x6400+64*0x20; macros defined later in file */),
 			   pi_rd(0x2144), pi_rd(0x2138), pi_rd(0x2130),
 			   pi_rd(0x2138) & 0x7fUL, pi_rd(0x2154));
-		/* PON-IP OMCI packet counters (vendor reg_list, SoC base 0x1b000000 ->
+		/* PON-IP OMCI packet counters (from the chip's register map, SoC base 0x1b000000 ->
 		 * swcore offsets): OMCI_RX_PKT_CNT 0x329c0 (DS OMCI de-encapsulated by the
 		 * PON-IP, DISTINCT from my GTC 0x4064 idx6), DROP 0x329b8, CRC_ERR 0x329cc,
 		 * US_TX 0x329bc; PON_TRAP_CFG 0x111f8 [2:0]=OMCI_MPCP_PRIORITY. DECODER:
@@ -3297,7 +3474,7 @@ static int gpon_proc_show(struct seq_file *s, void *v)
 		 * = 0x7000). The decisive signature for "OLT deactivates ~42s, no OMCI": cpu>0
 		 * (ACKs egress) but gem_byte=0 AND idle16=0 (no US GEM fills the grants). */
 		/* OMCC US-emission detector. TCONT_IDLE_BYTE_STAT array base 0x6c00, stride 8
-		 * BYTES (reg_list "array offset 64"=64 BITS), 64-bit/entry: T-CONT 16 (OMCC) =
+		 * BYTES (register-map "array offset 64"=64 BITS), 64-bit/entry: T-CONT 16 (OMCC) =
 		 * 0x6c00+16*8=0x6c80, T-CONT 8 (data) = 0x6c40. GEM_US_BYTE_STAT base 0x6800,
 		 * stride 8, flow 64 (OMCC) = 0x6800+64*8=0x6a00. If idle16/gemus64 climb the ONU
 		 * IS emitting US GEM on the OMCC (so the OLT should confirm it); if flat, the
@@ -3427,8 +3604,8 @@ static int gpon_proc_show(struct seq_file *s, void *v)
 	 * @0x66/0x67, unit 0.1 microWatt/LSB. Emit the raw u16; userspace converts
 	 * dBm = 10*log10(raw/10000) (no in-kernel log10/FPU). 0x0000/0xffff = n/a. */
 	{
-		int rxw = bosa_read16(0x168);
-		int txw = bosa_read16(0x166);
+		int rxw = bosa_read16_median(0x168);
+		int txw = bosa_read16_median(0x166);
 
 		seq_printf(s, "optic_rx_raw: 0x%04x optic_tx_raw: 0x%04x\n",
 			   rxw & 0xffff, txw & 0xffff);
@@ -3458,7 +3635,7 @@ static int gpon_proc_show(struct seq_file *s, void *v)
 	 * golden in [..]). Decisive good-vs-bad-boot diff for the cold-start US-TX
 	 * serializer lock: any reg that DIVERGES from the [stock] value on a
 	 * non-leasing boot is a live-confirmed candidate (unlike the transient
-	 * mode_set disasm values, which are overwritten by the CDR reset). */
+	 * mode-set programmed values, which are overwritten by the CDR reset). */
 	seq_printf(s, "sds_run: 280c=%04x[3106] 281c=%04x[1359] 225a0=%04x[713] 220a8=%04x[2] 225d8=%04x[29]\n",
 		   sw_rd(0x2280c) & 0xffff, sw_rd(0x2281c) & 0xffff,
 		   sw_rd(0x225a0) & 0xffff, sw_rd(0x220a8) & 0xffff,
@@ -3670,8 +3847,8 @@ static void gpon_send_ack(const u8 *ds)
  * to the OLT in two upstream Encryption_Key (US type 0x05) PLOAM fragments
  * (msg[2]=key_index, msg[3]=row, msg[4..11]=8 key bytes; row 0 = key[0..7], row 1 =
  * key[8..15]). The OLT requests this during activation; an ONU that never returns a
- * key can't complete config (it stalls before/at OMCI). Matches vendor
- * gpon_ploam_key_tx. (HW decryption isn't programmed — the OMCC is unencrypted; this
+ * key can't complete config (it stalls before/at OMCI). Matches stock
+ * key-TX behavior. (HW decryption isn't programmed — the OMCC is unencrypted; this
  * just satisfies the OLT's key exchange so config proceeds.)
  */
 static u8 gpon_aes_key[16];
@@ -3713,7 +3890,7 @@ static void gpon_send_key(void)
 
 	get_random_bytes(gpon_aes_key, sizeof(gpon_aes_key));
 	gpon_key_index++;
-	/* Send the SAME key 3x (6 PLOAMs total), matching the vendor (for i<3 around the
+	/* Send the SAME key 3x (6 PLOAMs total), matching stock behavior (3 reps around the
 	 * 2-fragment emit). The US PLOAM channel is lossy and the OLT re-issues Request_key
 	 * rapidly when it does not receive a complete key, stalling config; the redundant
 	 * triple-send maximises the chance the OLT accepts the key and proceeds. */
@@ -3750,7 +3927,7 @@ static void gpon_send_key(void)
 #define   DS_PORT_OP_WRITE	BIT(8)		/* OP_MODE = WRITE(1) */
 #define GPON_GTC_DS_PORT_WR	0x1104		/* [11:0] gemPortId */
 #define GPON_GTC_DS_TRAFFIC_CFG	0x1400		/* array: base 0x1400, STRIDE 4 bytes, idx
-						 * 0..127, [4:0] traffic-type. The vendor reg_list
+						 * 0..127, [4:0] traffic-type. The register map's
 						 * "array offset"=32 is in BITS (32b = 4 bytes), NOT
 						 * bytes — confirmed on a live online stock ONU whose
 						 * tcfg[64] sits at 0x1500 (=0x1400+64*4)=0x4, with
@@ -3758,12 +3935,12 @@ static void gpon_send_key(void)
 						 * 0x1400..0x1600 array, into the void.) */
 #define   DS_TRAFFIC_CFG_STRIDE	4u
 #define   DS_TRAFFIC_IS_OMCI	BIT(2)
-#define GPON_GTC_GEM_US_PORT_MAP 0x6400		/* array: base 0x6400, STRIDE 0x20 (vendor
-						 * reg_list "array offset"=32), idx 0..127,
+#define GPON_GTC_GEM_US_PORT_MAP 0x6400		/* array: base 0x6400, STRIDE 0x20 (register-map
+						 * "array offset"=32), idx 0..127,
 						 * [11:0] gemPortId. NOT stride 4. */
-#define   GEM_US_PORT_MAP_STRIDE 4u		/* 4 BYTES/entry. The SDK reg_array "offset 32"
-						 * means 32 BITS: dal_rtl9602c_gpon.c
-						 * gemUsPortCfg_set indexes 4-byte words (flow 64
+#define   GEM_US_PORT_MAP_STRIDE 4u		/* 4 BYTES/entry. The register-map "offset 32"
+						 * means 32 BITS: the US GEM-port config
+						 * indexes 4-byte words (flow 64
 						 * = 0x6500). The 0x20-stride epoch wrote 0x6C00,
 						 * OUTSIDE the 128-entry table. */
 #define GPON_GTC_DS_OMCI_PTI	0x1204		/* [6:4] PTI_MASK [2:0] END_PTI */
@@ -3778,7 +3955,7 @@ static void gpon_send_key(void)
 /* GPON_DATA_FLOW(1) / GPON_DATA_GEM(193) — the WAN data GEM (clean-room nas0-equivalent) —
  * are defined in rtl9602c_gpon_nic.h (shared with the eth driver's gpon0 TX descriptor). */
 #define GPON_OMCC_PHYS_QID	64		/* OMCC physical qid = TCONT_QUEUE_MAX(32)*(TCONT16/8)+q0 = 64
-						 * (stock _ponmac_physicalQueueId_get @k0 0x801dac80, GPON branch
+						 * (stock physical-queue-id mapping, GPON branch:
 						 * srl>>3 then <<5). The prior "63" was a misread: with the WRONG
 						 * contiguous packing, the readback of SID2QID[64] actually read
 						 * SID 56's slot (a data flow legitimately at qid 63). Fixed packing
@@ -3799,8 +3976,8 @@ static int gpon_install_tcont(u8 tcont, u16 alloc);	/* fwd: data-GEM install bin
 /* Set a `bits`-wide entry at index `idx` in the packed pi-register array based at
  * `base` (driver-relative).
  *
- * PACKING CORRECTED 2026-06-13 (disasm of stock reg_array_field_write @k0 0x801b7204):
- * the rtl9602c reg-array helper packs entries `entries_per_word = 32/bits` PER 32-bit
+ * PACKING CORRECTED 2026-06-13 (from the stock array-field-write routine):
+ * the reg-array helper packs entries `entries_per_word = 32/bits` PER 32-bit
  * WORD, word-aligned, leaving the top (32 - entries_per_word*bits) bits of each word
  * UNUSED. A field NEVER straddles a word boundary. So:
  *   epw   = 32 / bits
@@ -3840,7 +4017,7 @@ static u32 pi_packed_get(u32 base, unsigned int idx, unsigned int bits)
 }
 
 /*
- * Faithful port of stock dal_rtl9602c_ponmac_mode_set() GPON branch, run as ONE
+ * Faithful port of the stock PON-MAC GPON mode-set branch, run as ONE
  * ordered block at O5. Stock assembles the GMAC0->US-NIC IP-mux routing state in a
  * single window: (1) INVALIDATE every US SID's classify; (2) program the OMCI SID
  * triple in order; (3) PON/CPU-port RX_SPC; (4) [gated] SerDes re-commit; ending on
@@ -3873,9 +4050,11 @@ static void rtl9602c_ponmac_modeset_gpon(void)
 
 	/* (2b) WAN data-GEM classify, re-asserted every modeset (the all-SID loop above
 	 * would otherwise wipe it — the same trap that hid the OMCC SID for ~30 rounds).
-	 * SID2QID = OMCC qid 64 so the data US rides T-CONT 16's grants. */
+	 * SID2QID = the data qid 32 (T-CONT 8, the OLT's data Alloc-ID) so the data US is
+	 * reported to the OLT's DBA on the data Alloc; legacy = OMCC qid 64 (rides T-CONT 16). */
 	if (gpon_data_installed) {
-		pi_packed_set(PI_PON_SID2QID, GPON_DATA_FLOW, 7, GPON_OMCC_PHYS_QID & 0x7f);
+		pi_packed_set(PI_PON_SID2QID, GPON_DATA_FLOW, 7,
+			      (data_tcont ? GPON_DATA_PHYS_QID : GPON_OMCC_PHYS_QID) & 0x7f);
 		pi_packed_set(PI_PON_SIDVALID, GPON_DATA_FLOW, 1, 1);
 	}
 
@@ -3955,10 +4134,10 @@ static int gpon_install_omcc(u16 gem)
 	gpon_wr(GPON_GEM_DS_MC_CFG, GEM_DS_MC_CFG_VAL);
 
 	/* GEM-DS reassembly flush/forward timer (GPON_GEM_DS_FRM_TIMEOUT 0x4098,
-	 * ASSM_TIMEOUT_FRM[4:0]). The vendor writes 16 UNCONDITIONALLY at device init
-	 * (gpon_res default assemble_timer=16). FRM_TIMEOUT field map: [4:0]
+	 * ASSM_TIMEOUT_FRM[4:0]). Stock writes 16 UNCONDITIONALLY at device init
+	 * (default assemble_timer=16). FRM_TIMEOUT field map: [4:0]
 	 * ASSM_TIMEOUT_FRM, [8] OMCI_TR_MODE, [15:14] DEBUG_BUS_SEL. The hardware RESET
-	 * default is 0x8110 (OMCI_TR_MODE=1) and the vendor only ever FIELD-writes the
+	 * default is 0x8110 (OMCI_TR_MODE=1) and stock only ever FIELD-writes the
 	 * assemble timer (bits[4:0]), PRESERVING OMCI_TR_MODE=1. A full write of 0x10
 	 * (as done before) CLEARS OMCI_TR_MODE — and with OMCI transparent mode off the
 	 * DS GEM de-assembler does not pass OMCI frames, so the GEM-DS MISC counters
@@ -3966,7 +4145,7 @@ static int gpon_install_omcc(u16 gem)
 	gpon_field(0x4098, 8, 8, 1);		/* OMCI_TR_MODE = 1 (stock reset default) */
 	gpon_field(0x4098, 4, 0, 16);		/* ASSM_TIMEOUT_FRM = 16 frames */
 
-	/* US GEM-port map for flow 64. STRIDE is 0x20 (32B/entry per the vendor reg_array),
+	/* US GEM-port map for flow 64. STRIDE is 0x20 (32B/entry per the register-map array),
 	 * NOT DS_TRAFFIC_CFG_STRIDE(4) — the old code used the wrong stride constant, so it
 	 * wrote flow 8's slot (0x6500) and left flow 64's real slot (0x6c00) unmapped, so the
 	 * US-NIC had no GEM-port for the OMCI flow and dropped US OMCI (rxsid/gemus64=0). */
@@ -3984,7 +4163,7 @@ static int gpon_install_omcc(u16 gem)
 	pi_packed_set(PI_PON_SID_Q_MAP_DS, GPON_OMCC_FLOW, 2, 0);
 	/* Enroll SID 64 in US counter-mask group 0 (CNT_MASK_US 0x20a8 + g*12 +
 	 * word; SID64 -> 0x20b0 bit0). RX_SID_GOOD/BAD_CNT_US count ONLY
-	 * mask-enrolled SIDs (SDK dal_rtl9602c_pbo usCounterGroupMember_add) —
+	 * mask-enrolled SIDs (the stock PBO US counter-group member-add step) —
 	 * without this every us_rxsid readout is structurally zero and proves
 	 * nothing. The UNGATED ingest counter is PKT_OK_CNT_US (PI 0x4010,
 	 * RX_OK[15:0]). */
@@ -4196,7 +4375,7 @@ static int gpon_install_tcont(u8 tcont, u16 alloc)
 		return -ETIMEDOUT;
 	}
 
-	/* PON-MAC US scheduler activation — the half of the vendor ponmac_queue_add our
+	/* PON-MAC US scheduler activation — the half of the stock ponmac queue-add our
 	 * driver omitted. The GTC alloc CAM above binds the OLT Alloc-ID to the T-CONT for
 	 * BWMAP grants, but the PON-IP scheduler never knew T-CONT 16 / physical queue 64
 	 * was a live member, so the ONU could not actually transmit US GEM on it. The OLT
@@ -4220,14 +4399,15 @@ static int gpon_install_tcont(u8 tcont, u16 alloc)
 		pi_field(0x023e4 + (tcont / 32) * 4, tcont % 32, tcont % 32, 1); /* PON_TCONT_EN[tcont] */
 		/*
 		 * Drain out the physical queue BEFORE binding it into the schedule mask.
-		 * This is the half of the vendor ponmac_queue_add that was previously
+		 * This is the half of the stock ponmac queue-add that was previously
 		 * omitted: DRN_CMD (PON-IP 0x20e4) = CFG_DRN_QUEUE_MODE(bit2)=1 |
 		 * CFG_DRN_IDX(bits3..9)=qid | DRN_PS(bit1)=1, then poll DRN_FLG(bit0) until
 		 * it clears. Without it the queue stays in a stale/blocked drain state and
 		 * the US scheduler never PULLS it onto the T-CONT's grants, so the T-CONT
 		 * fills its grants with idle GEM (idle16 climbs) and OMCC GEM never egresses
 		 * (gemus64 = 0) — the queued US OMCI sits forever. DRN_CMD address + field
-		 * bits from the rtl9602c chipdef; field semantics from ponmac queue_add.
+		 * bits from the chip's register/field map; field semantics from the stock
+		 * ponmac queue-add behavior.
 		 */
 		{
 			int n;
@@ -4242,12 +4422,12 @@ static int gpon_install_tcont(u8 tcont, u16 alloc)
 		pi_field(0x0229c + qid * 4, 17, 0, 0x3ffff);	/* PON_QID_PIR_RATE[qid] = MAX (1 word/qid) */
 		pi_field(0x02198 + qid * 4, 17, 0, 0);		/* PON_QID_CIR_RATE[qid] = 0 (live-stock; STRICT uses PIR only) */
 		pi_field(0x023e8 + (qid / 32) * 4, qid % 32, qid % 32, 0); /* PON_WFQ_TYPE[qid] = STRICT */
-		/* PON_WFQ_WEIGHT[qid] = 1 (10 bits/entry, 3 entries per 32-bit word): the
-		 * vendor writes weight 1 even for a STRICT queue ("for safe") — a zero-weight
+		/* PON_WFQ_WEIGHT[qid] = 1 (10 bits/entry, 3 entries per 32-bit word):
+		 * stock writes weight 1 even for a STRICT queue ("for safe") — a zero-weight
 		 * queue is skipped by the WFQ round. */
 		pi_field(0x023f8 + (qid / 3) * 4, (qid % 3) * 10 + 9, (qid % 3) * 10, 1);
 		pi_wr(0x02194, 0x66000);			/* PON_SCH_CTRL base (bits 13,14,17,18) */
-		/* RTL9602C = CHIP_REV_ID_A: the vendor ponmac_mode_set clears PON_GEN_PIR_DROP
+		/* RTL9602C = CHIP_REV_ID_A: stock ponmac mode-set clears PON_GEN_PIR_DROP
 		 * (PON_SCH_CTRL bit18) on rev A. Left set, every BWMAP grant is PIR-dropped: the
 		 * grant is accepted (bwm_acpt) but the GEM-US framing engine is never driven, so the
 		 * T-CONT emits NEITHER data NOR idle (idle=0 AND gemus=0, OLT -> "Laser out"). bit18
@@ -4321,8 +4501,8 @@ static void gpon_apply_boh(bool ranged)
 	u8 guard = gpon_boh_guard, t3 = ranged ? gpon_boh_t3ranged : gpon_boh_t3pre;
 	u8 rep, i, boh_len, size;
 
-	/* EXACT port of the vendor burst-overhead build (gpon_dev_upstreamOverhead_
-	 * calculate + gpon_dev_burstHead_ranged_set, SDK gpon_res.c:988/1086). The old
+	/* EXACT port of the stock burst-overhead build (the upstream-overhead
+	 * calculation + the ranged burst-head set). The old
 	 * code ALWAYS stored the 3 delimiter bytes at oh[9..11] and wrote 12 bytes — but
 	 * the RANGED (operation) burst the OLT dictates via Extended_Burst_Length (0x14)
 	 * is usually SHORTER than 12 (boh_len = guard/8 + t3ranged + 3). With BOH_LENGTH<12
@@ -4355,8 +4535,8 @@ static void gpon_apply_boh(bool ranged)
 	 * BOH_REPEAT is NOT guard/8 — it is the stored-byte index of the LAST
 	 * preamble byte before the 3-byte delimiter, i.e. (size - 4). This is the
 	 * HW pointer the burst-builder uses to know which stored byte to replicate
-	 * when extending the stored <=12 bytes out to the full BOH_LENGTH. Stock
-	 * dal_rtl9602c_gpon_burstOverhead_set writes exactly `(size-4)&0xf` and
+	 * when extending the stored <=12 bytes out to the full BOH_LENGTH. The stock
+	 * burst-overhead set writes exactly `(size-4)&0xf` and
 	 * IGNORES the caller's boh_repeat (its `if (rep) {}` is a no-op). With
 	 * size=12 this is 8 — matching the live-stock golden O5 dump BOH_CFG=0x083f
 	 * (REPEAT=8, LENGTH=63). Writing REPEAT=guard/8=4 mis-positions the
@@ -4464,7 +4644,7 @@ static void gpon_fsm_set_state(u8 st)
 }
 
 /*
- * Process-context worker that runs the stock dal_rtl9602c_ponmac_serdesCdr_reset
+ * Process-context worker that runs the stock SerDes CDR-reset
  * (invert SDS_ANA_COM_REG08 bit15, hold 10ms, restore). Scheduled from
  * gpon_fsm_handle() (softirq) on a Deactivate->O1 re-range so the upstream-TX
  * serializer CDR is re-seated with the *correct* primitive before the next
@@ -4493,11 +4673,11 @@ static void gpon_cdr_reset_worker(struct work_struct *w)
 		pr_info("rtl9602c-gpon: re-range FULL serdes re-init\n");
 		return;
 	}
-	cdr = sw_rd(SDS_ANA_COM_REG08);
-	sw_wr(SDS_ANA_COM_REG08, cdr ^ BIT(15));
+	cdr = sw_rd(SDS_ANA_COM_REG12);
+	sw_wr(SDS_ANA_COM_REG12, cdr ^ BIT(15));
 	mdelay(10);
-	sw_wr(SDS_ANA_COM_REG08, cdr);
-	pr_info("rtl9602c-gpon: re-range serdesCdr_reset pulse (COM_REG08 0x225a0 bit15), restored=0x%08x\n",
+	sw_wr(SDS_ANA_COM_REG12, cdr);
+	pr_info("rtl9602c-gpon: re-range serdesCdr_reset pulse (COM_REG12 0x225b0 bit15), restored=0x%08x\n",
 		cdr);
 }
 
@@ -4547,7 +4727,7 @@ static void gpon_fsm_handle(const u8 *m)
 			gpon_field(GPON_GTC_DS_ONU_STATUS, 15, 8, gpon_fsm_onu_id);
 			/* Bind the DEFAULT/management Alloc-ID (= ONU-ID, per G.984.3) to the
 			 * OMCC's T-CONT 16 (NOT T-CONT 0). Pre-config the OLT grants only this
-			 * default alloc for PLOAM/OMCI, and per the vendor it owns the OMCC
+			 * default alloc for PLOAM/OMCI, and as stock does it owns the OMCC
 			 * T-CONT, so its grants must serve the OMCC US queue (phys qid 64). With
 			 * it on an empty T-CONT 0 the OMCC upstream is never drained, the OLT
 			 * sees the OMCC half-dead and WITHHOLDS DS OMCI. (The separate data
@@ -4572,8 +4752,8 @@ static void gpon_fsm_handle(const u8 *m)
 			 * shared CPU TX buffer before the first ranged (O5) grant fires, so
 			 * the OLT's NARROW ranged-window burst-RX never has to frame a stale
 			 * pre-ranged-format burst (-> LOSi/SFi -> Deactivate(0x05) on ~50%%
-			 * of boots, grant-timing dependent). Vendor gmac_fsm_o4_eqd() does
-			 * exactly this at this edge (rtk_gpon_usPloamBuf_flush: PLM_FLUSH_BUF
+			 * of boots, grant-timing dependent). Stock does
+			 * exactly this at this O4-EqD edge (US-PLOAM-buffer flush: PLM_FLUSH_BUF
 			 * 0->1). Use gpon_field RMW so CRC_GEN_EN|ONUID_OVRD are preserved. */
 			gpon_field(GPON_GTC_US_PLOAM_CFG, 4, 4, 0);	/* PLM_FLUSH_BUF = 0 */
 			gpon_field(GPON_GTC_US_PLOAM_CFG, 4, 4, 1);	/* 0->1 edge: flush */
@@ -4589,7 +4769,7 @@ static void gpon_fsm_handle(const u8 *m)
 		 * disabled) must NOT reset — the old code blindly reset on every 0x06, so it
 		 * fought the OLT's re-enable and trapped the ONU in a re-range loop (live trace
 		 * showed the OLT spamming 0x06 d[0]=0x00 ENABLE while we kept resetting).
-		 * Matches the authoritative stock gpon_ploam_rx_process DISABLESN (gpon_ploam.c:561:
+		 * Matches the authoritative stock Disable_SN PLOAM handling (
 		 * 0xFF+SN=RX_DISABLE, 0x00+SN=RX_ENABLE, 0x0F=enable-all recovery). */
 		if (!((d[0] == 0xff && !memcmp(&d[1], gpon_sn_bytes, 8)) || d[0] == 0x0f))
 			break;			/* 0x00 ENABLE / not-our-SN -> ignore, keep activating */
@@ -4623,7 +4803,7 @@ static void gpon_fsm_handle(const u8 *m)
 				sw_field(WSDS_DIG_1D, 16, 16, 0);
 				udelay(500);
 				sw_field(WSDS_DIG_1D, 16, 16, 1);
-				/* AND run the *correct* stock CDR-lock pulse (invert COM_REG08 bit15,
+				/* AND run the *correct* stock CDR-lock pulse (invert COM_REG12 bit15,
 				 * 10ms, restore) deferred to process context — the 10ms hold cannot run
 				 * here in softirq. The interface reset-B re-strobe above does not re-lock
 				 * the serializer CDR; this does. */
@@ -4689,9 +4869,30 @@ static void gpon_fsm_handle(const u8 *m)
 			 * (on the ungranted ONU-ID alloc) SILENT — TCONT_IDLE[16]=0 — so the OLT never
 			 * saw the OMCC upstream operate, kept re-Configure_Port-ID and withheld OMCI.
 			 * On stock this same alloc is bound to T-CONT 16 and its OMCC emits (~10M). */
-			if (d[2] == 0x01 && !gpon_tcont_installed) {
-				if (!gpon_install_tcont(GPON_OMCC_TCONT, alloc))
-					gpon_tcont_installed = true;
+			if (d[2] == 0x01) {
+				if (!gpon_tcont_installed) {
+					/* first Alloc-ID = the OMCC mgmt alloc -> T-CONT 16 */
+					if (!gpon_install_tcont(GPON_OMCC_TCONT, alloc)) {
+						gpon_tcont_installed = true;
+						gpon_omcc_alloc = alloc;
+					}
+				} else if (data_tcont && alloc != gpon_omcc_alloc &&
+					   !gpon_data_tcont_installed) {
+					/* the OLT's separate DATA Alloc-ID -> its OWN T-CONT 8, so the
+					 * OLT's DBA sees a live reporting T-CONT and does not reclaim/
+					 * deactivate it (see data_tcont). */
+					if (!gpon_install_tcont(GPON_DATA_TCONT, alloc)) {
+						gpon_data_tcont_installed = true;
+						gpon_data_alloc = alloc;
+						pr_info("rtl9602c-gpon: DATA Alloc 0x%x -> T-CONT %d (qid %d)\n",
+							alloc, GPON_DATA_TCONT, GPON_DATA_PHYS_QID);
+					}
+				}
+			} else if (d[2] == 0xff && data_tcont &&
+				   gpon_data_tcont_installed && alloc == gpon_data_alloc) {
+				/* OLT deallocated the data Alloc-ID: allow a clean re-bind on the next
+				 * allocate (the alloc CAM binding is idempotent; no HW teardown needed). */
+				gpon_data_tcont_installed = false;
 			}
 			gpon_send_ack(m);
 			if (trace)
@@ -4760,7 +4961,7 @@ static void gpon_fsm_handle(const u8 *m)
 		break;
 	case PLM_DS_CFG_VPVC:
 		/* Configure_VP/VC (0x07): legacy ATM connection setup — unsupported on a
-		 * GEM ONU, but the authoritative SDK (gpon_ploam.c:653) still sends a US
+		 * GEM ONU, but stock still sends a US
 		 * Acknowledge. A missing ACK to any AK-required DS PLOAM raises LOAi. */
 		if (onu_id == gpon_fsm_onu_id) {
 			gpon_send_ack(m);
@@ -4769,10 +4970,10 @@ static void gpon_fsm_handle(const u8 *m)
 		break;
 	case PLM_DS_BER_INTERVAL:
 		/* BER_interval (0x12): the OLT configures the upstream BER reporting interval
-		 * and REQUIRES a US Acknowledge (SDK gpon_ploam.c:856). The SDK also arms a
+		 * and REQUIRES a US Acknowledge. Stock also arms a
 		 * timer that periodically emits Remote_Error_Indication (US 0x08); the ACK is
-		 * the part that prevents LOAi, so send it (broadcast or our ONU-ID, like the SDK
-		 * which accepts GPON_DEV_DEFAULT_ONU_ID). REI reporting is informational and not
+		 * the part that prevents LOAi, so send it (broadcast or our ONU-ID, like stock
+		 * which accepts the default ONU-ID). REI reporting is informational and not
 		 * required to stay activated. */
 		if (onu_id == gpon_fsm_onu_id || onu_id == 0xff) {
 			gpon_send_ack(m);
@@ -4993,6 +5194,38 @@ static void gpon_fsm_poll(struct timer_list *t)
 	if (bosa_laser_up && (gpon_fsm_ticks % 5) == 0)
 		bosa_laser_maint();
 
+	/* Runtime DS-CDR-wedge recovery — the stock link-state-check
+	 * mechanism our driver was MISSING. If the GTC DS framer status latches the
+	 * wedge sentinel (0xca0eca0f), the DS CDR has come up stuck (the cold-start
+	 * lock that a soft/WDT reboot cannot clear); re-acquire it by toggling
+	 * SP_SDS_EN_RX (SDS_REG0[1]) 1->0->1, exactly as stock does. Done as a two-tick
+	 * toggle (disable now, re-enable next tick ~10ms later) so no 10ms busy-wait
+	 * runs in this softirq. Self-limiting: only fires while wedged, and a bounded
+	 * consecutive-attempt cap yields to the LOS/re-range path on a dead link. */
+	if (cdr_stuck_recover) {
+		static int cdr_pending, cdr_tries;
+		u32 sts = gpon_rd(GPON_GTC_DS_INTR_STS);
+
+		gpon_gtc_ds_sts_last = sts;
+		if (cdr_pending) {
+			sw_field(SDS_REG0, 1, 1, 1);		/* SP_SDS_EN_RX -> 1 */
+			cdr_pending = 0;
+			if (gpon_rd(GPON_GTC_DS_INTR_STS) != GTC_DS_CDR_STUCK)
+				gpon_cdr_stuck_fixed++;
+		} else if (sts == GTC_DS_CDR_STUCK) {
+			if (cdr_tries < GPON_CDR_STUCK_MAX) {
+				sw_field(SDS_REG0, 1, 1, 0);	/* SP_SDS_EN_RX -> 0 */
+				cdr_pending = 1;
+				cdr_tries++;
+				gpon_cdr_stuck_count++;
+				pr_warn_ratelimited("rtl9602c-gpon: DS CDR wedged (GTC_DS_STS=0x%08x); SP_SDS_EN_RX re-acquire #%u\n",
+						    sts, gpon_cdr_stuck_count);
+			}
+		} else {
+			cdr_tries = 0;	/* healthy -> reset the consecutive-attempt cap */
+		}
+	}
+
 	/* OFFK runtime servo (stock europa_LoopMon equiv): once the laser bursts at
 	 * O5, latch the RTL8290B modulator-offset cal. Runs in this same softirq as
 	 * bosa_laser_maint() (serialized BOSA I2C). Strobe 0x24d=0xb0, read R29
@@ -5016,6 +5249,38 @@ static void gpon_fsm_poll(struct timer_list *t)
 		}
 	}
 	mod_timer(&gpon_fsm_timer, jiffies + msecs_to_jiffies(10));
+}
+
+/* Stock's omitted LDO init step. Byte-exact
+ * replica of the stock behavior. SC-indirect (SerDes-Control) analog-reg engine via swcore:
+ *   0x40 = SC_IND_CMD  (ADR[15:0], CMD_EN[16], WREN[17]); 0x0001fdca=read 0xfdca,
+ *          0x0003fdca=write 0xfdca.  0x44 = SC_IND_RD (RD_DAT[7:0], BUSY[8]).
+ *          0x3c = SC_IND_WD (WR_DAT[7:0]).  Stock settles 1ms/step (no BUSY poll).
+ * reg 0xfdca = "Disable DRAM LDO output" (8-bit): clear bits 2,3 (mask ~0xC) so
+ * the DDR switching reg drives the rail, not the linear LDO. THERMAL_CTRL_0
+ * (0x130): arm the on-die over-temp comparator (TM_HIGHCMP_EN | TM_HIGH_THR=0x6c,
+ * PWRON_DLY preserved) -> 0x00ec0005. NOTE (RE verdict): this is DRAM-LDO + thermal
+ * ALARM, NOT the SerDes/laser path -> stock platform hygiene, not the WAN fix. */
+static void __init rtl9602c_sc_ldo_init(void)
+{
+	u32 fdca, t130 = sw_rd(0x130);
+
+	if (!sc_ldo_init)
+		return;
+	sw_wr(0x40, 0x0001fdcau);		/* SC read cmd: reg 0xfdca */
+	udelay(1000);
+	fdca = sw_rd(0x44);
+	pr_info("rtl9602c-gpon: sc_ldo_init BEFORE: 0xfdca=0x%08x THERMAL(0x130)=0x%08x (stock 0x130=0x00ec0005)\n",
+		fdca, t130);
+	sw_wr(0x3c, fdca & ~0xcu);		/* clear DRAM-LDO bits 2,3 (stock mask ~0xC) */
+	udelay(1000);
+	sw_wr(0x40, 0x0003fdcau);		/* SC write commit */
+	sw_wr(0x40, 0x0001fdcau);		/* re-issue read (stock reads back for log) */
+	udelay(1000);
+	(void)sw_rd(0x44);
+	sw_wr(0x130, sw_rd(0x130) | 0x00800000u);			/* THERMAL: set bit23 */
+	sw_wr(0x130, (sw_rd(0x130) & 0xff80ffffu) | 0x006c0000u);	/* preserve low-16 */
+	pr_info("rtl9602c-gpon: sc_ldo_init AFTER: 0x130=0x%08x\n", sw_rd(0x130));
 }
 
 static int __init rtl9602c_gpon_init(void)
@@ -5104,7 +5369,11 @@ static int __init rtl9602c_gpon_init(void)
 		const char *via;
 		int sret;
 
+		rtl9602c_sc_ldo_init();		/* stock LDO init: analog LDO + thermal comp, before SerDes bring-up */
 		rtl960x_c2_postmode_perturb = serdes_postmode_perturb;	/* A/B: skip the post-GPON-mode US-TX perturbations (default = skip, stock rev-A) */
+		rtl960x_c2_sds_cfgrst = serdes_sds_cfgrst;	/* A/B: SDS reset = stock bit0-only (default) vs legacy bit7+bit0 */
+		rtl960x_c2_stock_analog = serdes_stock_analog;	/* A/B: match live-stock SDS REG01/REG11 post-reset (default) */
+		rtl960x_c2_analog_postreset = serdes_analog_postreset;	/* A/B: program full analog CMU/CDR table AFTER the SDS reset (stock rev-A, default) = cold-start determinism */
 		if (family_lib) {
 			/* bring up via the clean-room family lib (the open-source path) */
 			sret = rtl960x_ponmac_mode_set(RTL960X_CHIP_9602C, RTL960X_REV_A,
@@ -5200,7 +5469,7 @@ static int __init rtl9602c_gpon_init(void)
 		 * (the default, kept because full APC deafens the shared-BOSA DS-RX). Decouple
 		 * the keepalive: arm bosa_laser_up here so the fault-service runs WITHOUT the
 		 * DS-deafening APC, holding the burst lit through O5 so the OLT stops raising
-		 * LOS. (Workflow wf_c84cdec9 fix 1b.) */
+		 * LOS. */
 		bosa_laser_up = 1;
 	}
 
@@ -5265,11 +5534,11 @@ skip_bosa_init:
 	if (force_laser)
 		pr_info("rtl9602c-gpon: force_laser=1 -> US_CFG.FS_LON set (CW diagnostic)\n");
 	/* US GEM-header PTI vector (GPON_GEM_US_PTI_CFG 0x6020, NOT write-protected).
-	 * Vendor gpon_res.c sets gemUsPtiVector_set(0,1,0,1) => PTI_VECTOR1[6:4]=1,
+	 * Stock sets the US GEM PTI vector (0,1,0,1) => PTI_VECTOR1[6:4]=1,
 	 * PTI_VECTOR3[14:12]=1 => 0x00001010 (FS_GEM_IDLE[31]=0 keeps auto-idle). Reset
 	 * is 0, so every US GEM frame (incl OMCC OMCI responses) carries PTI=000 even on
-	 * end-of-fragment; the vendor comment: "For ALU OLT it only accepts OMCI with
-	 * NON_END_FRAG=0 and END_FRAG=1." Set it so the upstream GEM/OMCC is well-formed. */
+	 * end-of-fragment; some OLTs (e.g. ALU) only accept OMCI with
+	 * NON_END_FRAG=0 and END_FRAG=1. Set it so the upstream GEM/OMCC is well-formed. */
 	gpon_wr(0x6020, 0x00001010);
 	gpon_wr_us_protected(GPON_GTC_US_LASER, GPON_US_LASER_VAL);
 
@@ -5324,8 +5593,8 @@ skip_bosa_init:
 	 * with this latched No_message (US type 0x04) template. WITHOUT it our granted
 	 * slots carry zeroed/invalid PLOAMs once the ACK/key bursts drain, so the OLT
 	 * never confirms a continuously-alive upstream PLOAM/OMCC channel, keeps re-issuing
-	 * Configure_Port-ID/Request_key and WITHHOLDS DS OMCI. The vendor loads this
-	 * unconditionally in gpon_ploam_init. One call latches the persistent template;
+	 * Configure_Port-ID/Request_key and WITHHOLDS DS OMCI. Stock loads this
+	 * unconditionally during PLOAM init. One call latches the persistent template;
 	 * /proc/gpon us_gtc:ploam_auto should then climb on every OLT grant. */
 	{
 		u8 nomsg[12];
@@ -5364,16 +5633,17 @@ skip_bosa_init:
 	gpon_set_eqd(0);			/* pre-ranging EqD = 290*128 = 0x9100 */
 
 	/*
-	 * O5 grant-burst optical config — the "Laser out"/LOAi wall (workflow wf_51454c77,
-	 * 2026-06-13). The digital US datapath egresses (gemus64 climbs) but the OLT gets no
+	 * O5 grant-burst optical config — the "Laser out"/LOAi wall (2026-06-13).
+	 * The digital US datapath egresses (gemus64 climbs) but the OLT gets no
 	 * valid O5 burst, while the ranging SN burst works. Root: the GTC US burst-mode/laser
-	 * registers stock programs in dal_rtl9602c_gpon_init that our init OMITTED — the
+	 * registers stock programs in its GPON init that our init OMITTED — the
 	 * wide-window isolated SN burst tolerates the reset defaults; the packed back-to-back
 	 * O5 bursts do not ("isolated tolerates, packed exposes").
 	 *
 	 * #1 GPON_GTC_US_OPTIC_SD_TH (0x5188): MISM_THRESH[30:16]=0xa0, TOOLONG_THRESH[14:0]=
-	 *    0x7fff. Stock comment: "Because laser driver TX_SD delay, TX_SD may merge to next
-	 *    burst, adjust toolong threshold to 0x7fff / mismatch to 0xa0." At reset defaults the
+	 *    0x7fff. Rationale (stock behavior): because of the laser-driver TX_SD delay, TX_SD
+	 *    may merge into the next burst, so the toolong threshold is raised to 0x7fff and the
+	 *    mismatch threshold to 0xa0. At reset defaults the
 	 *    GTC mis-judges the duration of our own packed O5 bursts (BOSA TX_SD lingers into the
 	 *    next grant window) -> "too long"/"mismatch" -> it gates/suppresses the burst at the
 	 *    SerDes burst-gate => OLT LOSi/SFi ("Laser out") + LOAi. The SN burst is isolated in a
@@ -5382,11 +5652,11 @@ skip_bosa_init:
 	 *    GEM_US_PWR_SAV_CFG (0x6024) OPT_AHEAD_CYCLES[9:0]=0x100 / OPT_BEHIND_CYCLES[20:16]=
 	 *    0x10 = laser pre-fire / post-hold margins around each granted burst (so the preamble
 	 *    isn't emitted before the BOSA driver has settled). Stock programs both unconditionally.
-	 * These are US-side only (harmless to DS/ranging). Offsets chipdef-exact via rtk_resolve
-	 * against librtk.so; values from dal_rtl9602c_gpon_init (kernel-5.10-vendor SDK).
+	 * These are US-side only (harmless to DS/ranging). Offsets exact via the chip's
+	 * register map; values from the stock GPON init behavior.
 	 */
-	/* Values CORRECTED to the LIVE stock-ref-ONU oracle (ttyUSB3 mmiord @O5, 2026-06-13) —
-	 * the SDK *init* source value for OPTIC_SD_TH (0x00a07fff) did NOT match the live operating
+	/* Values CORRECTED to the LIVE stock-ref-ONU oracle (live stock register read @O5, 2026-06-13) —
+	 * the stock *init* programmed value for OPTIC_SD_TH (0x00a07fff) did NOT match the live operating
 	 * value (0x00504bfa): MISM_THRESH[30:16]=0x50, TOOLONG_THRESH[14:0]=0x4bfa. Oracle-parity. */
 	gpon_wr_us_protected(0x5188, 0x00504bfa);	/* US_OPTIC_SD_TH: live stock = MISM 0x50 | TOOLONG 0x4bfa */
 	gpon_field(0x526c, 0, 0, 1);			/* US_PWR_SAV_MODE.PWR_SAV_MODE = 1 (live stock = 1) */

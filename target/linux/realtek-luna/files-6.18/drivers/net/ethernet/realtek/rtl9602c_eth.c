@@ -44,7 +44,7 @@
  *     single OMCC flow is unknown from the descriptor build alone, so expose it.
  *   - the PON port (ExtSpa) placed in word3[22:16]; our PON switch port is 2.
  *
- * HW-RING / DOORBELL (facts from the stock re8686_send disasm @0x8065ad24):
+ * HW-RING / DOORBELL (observed from the stock device's TX-submit behavior):
  * stock submits with a SW ring number and maps it to a HW ring via
  *   idx_sw2hw(ring) = 4 - ring   ("HW ring h").
  * The per-packet kick then targets that SAME HW ring h:
@@ -63,12 +63,12 @@
 /*
  * PON_SID one-hot SHIFT for the OMCC US flow (word3[28:23] = ((1<<idx)&0x3F)<<23).
  *
- * Default 4 from clean-room RE of the stock 9602C vmlinux + a live-stock cross-check:
- *   - stock OMCI-TX-core (@0x8022e188) builds the steering exactly as we do:
+ * Default 4 from clean-room study of the stock device's OMCI-TX behavior + a live-stock cross-check:
+ *   - the stock OMCI-TX path builds the steering exactly as we do:
  *       v0=1; v0 <<= sid_idx; v0 &= 0x3F; v0 <<= 0x17(23)   -> word3[28:23] one-hot
- *       (sid_idx read via [[[0x80e0c4b0]+0x14]+0x158], helper @0x801f6eb8; the
- *        first builder @0x8022df10 reads the same value from mirror [s3+0x63e4]).
- *     The value is PROVISIONED at OMCC GEM install (setter @0x80228278 just copies
+ *       (sid_idx comes from internal GPON state, dereferenced from a per-flow
+ *        mirror; the first descriptor builder reads the same value from that mirror).
+ *     The value is PROVISIONED at OMCC GEM install (the setter just copies
  *     a caller-supplied word into the mirror), so it is NOT a baked constant — it
  *     is a small table index into the 6-way PON_SID classifier.
  *   - DECISIVE cross-check: a prior live-stock read showed US RX_SID_GOOD for SID 64
@@ -84,10 +84,10 @@ module_param(omci_sid_idx, uint, 0644);
 MODULE_PARM_DESC(omci_sid_idx, "US-OMCI PON_SID one-hot shift count (default 4 = SID-64 classify slot)");
 
 /*
- * ExtSpa / PON port (word3[22:16] = (port&0x7F)<<16). The stock reads this from
- * gponMacCtrl[0x5DB] (OMCI-TX-core @0x8022e1e0: lbu v0,1499(s1); &0x7F; <<16) — a
- * per-port field set at the US T-CONT/port binding (written as the high byte of
- * the 0x5D8 word in the ponmac install paths), so it too is provisioned, not baked.
+ * ExtSpa / PON port (word3[22:16] = (port&0x7F)<<16). The stock device reads this
+ * from a per-port PON-MAC control field (the byte at the GPON-MAC control region offset 0x5DB:
+ * load byte, &0x7F, <<16) — set at the US T-CONT/port binding (written as the high
+ * byte of the 0x5D8 word during port install), so it too is provisioned, not baked.
  * For our single PON it is the PON switch port = 2.
  */
 static unsigned int omci_pon_port = 2;	/* ExtSpa / PON port (word3[22:16]) = our PON switch port */
@@ -121,7 +121,7 @@ module_param(omci_minimal, uint, 0644);
  * NOTE: default is 0 (shared-ring-0 test path) FOR THIS TEST so the image boots
  * straight into the shared-ring-0 steering experiment. Set to 4 to restore the
  * dedicated ring. */
-static unsigned int omci_tx_ring = 0;	/* 0 = LAN ring (GMAC FETCHES it; ring 4 dedicated does NOT fetch — dirty stays 0); 4 = dedicated */	/* dedicated HW-descriptor TX ring (opts3 carries the SID). The ring0 SW 0x8899-tag path is FPGA_9602C-only (re8686_ext.c) — on real silicon the L2 switch strips the inline tag so US OMCI never reaches the US-NIC; the HW descriptor (word3=0x00b20040, DST_SID 64) is the only path that classifies to SID-64 group[4]. */
+static unsigned int omci_tx_ring = 0;	/* 0 = LAN ring (GMAC FETCHES it; ring 4 dedicated does NOT fetch — dirty stays 0); 4 = dedicated */	/* dedicated HW-descriptor TX ring (opts3 carries the SID). The ring0 SW 0x8899-tag path only works on the FPGA model — on real silicon the L2 switch strips the inline tag so US OMCI never reaches the US-NIC; the HW descriptor (word3=0x00b20040, DST_SID 64) is the only path that classifies to SID-64 group[4]. */
 module_param(omci_tx_ring, uint, 0644);
 MODULE_PARM_DESC(omci_tx_ring, "US-OMCI HW TX ring: 0=shared LAN ring0 (test default), 1..5=dedicated ring");
 
@@ -136,16 +136,16 @@ MODULE_PARM_DESC(omci_doorbell_bit,
 /*
  * GMAC bring-up mode. The TX-DMA hard-park root cause: the driver inherited the
  * GMAC from U-Boot's polled TFTP (IO_CMD 0x400f3330) and never reset it nor gave
- * it an IO_CMD 0->config enable edge. The vendor re8686 init is categorical that
- * the multi-ring fetch engine only latches its internal ring state through a
+ * it an IO_CMD 0->config enable edge. The stock NIC init behavior is categorical
+ * that the multi-ring fetch engine only latches its internal ring state through a
  * BSP_IP_SEL IP-block power-cycle followed by programming the rings with IO_CMD=0
- * and writing IO_CMD1-then-IO_CMD last ("in old method, mring can't receive
- * packet at first time" - re8686_rtl9607c.c:6916; stock 9602C does the same,
- * k0 reset_hw @0x80640c6c = IP_SEL bit1 off / ~10ms / on). On the inherited,
+ * and writing IO_CMD1-then-IO_CMD last (otherwise "mring can't receive
+ * packet at first time"); the stock 9602C reset path does the same:
+ * IP_SEL bit1 off / ~10ms / on. On the inherited,
  * never-reset engine the first sparse park latches fatally (txok frozen, OWN
  * stuck at the HW cursor, doorbell-immune) - measured: dirty freezes at the 4th
  * descriptor ever, a plain LAN frame, before any OMCI inject.
- *   1 = vendor-faithful cold start: stop_hw + IP-block power-cycle + full
+ *   1 = stock-faithful cold start: stop_hw + IP-block power-cycle + full
  *       reprogram + IO_CMD edge with the LIVE-STOCK operating values.
  *   0 = legacy inherited-U-Boot bring-up (the wedging baseline, kept for A/B).
  */
@@ -153,8 +153,8 @@ MODULE_PARM_DESC(omci_doorbell_bit,
  * permanently kills the GMAC->switch egress link on this board — descriptors
  * complete but no frame reaches switch port 3 afterwards (p3 tx MIB frozen,
  * txok 0, ~750 frames evaporated), exactly the "reset desyncs the U-Boot
- * GMAC<->switch IP-block sync" failure the 9607C port works around by never
- * resetting. Default OFF: inherit U-Boot's engine (egress proven) and rely on
+ * GMAC<->switch IP-block sync" failure that the known-working approach avoids by
+ * never resetting. Default OFF: inherit U-Boot's engine (egress proven) and rely on
  * the soft TxFDP re-arm for un-parking. */
 static unsigned int gmac_reset = 1;	/* now safe to reset: rtl9602c_uboot_swcore_bringup() re-runs U-Boot's GMAC<->switch resync after the IP-block reset, breaking the old "reset kills egress" catch-22, and the stock GMAC init re-establishes the GMAC0-TX->US-NIC direct link */
 /* Same-board diff (stock-WORKING vs mine-BROKEN) SoC-ctrl bits 0x18000100[8]/0x18000104[2]
@@ -176,8 +176,8 @@ MODULE_PARM_DESC(gmac_reset, "1=cold GMAC bring-up (IP-block reset + stock IO_CM
  * sits on without fetching and dirty has not advanced for >250ms despite the
  * per-tick doorbell re-kicks, power-cycle the GMAC IP block and re-arm the rings
  * IN PLACE (rotated so TxFDP points at the first pending descriptor - nothing is
- * lost). This is the vendor's only documented un-wedge (re8670_reset_hw); there
- * is no lighter TX soft-reset on this IP. */
+ * lost). This is the stock device's only known un-wedge (the GMAC reset path);
+ * there is no lighter TX soft-reset on this IP. */
 /* Reset-based recovery escalation. Default OFF (see gmac_reset note: resets
  * kill the switch egress on this board). The park watchdog + soft TxFDP
  * re-arm stay active regardless; this only gates the destructive level. */
@@ -185,7 +185,7 @@ static unsigned int tx_recover;
 module_param(tx_recover, uint, 0644);
 MODULE_PARM_DESC(tx_recover, "1=escalate a persistent TX-DMA park to a full GMAC reset (kills switch egress on this board!)");
 
-/* Stock re8686_send pokes the network-engine GO (0x18001038[31] + poll-clear) on
+/* The stock device pokes the network-engine GO (0x18001038[31] + poll-clear) on
  * EVERY submit, not just OMCI injects; mirror it on the LAN xmit path too. */
 static unsigned int txgo_xmit = 1;
 module_param(txgo_xmit, uint, 0644);
@@ -240,7 +240,7 @@ MODULE_PARM_DESC(unpark_mode, "soft re-arm flavor: 0=FDP re-point only, 1=+IO_CM
  * handling wedges TX. This is the load-bearing proof that the US-OMCI gap is an
  * init-COMPLETENESS issue (our minimal init cannot support stock's operating
  * values), not a per-register value we can match. Keep 0x10 so LAN works; the
- * US-NIC RX needs the full SDK init sequence, not this single bit. */
+ * US-NIC RX needs the full stock init sequence, not this single bit. */
 static unsigned int msr_top = 0x10;
 module_param(msr_top, uint, 0644);
 MODULE_PARM_DESC(msr_top, "MSR(0x58) top byte (0x10=LAN-healthy w/ our init; 0xf0=stock value, stalls our LAN)");
@@ -253,7 +253,7 @@ MODULE_PARM_DESC(msr_top, "MSR(0x58) top byte (0x10=LAN-healthy w/ our init; 0xf
  * the switch CPU-port HSB parser never reads the GMAC-inserted cpu-tag's
  * PON_SID/EXTSPA/PSEL, so a descriptor-steered OMCI frame is never direct-TX'd
  * to the US-NIC (it falls through to L2 flood). Stock runs 0x300 permanently
- * (TAG_AWARE | TRAP_TAGET_INSERT_EN) at dal_rtl9602c_cpu_init. Default 0x300.
+ * (TAG_AWARE | TRAP_TAGET_INSERT_EN), set during its CPU-port init. Default 0x300.
  * Caveat: a PLAIN LAN frame (no cpu-tag) at CPU-port ingress with TAG_AWARE on
  * could be mis-parsed — but our LAN egress path can prepend the SW 0x8899 tag
  * (TX_CPUTAG) if that surfaces; for now bring up US-OMCI (the gating feature). */
@@ -264,8 +264,8 @@ MODULE_PARM_DESC(sw_tagaware, "SW MAC_CPU_TAG_CTRL at open (0x300=cpu-tag parse 
 /* Recovery flavor: 1 = CMD-register (0x3B) RST soft-reset + full reprogram
  * (microseconds, no IP-block gating) instead of the BSP_IP_SEL power-cycle
  * (~14ms outage, MIB wipe). The RST bit self-clears when the GMAC core
- * finishes resetting (rtl8139 heritage; present in the vendor enum, unused by
- * vendor code — hence param-gated, default off until HW-proven). */
+ * finishes resetting (rtl8139 heritage; the bit is defined in the register map
+ * but stock never exercises it — hence param-gated, default off until HW-proven). */
 static unsigned int recover_rst = 1;
 module_param(recover_rst, uint, 0644);
 MODULE_PARM_DESC(recover_rst, "1=CMD.RST soft-reset recovery instead of the IP-block power-cycle");
@@ -282,8 +282,8 @@ MODULE_PARM_DESC(recover_rst, "1=CMD.RST soft-reset recovery instead of the IP-b
 #define R_TxCDO1	0x1304	/* TX ring0 current-descriptor offset (u16) */
 /* Per-ring TX descriptor pointers. The GMAC has six TX descriptor rings; each
  * ring k (0-indexed: 0 = the LAN ring above) has an {FDP,CDO} register pair on a
- * 16-byte stride. Confirmed from the stock 9602C vmlinux re8686_start_hw ring-init
- * loop @0x801af0f4 (writes 0x1300/0x1310/0x1320/0x1330/0x1340 for rings 0..4 —
+ * 16-byte stride. Confirmed from the stock device's ring-init behavior (it
+ * writes 0x1300/0x1310/0x1320/0x1330/0x1340 for rings 0..4 —
  * stride 16, NOT 8). The US-OMCI path submits on HW ring 4 (a free ring; the LAN
  * owns HW ring 0) so its descriptor base lives at R_TxFDP(4) = 0x1340 and the kick
  * targets the SAME ring (R_IO_CMD1 |= 0x100). HW ring h is consistent across the
@@ -291,8 +291,8 @@ MODULE_PARM_DESC(recover_rst, "1=CMD.RST soft-reset recovery instead of the IP-b
 #define R_TxFDP(k)	(0x1300 + (k) * 16)	/* ring k fetch-descriptor pointer (stock stride 16) */
 #define R_TxCDO(k)	(0x1304 + (k) * 16)	/* ring k current-descriptor offset (u16) */
 /* RX multi-ring config block at NIC offset 0x1380 + k*16 (RxFDP2 region), filled
- * by the stock re8686_start_hw RX-init loop @0x801af114 (the a0=1..5 path = RX
- * rings 1..5; a0==0 = the RxFDP/EthrntRxCPU_Des_Num ring-0 path). This is NOT a TX
+ * by the stock device's RX-init (the index 1..5 path = RX
+ * rings 1..5; index 0 = the RxFDP/RxCPU-descriptor-count ring-0 path). This is NOT a TX
  * config table — TX ring activation is TxFDP + OWN(opts1) + kick, with no second
  * table. Macro kept only to document the address; our driver uses only RX ring 0. */
 #define R_RxMRingCfg(k)	(0x1380 + (k) * 16)	/* RX multiring k config block (stock stride 16) */
@@ -311,9 +311,9 @@ MODULE_PARM_DESC(recover_rst, "1=CMD.RST soft-reset recovery instead of the IP-b
 #define IOCMD1_UBOOT	0x323F0001
 /*
  * SoC per-IP enable (system block 0xb8000600, OUTSIDE the GMAC window; same
- * register the PCIe driver drives as SOC_IP_SEL). Stock re8670_reset_hw
- * (k0 @0x80640c6c): clear bit1, ~10ms, set bit1 = GMAC0 IP-block power-cycle.
- * The vendor flags this as REQUIRED before ring programming - without it the
+ * register the PCIe driver drives as SOC_IP_SEL). The stock GMAC reset path
+ * does: clear bit1, ~10ms, set bit1 = GMAC0 IP-block power-cycle.
+ * Stock treats this as REQUIRED before ring programming - without it the
  * multi-ring fetch engine's internal state never latches and it parks fatally
  * on sparse TX. KSEG1 is always mapped on MIPS, so address it directly like
  * pcie-rtl9602c.c does.
@@ -464,12 +464,12 @@ struct tx_desc { u32 opts1, addr, opts2, opts3, opts4; };
 #define RTL9602C_OMCI_REASON	246	/* RX cpu-tag reason code = OMCI */
 #define RTL9602C_PON_PORT	2	/* PON/fiber switch port */
 #define CPUTAG1_OMCI_SID(s)	(((s) & 0x7f) << 8)	/* R_CPUTAG1CR[14:8] */
-#define CPUTAG1_B1		0x2	/* bit1: live 9602C stock reads CPUTAG1CR=0x4002; absent from the 9607C vendor enum (RTL8672GMAC_CPUtag1_Control) */
-/* Stock re8670_init_hw writes CPUTAG1CR = (SID<<8) | 0x70 (bits 4/5/6 = the
+#define CPUTAG1_B1		0x2	/* bit1: live 9602C stock reads CPUTAG1CR=0x4002; not present in the 9607C register map */
+/* Stock NIC init writes CPUTAG1CR = (SID<<8) | 0x70 (bits 4/5/6 = the
  * cpu-tag format/enable that make the GMAC actually PREPEND the on-wire tag the
- * switch HSB parser reads). Verified in the stock kernel disasm @0x801af04c-058
- * (ori 0x4070). The earlier 0x02 (bit1 only) was a misread of a runtime snapshot. */
-#define CPUTAG1_LOW		0x02	/* live-stock ref ONU devmem: CPUTAG1CR = 0x4002 (the 0x4070 disasm read was wrong) */
+ * switch HSB parser reads). Observed in the stock device's init (it ORs in
+ * 0x4070). The earlier 0x02 (bit1 only) was a misread of a runtime snapshot. */
+#define CPUTAG1_LOW		0x02	/* live-stock ref ONU devmem: CPUTAG1CR = 0x4002 (the earlier 0x4070 derivation was wrong) */
 
 struct rtl9602c_eth {
 	void __iomem	*base;
@@ -741,13 +741,13 @@ static void rtl9602c_sw_min_init(struct rtl9602c_eth *ep)
 	if (!ep->sw)
 		return;
 
-	/* --- SDK dal_rtl9602c_switch_init prerequisites (full-init-sequence port) ---
-	 * These are concrete register writes the vendor switch_init does that our
-	 * minimal init omitted; resolved from the SDK reg_list. They set up switch-side
-	 * state the cpu-tag PSEL direct-TX path is gated on. */
+	/* --- Stock switch-init prerequisites (full-init-sequence equivalents) ---
+	 * These are concrete register writes the stock switch init does that our
+	 * minimal init omitted; identified from the chip's register/field map. They set
+	 * up switch-side state the cpu-tag PSEL direct-TX path is gated on. */
 
 	/* (a) PONPBO IP clock/reset enable — SoC 0x1800063C bit5 (KSEG1 0xB800063C);
-	 * dal_rtl9602c_switch_ipEnable_set. The SDK calls this FIRST in switch_init: it
+	 * the switch IP-enable step. Stock does this FIRST in switch init: it
 	 * is the prerequisite that makes the whole PON-IP US/DS NIC + PBO datapath
 	 * reachable. Our minimal init never touched it (we only ever compared
 	 * 0x18000600..0x624, never 0x63C). Read-modify-write, OR bit5. */
@@ -756,11 +756,11 @@ static void rtl9602c_sw_min_init(struct rtl9602c_eth *ep)
 
 	/* (b) CFG_UNHIOL.IPG_COMPENSATION — swcore 0x23040 bit0. ORACLE-CONFIRMED real
 	 * value diff (ours read 0xa8, working stock 0xa9) that demonstrably changed the
-	 * OMCI forwarding class when poked live. The SDK switch_init sets it. */
+	 * OMCI forwarding class when poked live. The stock switch init sets it. */
 	iowrite32(ioread32(ep->sw + 0x23040) | BIT(0), ep->sw + 0x23040);
 
 	/* (c) WRAP_GPHY_MISC.PATCH_PHY_DONE — swcore 0x110 bit0: the "switch ready /
-	 * PHY patch done" latch the SDK switch_init asserts at completion. Without it
+	 * PHY patch done" latch the stock switch init asserts at completion. Without it
 	 * the switch may not present itself as fully initialised to the direct-TX
 	 * forwarding class. */
 	iowrite32(ioread32(ep->sw + 0x110) | BIT(0), ep->sw + 0x110);
@@ -783,7 +783,7 @@ static void rtl9602c_sw_min_init(struct rtl9602c_eth *ep)
 	 * ports). PISO 0x27000 is an 11-bit positive egress matrix (reset 0x3FFFFF =
 	 * forward to all); leave it at reset — do NOT write 0xffffffff (reserved bits). */
 	iowrite32(0, ep->sw + SW_SRC_PORT_PERMIT);
-	/* Flood masks: ports 0,1 (LAN) + 3 (CPU), but NOT port 2 (PON). Blueprint rank-2:
+	/* Flood masks: ports 0,1 (LAN) + 3 (CPU), but NOT port 2 (PON). Behavioral note:
 	 * stock excludes the PON port from BC/MC/unknown-UC flood so a cpu-tagged US OMCI
 	 * that the parser did not direct-TX has NO flood escape to switch-p2 — it is forced
 	 * down the PSEL direct-TX path to the US-NIC (our measured symptom was OMCI
@@ -854,9 +854,9 @@ static void rtl9602c_sw_min_init(struct rtl9602c_eth *ep)
 	/* Accept short (runt) frames on the PON port (2) and CPU port (3). A DS OMCI
 	 * frame is the 48-byte G.988 baseline + headers = ~60 bytes, BELOW the 64-byte
 	 * Ethernet minimum, so the switch runt-filters it unless RX_SPC (P_MISC bit2) is
-	 * set. The vendor sets RX_SPC per-port. P_MISC = 0x020004 + port*0x20; bit2 =
+	 * set. Stock sets RX_SPC per-port. P_MISC = 0x020004 + port*0x20; bit2 =
 	 * RX_SPC. Without it the de-encapsulated OMCI never reaches the CPU. */
-	/* P_MISC = 0x20004 + port*0x400 (SDK chip.c: per-port interval 0x400 —
+	/* P_MISC = 0x20004 + port*0x400 (the chip's per-port register interval is 0x400 —
 	 * the old 0x20-stride wrote unrelated registers and RX_SPC never landed). */
 	iowrite32(ioread32(ep->sw + 0x20804) | BIT(2), ep->sw + 0x20804); /* port 2 (PON) */
 	iowrite32(ioread32(ep->sw + 0x20C04) | BIT(2), ep->sw + 0x20C04); /* port 3 (CPU) */
@@ -874,7 +874,7 @@ static void rtl9602c_sw_min_init(struct rtl9602c_eth *ep)
 	iowrite32(SW_ABLTY_1G_FD_UP, ep->sw + SW_FORCE_P_ABLTY(RTL9602C_PON_PORT));
 	/*
 	 * Force P2 link UP (0xfff). This is REQUIRED for the DS path (PON->CPU forward).
-	 * Tested the vendor-style auto-link (0xfef, clearing FORCE_LINK_ABLTY) on HW:
+	 * Tested the stock-style auto-link (0xfef, clearing FORCE_LINK_ABLTY) on HW:
 	 * DS BROKE (OMCI responder resp -> 0, no DS OMCI reached the CPU) and US was NOT
 	 * fixed (us_rxsid still 0). So the P2 force-link is load-bearing for DS and is
 	 * NOT the US-egress blocker -- do not remove it.
@@ -925,6 +925,16 @@ static unsigned int omci_mds_seed = 125;	/* = stock's live ME2 MIB-Data-Sync (om
 					 * the in-sync ONU); reporting it pre-config makes the OLT treat us as in-sync. */
 module_param(omci_mds_seed, uint, 0644);
 MODULE_PARM_DESC(omci_mds_seed, "OMCI ME2 MIB-Data-Sync seed (must equal the OLT's applied-op count for Match)");
+/* mds_reset0: on an on-wire MIB-Reset (MT 0x4f), zero the MIB-Data-Sync counter per G.988 (and
+ * stock omci_app OMCI_ResetMib @0x41057c) instead of re-seeding 125. CAPTURE-PROVEN (2026-06-18):
+ * the OLT, after IT issues MIB-Reset, recounts its lsync from 0 and re-Creates the MEs; if we keep
+ * 125 our rsync = 125+N is PERMANENTLY ahead of the OLT's 0+N -> every periodic ONU-Data(ME2) audit
+ * mismatches -> the OLT loops MIB-Reset/Upload/re-Create and eventually Deactivate_ONU-ID(0x05) +
+ * dealloc-churn (the ~4min WAN teardown). Zeroing makes rsync==lsync after ONE resync -> stable.
+ * Default on (the WAN-stability fix); gpon.mds_reset0=0 = legacy re-seed. */
+static bool mds_reset0 = true;
+module_param(mds_reset0, bool, 0644);
+MODULE_PARM_DESC(mds_reset0, "on MIB-Reset zero ME2 MIB-Data-Sync (G.988/stock, default) vs re-seed");
 
 static void rtl9602c_wan_mac(u8 *out, const u8 *base)
 {
@@ -997,18 +1007,18 @@ static int rtl9602c_eth_refill(struct rtl9602c_eth *ep, unsigned int idx)
 /*
  * US-OMCI "txInfo" descriptor encoding — the AUTHORITATIVE stock 9602C mechanism.
  *
- * Reverse-engineered from the stock vmlinux (clean-room: the values below are
- * FACTS read from the binary; the code is our own). The stock OMCI-TX path
- * (omci-tx-core) builds a zeroed 5-word txInfo on the stack and OR-patches three
- * words, then re8686_tx_with_Info copies the OMCI PDU into an skb and submits the
- * txInfo via re8686_send, where the ring engine OR-s the descriptor control flags
+ * Derived from observing the stock device's OMCI-TX behavior (clean-room: the
+ * values below are FACTS; the code is our own). The stock OMCI-TX path
+ * builds a zeroed 5-word txInfo on the stack and OR-patches three
+ * words, then the NIC-TX layer copies the OMCI PDU into an skb and submits the
+ * txInfo, where the ring engine OR-s the descriptor control flags
  * into word0, sets OWN in word2, publishes the ring slot and kicks the per-ring
  * poll doorbell. The descriptor is 5 u32 words at offsets 0/4/8/12/16 = opts1 /
- * addr / opts2 / opts3 / opts4. CONFIRMED from re8686_send disasm: OWN = bit31 of
- * the word at OFFSET 8 = opts2/word2 (@0x8065aa1c lw a0,8(s4); lui 0x8000; or; sw
- * 8(s4)); word0/opts1 (offset 0) carries the org/desc-flag control and is the LAST
- * word copied to the live ring after a sync barrier (@0x8065aa54 sync, then sw
- * 0(s3)). So OWN lives in opts2 and is set LAST in our build, after the body.
+ * addr / opts2 / opts3 / opts4. CONFIRMED from the stock submit path: OWN = bit31 of
+ * the word at OFFSET 8 = opts2/word2 (read word at 8, OR in 0x80000000, store back);
+ * word0/opts1 (offset 0) carries the org/desc-flag control and is the LAST
+ * word copied to the live ring after a sync barrier (a sync, then the store of
+ * word0). So OWN lives in opts2 and is set LAST in our build, after the body.
  * Word layout (32-bit words; word0 published last):
  *
  *   word0 (opts1): segment/org control. Stock OR-s 0x02240000 (bits 25/21/18) on
@@ -1016,8 +1026,8 @@ static int rtl9602c_eth_refill(struct rtl9602c_eth *ep, unsigned int idx)
  *                  path additionally OR-s the descriptor flags 0xb8800000 |
  *                  0x40000000 and re-OR-s (word0 & 0x077e0000).
  *   word2/word3 = the stock GMAC tx_info (opts2->word2, opts3->word3, copied
- *   VERBATIM onto the ring; re8686_rtl9607c.h tx_info bitfields). Stock
- *   gpon_omci_tx directs the OMCI PDU CPU->PON like this:
+ *   VERBATIM onto the ring; the GMAC tx_info bitfields). Stock
+ *   OMCI-TX directs the OMCI PDU CPU->PON like this:
  *     word2 (opts2): cputag(bit31) | tx_portmask[26:16] = (1 << ponPort).
  *     word3 (opts3): keep(23) | dislrn(21) | cputag_psel(20) | l34_keep(17) |
  *                    tx_dst_stream_id[6:0] = OMCC SID (=64, a PLAIN 7-bit value,
@@ -1046,8 +1056,8 @@ static int rtl9602c_eth_refill(struct rtl9602c_eth *ep, unsigned int idx)
 #define TXD3_OMCI_L34KEEP	0x00020000u	/* opts3 bit17 l34_keep (no L3/L4 filter) */
 #define TXD3_DST_SID(s)		((s) & 0x7Fu)	/* opts3[6:0] tx_dst_stream_id (plain value) */
 /*
- * ★ 9602C opts3/word3 layout (authoritative: SDK rtk_rg_txdesc_s, CONFIG_RG_
- * RTL9602C_SERIES arm) — DIFFERENT from the 9607C layout the earlier code used:
+ * ★ 9602C opts3/word3 layout (authoritative: the 9602C TX-descriptor field map)
+ * — DIFFERENT from the 9607C layout the earlier code used:
  *   extspa[31:29] | tx_portmask[28:23] | tx_dst_stream_id[22:16] | rsvd | l34_keep[1] | ptp[0]
  * The 9607C put dst_stream_id at [6:0]; writing SID 64 there on 9602C landed it
  * in RESERVED bits (ignored) so the US-NIC never saw SID 64 (rxsid stayed 0 —
@@ -1058,7 +1068,7 @@ static int rtl9602c_eth_refill(struct rtl9602c_eth *ep, unsigned int idx)
  * 2026-06-11): every OMCI descriptor is word0=0x30000030 (FS|LS|len48, NO CRC,
  * NO org bits), word2=0x80080000, word3=0x02400000. Decoding word3 in the 9602C
  * layout: tx_portmask[28:23] = (1<<2) and tx_dst_stream_id[22:16] = 64. So the
- * PON port for the GMAC tx_portmask is 2, not 4 (the earlier disasm guess). */
+ * PON port for the GMAC tx_portmask is 2, not 4 (the earlier guess). */
 #define GMAC_PON_PORT		2			/* GMAC tx_portmask PON bit (stock = 1<<2 -> word3 0x02400000) */
 #define TXD3_9602C_PMASK(p)	(((p) & 0x3Fu) << 23)	/* opts3[28:23] tx_portmask */
 #define TXD3_9602C_DST_SID(s)	(((s) & 0x7Fu) << 16)	/* opts3[22:16] tx_dst_stream_id (the steering SID) */
@@ -1127,7 +1137,7 @@ static void rtl9602c_eth_omci_reclaim(struct rtl9602c_eth *ep)
  * the rest of the LAN datapath further down). */
 static void rtl9602c_eth_tx_reclaim(struct rtl9602c_eth *ep);
 
-/* Stock per-packet TX-fetch GO (re8686_send @0x8065acb4 in the 9602C k0): set bit31
+/* Stock per-packet TX-fetch GO (observed in the stock device's submit path): set bit31
  * of the network-engine reg at txgo+0x38, then poll it clear (HW acks the fetch) up
  * to ~100 spins. This is what commands the self-polling GMAC TX DMA to FETCH the
  * freshly-published OWN descriptor; the per-ring R_IO_CMD doorbell alone only marks
@@ -1259,7 +1269,7 @@ static int rtl9602c_eth_omci_xmit_ring0(struct rtl9602c_eth *ep, const u8 *omci,
 	 * — they were set at submit. Without them the frame L2-floods and never
 	 * reaches the US-NIC. D_EOR only on wrap slot.
 	 *
-	 * TxCRC (bit23) + IPCS (bit27): stock re8686_send_with_txInfo (@0x8065a7a0)
+	 * TxCRC (bit23) + IPCS (bit27): the stock submit path
 	 * UNCONDITIONALLY OR's 0xb8800000 into opts1 for EVERY frame, OMCI included, so
 	 * the stock OMCI submit word0 = 0xbaa40030 — the GMAC GENERATES + APPENDS the
 	 * Ethernet FCS. The old "stock omits TxCRC" belief was a MISREAD of the
@@ -1329,12 +1339,12 @@ static int rtl9602c_eth_omci_xmit_ring0(struct rtl9602c_eth *ep, const u8 *omci,
 /*
  * US-OMCI upstream transmit — the AUTHORITATIVE stock 9602C mechanism.
  *
- * Clean-room re-implementation of the stock OMCI-TX path (omci-tx-core ->
- * re8686_tx_with_Info -> re8686_send). The frame body is the BARE OMCI PDU only
+ * Clean-room re-implementation of the stock OMCI-TX path (build txInfo ->
+ * NIC-TX layer -> submit). The frame body is the BARE OMCI PDU only
  * (no [DA][SA] L2 header, no in-band 0x8899 tag); steering rides entirely in the
  * 5-word txInfo descriptor, and the descriptor is submitted on the dedicated
  * OMCC TX ring with the per-ring poll doorbell. The encoding (word0/word2/word3
- * masks, ring, doorbell) was re-derived from the stock binary and is described at
+ * masks, ring, doorbell) was re-derived from the stock device's behavior and is described at
  * the TXD*_OMCI_* defines above. The descriptor ring, the TxFDP arm (in open())
  * and the doorbell ALL reference the same HW ring h, so the engine polls the ring
  * we actually filled. Differs from the prior driver: a dedicated HW ring (not the
@@ -1469,7 +1479,7 @@ static int rtl9602c_eth_omci_xmit(struct rtl9602c_eth *ep, const u8 *omci,
 	/* omci_tx_ring is the HW ring h directly — the SAME h used to arm R_TxFDP(h)
 	 * in open(). Derive the doorbell from h so they can never disagree (the prior
 	 * bug: ring armed at h=4/0x1340 but kicked R_IO_CMD bit0 = h=0). Stock kick
-	 * (re8686_send @0x8065ad24): h<4 -> R_IO_CMD |= 1<<h; h==4 -> R_IO_CMD1 |= 0x100. */
+	 * behavior: h<4 -> R_IO_CMD |= 1<<h; h==4 -> R_IO_CMD1 |= 0x100. */
 	hwring = omci_tx_ring;
 	if (hwring > 5)
 		hwring = 4;
@@ -1527,8 +1537,8 @@ static int rtl9602c_eth_omci_xmit(struct rtl9602c_eth *ep, const u8 *omci,
 	/*
 	 * word0 (opts1) = FS|LS|len|0x02240000 (keep|dislrn|cputag_psel). The
 	 * cputag_psel bit triggers GMAC direct-TX to the US-NIC (bypassing L2);
-	 * the GMAC consumes these bits during cpu-tag insertion. D_TXCRC|D_IPCS: stock
-	 * send (@0x8065a7a0) OR's 0xb8800000 into opts1 for every frame -> GMAC appends
+	 * the GMAC consumes these bits during cpu-tag insertion. D_TXCRC|D_IPCS: the
+	 * stock submit path OR's 0xb8800000 into opts1 for every frame -> GMAC appends
 	 * the FCS; omitting it dropped the OMCI pre-MAC (rxsid=0). See the ring-0 path.
 	 */
 	word0 = D_FS | D_LS | D_TXCRC | D_IPCS | (len & TXD_LEN_MASK);
@@ -1542,23 +1552,23 @@ static int rtl9602c_eth_omci_xmit(struct rtl9602c_eth *ep, const u8 *omci,
 
 	/* word2 (opts2): CpuTag(31)+bit19 set, bits 16..18 cleared. OWN does NOT
 	 * live here: the GMAC fetch engine reads ownership from opts1 bit31 (word0)
-	 * on EVERY TX ring, including HW ring 4. Confirmed from the stock 9602C
-	 * re8686 SDK (DMA_TX_DESC.opts1 carries own/eor/fs/ls/crc; the reclaim/poll
-	 * test `tx_Mhqring[ring][tail].opts1 & DescOwn` and `txd->opts1 & 0x80000000`
-	 * — re8686_rtl9607c.c:3035/3151). The previous OWN-in-opts2 left opts1 bit31
+	 * on EVERY TX ring, including HW ring 4. Confirmed from the stock device's
+	 * descriptor handling (the TX descriptor's opts1 carries own/eor/fs/ls/crc; its
+	 * reclaim/poll tests the ring tail's opts1 against DescOwn / 0x80000000).
+	 * The previous OWN-in-opts2 left opts1 bit31
 	 * clear, so the HW saw the descriptor as CPU-owned and never fetched ring 4
 	 * (own[]=1, dirty=0). Mirror the proven LAN ring exactly: OWN in opts1,
 	 * published LAST. */
 	/* word2 (opts2): stock = cputag(31) | bit19 (directed-egress; steered by word3's
 	 * one-hot PON_SID + ExtSpa, NOT a switch portmask), tx_portmask [18:16] CLEARED.
-	 * RE'd from k0 OMCI-TX core @0x8022e1a0: opts2 = (prev | 0x80080000) & 0xfff8ffff.
+	 * From the stock OMCI-TX core: opts2 = (prev | 0x80080000) & 0xfff8ffff.
 	 * The old TX_PMASK(port) bit18 = switch cpu-tag forwarding => 0 egress on this
 	 * silicon (frame dropped before the US-NIC) — the real reason RX_SID_GOOD stayed 0. */
 	word2 = omci_word2_ovr ? omci_word2_ovr : (TXD2_OMCI_CPUTAG | BIT(19));
 
-	/* word3 (opts3): stock US-OMCI steering, RE'd from the 9602C vmlinux OMCI-TX
-	 * core (k0 rtk_gponapp_omci_tx -> 0x8022dfc0 builds the txInfo at 0x8022e1c0,
-	 * then re8686_tx_with_Info writes opts3): the steering is the one-hot PON_SID
+	/* word3 (opts3): stock US-OMCI steering, derived from the stock device's OMCI-TX
+	 * core (the OMCI-TX entry builds the txInfo, then the NIC-TX layer writes opts3):
+	 * the steering is the one-hot PON_SID
 	 * [28:23] = ((1<<omci_sid_idx)&0x3F)<<23 (idx 4 = the SID-64 classify slot ->
 	 * RX_SID_GOOD group[4]) | ExtSpa/PON-port [22:16] = (omci_pon_port&0x7F)<<16 |
 	 * tx_dst_stream_id [6:0] = OMCC SID 64. The earlier KEEP|DISLRN|PSEL|L34KEEP
@@ -1588,7 +1598,7 @@ static int rtl9602c_eth_omci_xmit(struct rtl9602c_eth *ep, const u8 *omci,
 	 * the same ring whose R_TxFDP(h) we armed in open(), so the engine fetches it. */
 	if (kick_iocmd1)
 		/* HW ring 4 (TxFDP5) poll "go" = IO_CMD1 |= TX_POLL5 (bit8 = 0x100),
-		 * EXACTLY as stock kick_tx() (re8686_rtl9607c.c:4306). IO_CMD1[21:16] is
+		 * EXACTLY as the stock per-ring TX kick. IO_CMD1[21:16] is
 		 * the RX multiring bitmap, NOT a TX-fetch enable, so it is not touched
 		 * here — the TX ring fetches once its TxFDP is armed and the descriptor
 		 * publishes OWN in opts1. */
@@ -2127,10 +2137,11 @@ static void rtl9602c_eth_omci_input(struct rtl9602c_eth *ep, const u8 *msg,
 		/* Stock X111W (omci_app OMCI_ResetMib @0x41057c) resets ONU-Data ME2 attr-1
 		 * (MIB-Data-Sync) to 0 on every on-wire MIB-Reset; it is then rebuilt by +1 per
 		 * applied config message (SET/CREATE/DELETE below) and reported live on GET/Upload.
-		 * BUT this OLT keeps a PERSISTENT per-SN lsync and never resets the in-sync ONU
-		 * (stock's live MDS=125 accumulated, never 0). So keep our seeded/accumulated value
-		 * across a MIB-Reset rather than zeroing, so the following Upload still reports it. */
-		ep->omci_mds = (u8)omci_mds_seed;
+		 * The prior "keep 125 across MIB-Reset" was WRONG (capture-proven 2026-06-18): once
+		 * the OLT itself issues MIB-Reset it recounts lsync from 0, so a retained 125+N is
+		 * permanently ahead -> ME2-audit mismatch loop -> Deactivate(0x05). Zero it (mds_reset0,
+		 * default) so rsync converges to the OLT's lsync after the resync. */
+		ep->omci_mds = mds_reset0 ? 0 : (u8)omci_mds_seed;
 		resp[8] = OMCI_RC_OK;
 		break;
 	case OMCI_MT_MIB_UPLOAD:
@@ -2482,7 +2493,7 @@ static void rtl9602c_eth_tx_rekick(struct rtl9602c_eth *ep)
 
 	/*
 	 * Park watchdog. A briefly-parked ring is normal (the doorbell above is
-	 * the vendor's 10ms TDU kick equivalent); a park that survives re-kicks
+	 * the equivalent of the stock device's ~10ms TDU kick); a park that survives re-kicks
 	 * with dirty frozen >250ms is the fatal latch — only the IP-block
 	 * power-cycle recovers it. Track progress via the combined dirty count
 	 * so either ring advancing resets the clock.
@@ -2686,7 +2697,7 @@ static void rtl9602c_eth_free_rings(struct rtl9602c_eth *ep)
  * (ISR & 0xf835) and per-ring TX-completion status (ISR1 & 0x3f); if neither is
  * ours return IRQ_NONE so a shared line keeps dispatching to co-handlers. Mask
  * our sources (so the level line de-asserts), W1C-ack the latched bits, and hand
- * the work to NAPI. Mirrors stock @0x80659724.
+ * the work to NAPI. Mirrors the stock device's ISR handling.
  */
 static irqreturn_t rtl9602c_eth_isr(int irq, void *dev_id)
 {
@@ -2709,7 +2720,7 @@ static irqreturn_t rtl9602c_eth_isr(int irq, void *dev_id)
 }
 
 /*
- * Halt the GMAC DMA + IRQ machinery (vendor re8670_stop_hw: IO_CMD/IO_CMD1 = 0,
+ * Halt the GMAC DMA + IRQ machinery (the stock stop sequence: IO_CMD/IO_CMD1 = 0,
  * masks 0, W1C-ack everything, settle). Caller holds tx_lock or is open()
  * before anything runs.
  */
@@ -2725,10 +2736,10 @@ static void rtl9602c_hw_stop(struct rtl9602c_eth *ep)
 }
 
 /*
- * Full GMAC register program in the vendor re8670_init_hw ORDER, for an engine
+ * Full GMAC register program in the stock init ORDER, for an engine
  * whose IO_CMD is 0 (fresh from rtl9602c_hw_stop + the IP-block power-cycle):
- * CMD/TCR/RCR/CONFIG -> cpu-tag -> ring pointers (TxCDO written 16-BIT like the
- * vendor; a 32-bit write would also clobber 0x1306) -> MSR/IDR/MAR ->
+ * CMD/TCR/RCR/CONFIG -> cpu-tag -> ring pointers (TxCDO written 16-BIT like
+ * stock; a 32-bit write would also clobber 0x1306) -> MSR/IDR/MAR ->
  * IO_CMD1-then-IO_CMD (the 0->config enable edge that latches the multi-ring
  * fetch engine) -> ISR ack -> IMR unmask. Ring bases honour the recovery
  * rotation (TxFDP -> first pending slot). Values are the LIVE-STOCK operating
@@ -2759,7 +2770,7 @@ static void rtl9602c_hw_program(struct rtl9602c_eth *ep)
 	/* SWITCH side of the cpu-tag engine (param: 0 = plain-LAN-safe). */
 	if (ep->sw) {
 		/* OFF->ON edge re-latches the SWITCH CPU-port cpu-tag PARSER, mirroring the
-		 * GMAC CPUTAGCR re-latch above. SDK-init analysis (blueprint rank-1): TAG_AWARE
+		 * GMAC CPUTAGCR re-latch above. Behavioral note: TAG_AWARE
 		 * re-arms the CPU-port HSB cpu-tag parser; a straight write can leave the parser
 		 * half-armed so it ignores the descriptor's PSEL/PON_SID and the cpu-tagged US
 		 * OMCI falls through to L2 flood instead of PSEL direct-TX to the PON/US-NIC.
@@ -2772,7 +2783,7 @@ static void rtl9602c_hw_program(struct rtl9602c_eth *ep)
 		iowrite32(0x00400034, ep->sw + 0x230F8);
 	}
 
-	/* Ring pointers, programmed while IO_CMD==0 (vendor order; CDO is
+	/* Ring pointers, programmed while IO_CMD==0 (stock order; CDO is
 	 * writable only in this stopped state). */
 	ep_wr(ep, R_TxFDP1, ep->tx_ring_dma | DMA_BUS_WINDOW);
 	iowrite16(0, ep->base + R_TxCDO1);
@@ -2801,7 +2812,7 @@ static void rtl9602c_hw_program(struct rtl9602c_eth *ep)
 	iowrite32(0xffffffff, ep->base + 0x08);		/* MAR0 */
 	iowrite32(0xffffffff, ep->base + 0x0C);		/* MAR4 */
 
-	/* The enable edge: IO_CMD1 first, IO_CMD last (vendor re8670_start_hw). */
+	/* The enable edge: IO_CMD1 first, IO_CMD last (stock start order). */
 	ep_wr(ep, R_IO_CMD1, IOCMD1_STOCK);
 	ep_wr(ep, R_IO_CMD, IOCMD_STOCK);
 
@@ -2811,7 +2822,7 @@ static void rtl9602c_hw_program(struct rtl9602c_eth *ep)
 	ep_wr(ep, R_IMR0, IMR0_TX_BITS);
 }
 
-/* Stock re8670_reset_hw (k0 @0x80640c6c): GMAC0 IP-block power-cycle. The block
+/* Stock GMAC reset path: GMAC0 IP-block power-cycle. The block
  * is UNREADABLE while gated (MMIO would bus-abort), so callers must fence off
  * the ISR/diag readers first. */
 static void rtl9602c_ipsel_cycle(void)
@@ -2828,7 +2839,7 @@ static void rtl9602c_ipsel_cycle(void)
 
 /*
  * TX-DMA park recovery (process context, scheduled by the rekick watchdog).
- * The vendor's only documented un-wedge: stop -> IP-block power-cycle -> full
+ * The stock device's only known un-wedge: stop -> IP-block power-cycle -> full
  * reprogram + IO_CMD edge. The TX rings are re-armed ROTATED so TxFDP points at
  * the first pending descriptor: nothing in flight is dropped, the restarted
  * engine resumes exactly where the old one parked. RX descriptors are
@@ -2930,17 +2941,17 @@ static void rtl9602c_eth_recover_work(struct work_struct *work)
  * shared rtl9602c_gpon_nic.h. */
 
 /*
- * U-Boot Lan_RXENABLE() resync (bismarck re8670poll.c) — the GMAC<->switch link
+ * U-Boot LAN-RX-enable resync — the GMAC<->switch link
  * bring-up that the GMAC IP-block power-cycle (rtl9602c_ipsel_cycle) tears down.
  * U-Boot established the GMAC<->switch sync ONCE via the SoC 0xB8000044
  * RDY_FOR_PATCH handshake (poll bit1 -> GPHY analog patch -> switch CPU-port /
  * isolation / VLAN config -> set bit0 patch-done) and never re-ran it; that is
  * exactly why gmac_reset=1 used to PERMANENTLY kill CPU->switch egress (the
  * "reset desyncs the U-Boot GMAC<->switch IP sync" catch-22). Re-running this
- * verbatim AFTER the reset re-establishes egress — and lets the subsequent stock
+ * AFTER the reset re-establishes egress — and lets the subsequent stock
  * GMAC init (hw_program) re-establish the GMAC0-TX->US-NIC internal direct-TX link
- * the US-OMCI rides (the non-register init-state the ROM diff proved is the gap).
- * MACReg(off) in U-Boot == sw_wr(off) here (SWITCH_BASE 0xbb000000 == ep->sw).
+ * the US-OMCI rides (the non-register init-state the stock/ours diff proved is the gap).
+ * The bootloader's switch-register accesses correspond to sw_wr(off) here.
  */
 static void rtl9602c_uboot_swcore_bringup(struct rtl9602c_eth *ep)
 {
@@ -2952,7 +2963,7 @@ static void rtl9602c_uboot_swcore_bringup(struct rtl9602c_eth *ep)
 	/* wait for RDY_FOR_PATCH (0xB8000044 bit1) after the IP-block reset */
 	for (to = 0; to < 200000 && !(readl(sysstat) & 0x2); to++)
 		udelay(1);
-	/* GPHY analog patch (0x6485 variant only), MACReg 0x10004/0x0/0x4 */
+	/* GPHY analog patch (0x6485 variant only), switch regs 0x10004/0x0/0x4 */
 	iowrite32(0xa0000000, ep->sw + 0x10004);
 	if ((ioread32(ep->sw + 0x10004) & 0xffff) == 0x6485) {
 		iowrite32(0x0000fffb, ep->sw + 0x0);
@@ -3000,19 +3011,19 @@ static int rtl9602c_eth_open(struct net_device *ndev)
 
 	if (gmac_reset) {
 		/*
-		 * Vendor-faithful cold start (the TX-park fix): halt the
-		 * inherited engine, power-cycle the GMAC IP block (stock
-		 * re8670_reset_hw), then program EVERYTHING in the vendor
+		 * Stock-faithful cold start (the TX-park fix): halt the
+		 * inherited engine, power-cycle the GMAC IP block (the stock
+		 * GMAC reset path), then program EVERYTHING in the stock
 		 * init order ending on the IO_CMD1->IO_CMD enable edge with
 		 * the live-stock operating values. Without the power-cycle
 		 * the multi-ring fetch engine never latches its ring state
-		 * and parks fatally on the first sparse TX (vendor:
+		 * and parks fatally on the first sparse TX (stock note:
 		 * "in old method, mring can't receive packet at first time").
 		 */
 		rtl9602c_hw_stop(ep);
 		rtl9602c_ipsel_cycle();
 		rtl9602c_uboot_swcore_bringup(ep);	/* re-establish GMAC<->switch sync the reset tore down (catch-22 breaker) */
-		/* Faithful full SDK datapath init, in stock module order, on the now-
+		/* Faithful full stock-equivalent datapath init, in stock module order, on the now-
 		 * QUIESCENT switch (TX not yet armed) — switch/l2/vlan/port/cpu/trap/
 		 * classify/ponmac. Hypothesis: the switch honoring the cpu-tag PSEL
 		 * directed-egress to the PON-MAC is an emergent property of the full
@@ -3085,9 +3096,9 @@ static int rtl9602c_eth_open(struct net_device *ndev)
 		/* NOTE: a TX ring needs ONLY its TxFDP armed + per-packet kick + a
 		 * descriptor with OWN(opts1 bit31) set — there is NO separate TX
 		 * "ring-config table" / count / active-mask. Confirmed from the stock
-		 * 9602C vmlinux re8686_start_hw: the TxFDP loop @0x801af0f4 writes
+		 * device's ring-init behavior: it writes
 		 * TxFDP1..TxFDP5 (rings 0..4) and nothing else gates TX fetch; the
-		 * 0x18013380+k*16 loop @0x801af114 is the RX multi-ring config (RxFDP2
+		 * 0x18013380+k*16 loop is the RX multi-ring config (RxFDP2
 		 * block), NOT a TX table — writing the OMCI TX ring base there only
 		 * scribbled RX-ring-5 config and never affected TX. Removed: the real
 		 * "ring 4 never fetched" gate was OWN being published in opts2 instead of
@@ -3153,7 +3164,7 @@ static int rtl9602c_eth_open(struct net_device *ndev)
 	/* Arm the OMCI cpu-tag (SID 64) here, ONCE, before R_IO_CMD enables the TX
 	 * engine — re-arming CPUTAGCR/CPUTAG1CR at runtime (set_omci_sid, post-O5) left
 	 * the cpu-tag-insert engine half-armed and the switch CPU-port-3 dropped the
-	 * tagged US OMCI (matches vendor: CPUTAGCR written once in init, never again).
+	 * tagged US OMCI (matches stock: CPUTAGCR written once in init, never again).
 	 * ★ The cpu-tag ADD engine must be RE-LATCHED with an off-then-on toggle:
 	 * write CPUTAGCR=0 FIRST, THEN the operating value — the 0->value edge re-samples
 	 * CT_TSIZE/CTPV/CT_APPLO so the GMAC actually PREPENDS the cpu-tag to egressing
@@ -3161,9 +3172,9 @@ static int rtl9602c_eth_open(struct net_device *ndev)
 	 * it emitted a BARE OMCI frame (port-mirror confirmed: no cpu-tag on the wire)
 	 * -> switch can't directed-egress by portmask -> US OMCI never reaches PON P2
 	 * -> us_rxsid good=0. CPUTAG1CR = CT1_SID(64<<8) | bit1 = 0x4002. NOTE: the 9607C
-	 * vendor enum (RTL8672GMAC_CPUtag1_Control) defines only CT1_SID (0x4000), so an
-	 * earlier port dropped the "|2" as "a stray bit the vendor never sets" — but that
-	 * followed the 9607C source, and the 9602C is a different chip: a LIVE 9602C stock
+	 * register map defines only CT1_SID (0x4000), so an
+	 * earlier port dropped the "|2" as "a stray bit stock never sets" — but that
+	 * followed the 9607C definition, and the 9602C is a different chip: a LIVE 9602C stock
 	 * register read (serial-pasted mmap reader on the stock ONU, 2026-06-11) shows
 	 * CPUTAG1CR = 0x4002, i.e. bit1 IS set on this chip. Restoring it (the bare 0x4000
 	 * was a 9607C->9602C port regression). SID is fixed (== GPON flow 64), latch before O5. */
@@ -3183,7 +3194,7 @@ static int rtl9602c_eth_open(struct net_device *ndev)
 	 * (live-stock): 0x230F0=0x00400034, 0x230F4=0x00f000ea, 0x230F8=0x00400034. */
 	if (ep->sw) {
 		/* OFF->ON edge re-latches the SWITCH CPU-port cpu-tag PARSER, mirroring the
-		 * GMAC CPUTAGCR re-latch above. SDK-init analysis (blueprint rank-1): TAG_AWARE
+		 * GMAC CPUTAGCR re-latch above. Behavioral note: TAG_AWARE
 		 * re-arms the CPU-port HSB cpu-tag parser; a straight write can leave the parser
 		 * half-armed so it ignores the descriptor's PSEL/PON_SID and the cpu-tagged US
 		 * OMCI falls through to L2 flood instead of PSEL direct-TX to the PON/US-NIC.
@@ -3209,9 +3220,9 @@ static int rtl9602c_eth_open(struct net_device *ndev)
 			((msr_top & 0xffu) << 24));	/* MSR top byte: param (0xf0 kills sparse TX, see msr_top) */
 	iowrite32(0xffffffff, ep->base + 0x08);	/* MAR0: accept-all-multicast */
 	iowrite32(0xffffffff, ep->base + 0x0C);	/* MAR4 */
-	/* IO_CMD1 = the exact stock re8686_start_hw value (@0x801af248 writes the
-	 * IO_CMD1 reg = 0x323f0001). Decoded against the SDK header / re8686_rtl9607c.c
-	 * iocmd1_reg construction (line 13183): 0x323f0001 =
+	/* IO_CMD1 = the exact stock start value (stock writes IO_CMD1 = 0x323f0001).
+	 * Decoded against the chip's IO_CMD1 field definitions
+	 * (iocmd1_reg construction): 0x323f0001 =
 	 *   CMD1_CONFIG(0x30000000, "apollo desc-format") | RX_NOT_ONLY_RING1(1<<25)
 	 *   | RX_MULTIRING_BITMAP(0x3f)<<16 | txq1_h(1<<0).
 	 * IMPORTANT: bits[21:16] are the RX multiring bitmap (which RX rings are
@@ -3691,7 +3702,7 @@ static int rtl9602c_eth_probe(struct platform_device *pdev)
 	/* Switch core (best-effort; minimal L2 flood enabled at open). */
 	ep->sw = devm_ioremap(dev, SWCORE_PHYS, SWCORE_SIZE);
 	/* network-engine TX-fetch GO register page (phys 0x18001000, a SEPARATE page
-	 * below the GMAC). Stock re8686_send sets bit31 of +0x38 then polls it clear on
+	 * below the GMAC). The stock device sets bit31 of +0x38 then polls it clear on
 	 * EVERY submit to command the self-polling TX DMA to fetch the freshly-published
 	 * descriptor; without it the sparse OMCI inject's descriptor is never fetched and
 	 * the engine parks (txok frozen, dirty stuck). */

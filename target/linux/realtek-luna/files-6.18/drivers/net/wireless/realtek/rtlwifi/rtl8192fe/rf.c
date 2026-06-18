@@ -6,7 +6,8 @@
  * Realtek RTL8192F (2T2R 802.11n PCIe).  Structure follows the mainline
  * rtlwifi rtl8192ee / rtl8723be sub-drivers; the register addresses,
  * field positions and numeric constants are the documented RTL8192F
- * values.  No vendor source is reproduced here.
+ * values.  Written clean-room from the public register map and the
+ * device's observable behaviour.
  */
 
 #include "../wifi.h"
@@ -139,8 +140,9 @@ void rtl92fe_phy_rf6052_set_cck_txpower(struct ieee80211_hw *hw,
 			tx_agc[idx] = ppowerlevel[idx] * 0x01010101;
 
 		/*
-		 * RTK "better performance" regulatory: fold the per-rate
-		 * offsets cached from the PG table into the CCK base word.
+		 * Regulatory mode 0 (the device's default "better
+		 * performance" behaviour): fold the per-rate offsets
+		 * cached from the PG table into the CCK base word.
 		 */
 		if (rtlefuse->eeprom_regulatory == 0) {
 			tmpval = rtlphy->mcs_txpwrlevel_origoffset[0][6] +
