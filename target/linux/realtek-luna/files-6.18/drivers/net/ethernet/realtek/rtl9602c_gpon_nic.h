@@ -41,6 +41,13 @@ void rtl9602c_eth_omci_selftest(void);
  * engine re-latches against the freshly-reset GMAC (stock order: GMAC reset -> NIC). */
 void gpon_pbo_init(void);
 
+/* Live ANI-G (ME 263) optical levels for the OMCI responder, in G.988 encoding
+ * (2's-complement s16, 0.002 dB referred to 1 mW): #10 RX signal level, #14 TX
+ * level. Reads a cache refreshed on the periodic FSM tick from the RTL8290B's
+ * calibrated SFF-8472 DDM page — no I2C in the (softirq) GET path. Defined in
+ * gpon-rtl9602c.c. */
+void gpon_anig_optical_omci(s16 *rx_level, s16 *tx_level);
+
 /* Faithful port of the stock SDK rtk_all_module_init() GPON datapath bring-up,
  * run on the quiescent switch in the eth reset path (after the GMAC reset + swcore
  * resync, before the GMAC is programmed/armed). Defined in gpon-rtl9602c.c. */

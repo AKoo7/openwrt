@@ -1848,7 +1848,9 @@ static u8 omci_me_fill(struct rtl9602c_eth *ep, u16 class_id, u16 inst,
 		PUT1(OMCI_ATTR_BIT(2), 1);		/* #2 Mode indicator = 1 */
 		PUT1(OMCI_ATTR_BIT(3), 0);		/* #3 Policy = 0 */
 		break;
-	case OMCI_ME_ANI_G:				/* ME 263 (inst 0x8001) — live stock ANI-G */
+	case OMCI_ME_ANI_G: {				/* ME 263 (inst 0x8001) — live ANI-G */
+		s16 orx, otx;
+		gpon_anig_optical_omci(&orx, &otx);	/* live DDM optical levels (cached) */
 		PUT1(OMCI_ATTR_BIT(1), 1);		/* #1 SR indication = 1 */
 		PUT2(OMCI_ATTR_BIT(2), 12);		/* #2 Total T-CONT number = 12 */
 		PUT2(OMCI_ATTR_BIT(3), 48);		/* #3 GEM block length = 0x30 */
@@ -1858,14 +1860,15 @@ static u8 omci_me_fill(struct rtl9602c_eth *ep, u16 class_id, u16 inst,
 		PUT1(OMCI_ATTR_BIT(7), 9);		/* #7 SD threshold = 9 */
 		PUT1(OMCI_ATTR_BIT(8), 0);		/* #8 ARC = 0 */
 		PUT1(OMCI_ATTR_BIT(9), 0);		/* #9 ARC interval = 0 */
-		PUT2(OMCI_ATTR_BIT(10), 0xeedc);	/* #10 Optical signal level (live stock) */
+		PUT2(OMCI_ATTR_BIT(10), (u16)orx);	/* #10 Optical signal level (live DDM) */
 		PUT1(OMCI_ATTR_BIT(11), 0xff);		/* #11 Lower optical threshold */
 		PUT1(OMCI_ATTR_BIT(12), 0xff);		/* #12 Upper optical threshold */
 		PUT2(OMCI_ATTR_BIT(13), 0);		/* #13 ONU response time = 0 */
-		PUT2(OMCI_ATTR_BIT(14), 0x04d7);	/* #14 Transmit optical level (live stock) */
+		PUT2(OMCI_ATTR_BIT(14), (u16)otx);	/* #14 Transmit optical level (live DDM) */
 		PUT1(OMCI_ATTR_BIT(15), 0x81);		/* #15 Lower transmit power threshold */
 		PUT1(OMCI_ATTR_BIT(16), 0x81);		/* #16 Upper transmit power threshold */
 		break;
+	}
 	case OMCI_ME_UNI_G:				/* ME 264 (inst 0x0101) */
 		PUT2(OMCI_ATTR_BIT(1), 0x0000);		/* #1 (config-option status) = 0 */
 		PUT1(OMCI_ATTR_BIT(2), 0);		/* #2 Administrative state = 0 */

@@ -1024,6 +1024,79 @@ static int bosa_read16_median(u16 reg_hi)
 	return v[n / 2];			/* median */
 }
 
+/* --- ANI-G (ME 263) live optical levels ------------------------------------
+ * The OMCI GET runs in softirq (GFP_ATOMIC) and must not busy-wait on the I2C
+ * bus, so the DDM optical words are sampled by a periodic workqueue (~3 s, as
+ * stock's separate DDM thread does) into this cache; the GET just returns the
+ * cache. Values use the
+ * G.988 ANI-G encoding (2's-complement s16, 0.002 dB referred to 1 mW). The
+ * defaults are the stock first-light snapshot, used until the first good read. */
+static s16 anig_rx_level = (s16)0xeedc;		/* #10 Optical signal level (DS RX) */
+static s16 anig_tx_level = (s16)0x04d7;		/* #14 Transmit optical level (TX)  */
+
+/*
+ * Convert a raw SFF-8472 DDM power word (unit 0.1 microWatt/LSB) to the ANI-G
+ * level encoding. power_mW = raw/10000, so
+ *   level = 500 * 10*log10(raw/10000) = 1505*log2(raw)/65536 - 20000
+ * (5000*log10(2) = 1505.15). log2 is computed in Q16 fixed point (fls for the
+ * integer part + linear interpolation of the mantissa; ~0.25 dB error, ample for
+ * the diagnostic ANI-G report) so no kernel FPU is needed. Returns INT_MIN when
+ * the word reads "not available" (0x0000/0xffff) so the caller keeps the cache.
+ */
+static s32 ddm_word_to_level(int raw)
+{
+	int e;
+	u32 frac;
+	s64 log2_q16, level;
+
+	if (raw <= 0 || raw >= 0xffff)
+		return INT_MIN;
+	e = fls((u32)raw) - 1;				/* floor(log2(raw))      */
+	frac = e ? (((u32)(raw - (1u << e)) << 16) >> e) : 0;	/* mantissa frac, Q16 */
+	log2_q16 = ((s64)e << 16) | frac;		/* log2(raw) in Q16      */
+	level = ((log2_q16 * 1505) >> 16) - 20000;
+	if (level > 32767)
+		level = 32767;
+	else if (level < -32768)
+		level = -32768;
+	return (s32)level;
+}
+
+/* Sample the calibrated DDM optical words and refresh the ANI-G level cache.
+ * Called from the periodic FSM tick at a slow cadence (never from the GET path);
+ * a "not available" word keeps the previous cached value. */
+static void gpon_optical_cache_poll(void)
+{
+	s32 v;
+
+	v = ddm_word_to_level(bosa_read16_median(0x168));	/* RX @0x68/0x69 */
+	if (v != INT_MIN)
+		anig_rx_level = (s16)v;
+	v = ddm_word_to_level(bosa_read16_median(0x166));	/* TX @0x66/0x67 */
+	if (v != INT_MIN)
+		anig_tx_level = (s16)v;
+}
+
+/* Exported to the OMCI responder (rtl9602c_eth.c) for the ANI-G GET: returns the
+ * cached live optical levels. No I2C here, so it is safe to call from softirq. */
+void gpon_anig_optical_omci(s16 *rx_level, s16 *tx_level)
+{
+	*rx_level = anig_rx_level;
+	*tx_level = anig_tx_level;
+}
+
+/* The DDM optical read busy-waits on the I2C bus, so it must NOT run in the PLOAM
+ * fsm_poll softirq — a stall there risks missed US-grant timing and an OLT-side
+ * deactivate. Run it from a workqueue (process context) on a ~3 s cadence, like
+ * stock's separate DDM polling thread. The median read already tolerates racing
+ * the laser servo, so no bus lock is needed. */
+static struct delayed_work gpon_optical_work;
+static void gpon_optical_work_fn(struct work_struct *w)
+{
+	gpon_optical_cache_poll();
+	schedule_delayed_work(&gpon_optical_work, msecs_to_jiffies(3000));
+}
+
 /*
  * Write one 8-bit register to an I2C slave via the SoC HW I2C master (bus 0).
  * Returns 0 on success, negative on NACK/timeout. Same indirect kick as the
@@ -3630,6 +3703,10 @@ static int gpon_proc_show(struct seq_file *s, void *v)
 
 		seq_printf(s, "optic_rx_raw: 0x%04x optic_tx_raw: 0x%04x\n",
 			   rxw & 0xffff, txw & 0xffff);
+		/* ANI-G ME263 #10/#14 cached levels (OMCI 0.002 dB, 2's-comp) reported to
+		 * the OLT — refreshed from the DDM words on the FSM tick. */
+		seq_printf(s, "anig_rx_level: 0x%04x anig_tx_level: 0x%04x\n",
+			   (u16)anig_rx_level, (u16)anig_tx_level);
 	}
 	/* BOSA page0 (slave 0x50) control regs — compare against the O5 operating
 	 * state to find the APCDIG clock/power enable (O5 p0: 02 04 0b ff ff ff ff 0c
@@ -5731,6 +5808,8 @@ skip_bosa_init:
 	pr_info("rtl9602c-gpon: PLOAM FSM start, SN '%s' = %*phN\n",
 		onu_sn, 8, gpon_sn_bytes);
 	INIT_WORK(&gpon_cdr_reset_work, gpon_cdr_reset_worker);
+	INIT_DELAYED_WORK(&gpon_optical_work, gpon_optical_work_fn);
+	schedule_delayed_work(&gpon_optical_work, msecs_to_jiffies(3000));
 	timer_setup(&gpon_fsm_timer, gpon_fsm_poll, 0);
 	mod_timer(&gpon_fsm_timer, jiffies + msecs_to_jiffies(50));
 	return 0;
@@ -5740,6 +5819,7 @@ static void __exit rtl9602c_gpon_exit(void)
 {
 	timer_delete_sync(&gpon_fsm_timer);
 	cancel_work_sync(&gpon_cdr_reset_work);
+	cancel_delayed_work_sync(&gpon_optical_work);
 	remove_proc_entry("gpon", NULL);
 	if (ponip_base)
 		iounmap(ponip_base);
