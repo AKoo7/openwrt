@@ -231,9 +231,11 @@
 #define WSDS_DIG_03		0x2203c		/* [6:4] CFG_TXDIS_SEL_DLY     */
 #define WSDS_DIG_18		0x22090		/* [12]  BEN_OE                */
 #define WSDS_DIG_1D		0x220a4		/* interface reset-B releases  */
-#define   WSDS_SFT_RSTB_INF	BIT(14)		/* interface soft reset-B      */
+#define   WSDS_SFT_RSTB_INF	BIT(14)		/* interface soft reset-B (FIFO r/w ptr re-sync) */
 #define   WSDS_SFT_RSTB_INF_RX	BIT(15)		/* RX interface soft reset-B   */
 #define   WSDS_SFT_RSTB_INF_TX	BIT(16)		/* TX interface soft reset-B   */
+#define SDS_ANA_COM_REG27	0x225ec		/* TX CMU enable lives here    */
+#define   SDS_CMU_EN		BIT(10)		/* TX CMU enable (toggle 1->0->1 to re-lock the PLL) */
 #define SDS_ANA_COM_REG03	0x2258c		/* [15:14] CMU_ISTANK_SEL_RX   */
 #define SDS_ANA_COM_REG08	0x225a0		/* TX-CDR (reg1418); [15] = the
 						 * serdesCdr_reset toggle bit    */
@@ -665,6 +667,27 @@ MODULE_PARM_DESC(serdes_analog_postreset, "1=program full analog CMU/CDR table A
 static unsigned int serdes_cmu_settle_ms;
 module_param(serdes_cmu_settle_ms, uint, 0644);
 MODULE_PARM_DESC(serdes_cmu_settle_ms, "ms TX-CMU-lock settle between 125M ref force and reset-B release (0=legacy default)");
+/* serdes_txpll_relock: at the O1/O2->O3 edge (downstream optical signal present, just
+ * before the first upstream burst), re-lock the TX CMU PLL by toggling the CMU enable
+ * 1->0->1, then re-sync the SerDes word FIFO read/write pointer (WSDS_DIG_1D[14] 0->1).
+ * On a fresh power-on under strong downstream light the optical signal-detect can assert
+ * before the CMU has settled, latching the TX PLL onto the WRONG clock rate (~50%,
+ * un-frameable by the OLT = "Laser out"); re-toggling the CMU enable once the optics are
+ * stable forces a clean re-acquire. This is the one bring-up step the clean-room port
+ * omitted. DEFAULT 1 = on (cold-start determinism candidate); =0 = skip. */
+/* DEFAULT OFF: the O3-entry CMU re-toggle is an unvalidated cold-start-lock candidate
+ * (the active-fiber failure was NOT cold-start, so it's untested); keep it gated. */
+static bool serdes_txpll_relock;
+module_param(serdes_txpll_relock, bool, 0644);
+MODULE_PARM_DESC(serdes_txpll_relock, "1=re-lock TX CMU PLL (toggle CMU enable + FIFO re-sync) at O3 entry before first US burst (cold-start candidate, default off); 0=skip");
+/* optical_poll: periodic ANI-G DDM optical read. DEFAULT OFF — the periodic BOSA I2C
+ * read (in any context) transiently disturbs the optical path and provokes the OLT
+ * op=0xff dealloc/DEACT churn (no WAN); proven by A/B (poll on=churn, off=clean WAN).
+ * Until the read is made glitch-free, ANI-G reports the (plausible) snapshot value.
+ * =1 re-enables the live read (for development of the glitch-free path). */
+static bool optical_poll;
+module_param(optical_poll, bool, 0644);
+MODULE_PARM_DESC(optical_poll, "1=periodic ANI-G DDM optical poll (default); 0=off (static snapshot)");
 /* force_soc_clk: before the SerDes bring-up, write the 3 SoC sysctl/clock registers
  * (0x18000100/12c/140) to the live-STOCK (100%-deterministic) values that OUR FAIL boot
  * was found to differ from (stock 0x00440e00/0x024d024d/0x024d024d vs ours 0x00440f00/
@@ -1093,6 +1116,8 @@ void gpon_anig_optical_omci(s16 *rx_level, s16 *tx_level)
 static struct delayed_work gpon_optical_work;
 static void gpon_optical_work_fn(struct work_struct *w)
 {
+	if (!optical_poll)
+		return;
 	gpon_optical_cache_poll();
 	schedule_delayed_work(&gpon_optical_work, msecs_to_jiffies(3000));
 }
@@ -4690,6 +4715,30 @@ static u32 gpon_o5_entry_tick;
 static bool gpon_vlan_lan_open;
 static int gpon_avc_sent;	/* OMCI oper-state AVCs emitted this O5 (reset on re-range) */
 
+/*
+ * Re-lock the TX CMU PLL at O3 entry — see serdes_txpll_relock. A fresh power-on under
+ * strong downstream light can assert the optical signal-detect before the CMU has
+ * settled, latching the TX PLL onto the wrong clock rate (~50% "Laser out"). Toggling
+ * the CMU enable 1->0->1 forces a clean re-acquire now the optics are stable, then the
+ * SerDes word FIFO read/write pointer is re-synced. Called once per ranging cycle from
+ * the FSM (softirq); the settle is short (the CMU finishes re-locking during the
+ * remaining ranging time, well before the upstream burst is framed).
+ */
+static void gpon_txpll_relock(void)
+{
+	if (!serdes_txpll_relock)
+		return;
+	if (sw_rd(SDS_ANA_COM_REG27) & SDS_CMU_EN) {
+		sw_field(SDS_ANA_COM_REG27, 10, 10, 0);		/* CMU enable -> 0      */
+		udelay(100);
+		sw_field(SDS_ANA_COM_REG27, 10, 10, 1);		/* -> 1 (re-acquire)    */
+		udelay(100);
+	}
+	sw_field(WSDS_DIG_1D, 14, 14, 0);			/* FIFO r/w ptr re-sync */
+	sw_field(WSDS_DIG_1D, 14, 14, 1);
+	pr_info("rtl9602c-gpon: TX-PLL relock (CMU re-toggle + FIFO re-sync) at O3 entry\n");
+}
+
 static void gpon_fsm_set_state(u8 st)
 {
 	u8 prev = gpon_fsm_state;
@@ -4814,6 +4863,7 @@ static void gpon_fsm_handle(const u8 *m)
 			gpon_set_eqd(pre_eqd);
 			gpon_fsm_set_state(2);
 			gpon_fsm_set_state(3);
+			gpon_txpll_relock();	/* re-lock TX CMU PLL now DS optics are stable, before US burst */
 			gpon_send_sn();		/* first SN immediately */
 		}
 		break;
@@ -5809,7 +5859,8 @@ skip_bosa_init:
 		onu_sn, 8, gpon_sn_bytes);
 	INIT_WORK(&gpon_cdr_reset_work, gpon_cdr_reset_worker);
 	INIT_DELAYED_WORK(&gpon_optical_work, gpon_optical_work_fn);
-	schedule_delayed_work(&gpon_optical_work, msecs_to_jiffies(3000));
+	if (optical_poll)
+		schedule_delayed_work(&gpon_optical_work, msecs_to_jiffies(3000));
 	timer_setup(&gpon_fsm_timer, gpon_fsm_poll, 0);
 	mod_timer(&gpon_fsm_timer, jiffies + msecs_to_jiffies(50));
 	return 0;
