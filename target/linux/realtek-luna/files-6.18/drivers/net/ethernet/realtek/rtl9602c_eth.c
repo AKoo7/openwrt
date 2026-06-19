@@ -1938,6 +1938,90 @@ struct omci_mib_row { u16 class_id; u16 inst; u16 mask; };
 static struct omci_mib_row mib_rows[200];
 static u16 mib_nrows;
 
+/*
+ * Dynamic, auto-adaptive MIB store: the MEs the OLT PROVISIONS at runtime
+ * (Create/Set), kept so GET and MIB-Upload reflect the ACTUAL configured MIB
+ * rather than a fixed list. Without it, a GET of an OLT-created ME returns
+ * UNKNOWN_ME, so the OLT's post-config consistency audit fails and it re-runs the
+ * whole MIB-Reset/Upload/Create sequence every ~50s and then Deactivates (the
+ * periodic-deact / reboot-instability we see vs stock). Adapts to ANY class +
+ * instance the OLT creates; bounded (drops past capacity, logged).
+ */
+struct omci_me_inst { u16 class_id; u16 inst; u8 body[26]; u8 blen; bool used; };
+static struct omci_me_inst omci_store[128];
+static u16 omci_store_n;			/* count of used entries */
+
+static struct omci_me_inst *omci_store_find(u16 class_id, u16 inst)
+{
+	u16 k;
+
+	for (k = 0; k < ARRAY_SIZE(omci_store); k++)
+		if (omci_store[k].used && omci_store[k].class_id == class_id &&
+		    omci_store[k].inst == inst)
+			return &omci_store[k];
+	return NULL;
+}
+
+/* idx-th used entry, in array order (stable while no deletes) — for MIB-Upload. */
+static struct omci_me_inst *omci_store_nth(u16 idx)
+{
+	u16 k, n = 0;
+
+	for (k = 0; k < ARRAY_SIZE(omci_store); k++)
+		if (omci_store[k].used) {
+			if (n == idx)
+				return &omci_store[k];
+			n++;
+		}
+	return NULL;
+}
+
+static void omci_store_put(u16 class_id, u16 inst, const u8 *body, int blen)
+{
+	struct omci_me_inst *e = omci_store_find(class_id, inst);
+	u16 k;
+
+	if (!e)
+		for (k = 0; k < ARRAY_SIZE(omci_store); k++)
+			if (!omci_store[k].used) {
+				e = &omci_store[k];
+				e->used = true;
+				e->class_id = class_id;
+				e->inst = inst;
+				e->blen = 0;
+				omci_store_n++;
+				break;
+			}
+	if (!e) {				/* store full -> bounded drop */
+		pr_warn_ratelimited("rtl9602c-omci: ME store full, dropping class=%u inst=%u\n",
+				    class_id, inst);
+		return;
+	}
+	if (body && blen > 0) {
+		if (blen > (int)sizeof(e->body))
+			blen = sizeof(e->body);
+		memcpy(e->body, body, blen);
+		e->blen = (u8)blen;
+	}
+}
+
+static void omci_store_del(u16 class_id, u16 inst)
+{
+	struct omci_me_inst *e = omci_store_find(class_id, inst);
+
+	if (e) {
+		e->used = false;
+		if (omci_store_n)
+			omci_store_n--;
+	}
+}
+
+static void omci_store_reset(void)		/* on on-wire MIB-Reset */
+{
+	memset(omci_store, 0, sizeof(omci_store));
+	omci_store_n = 0;
+}
+
 static void omci_build_mib(void)
 {
 	u16 n = 0;
@@ -2070,6 +2154,21 @@ static u8 rtl9602c_omci_get_fill(struct rtl9602c_eth *ep, u16 class_id,
 	u8 rc = omci_me_fill(ep, class_id, inst, mask, resp + 11, resp + 40,
 			     &rmask);
 
+	if (rc == OMCI_RC_UNKNOWN_ME) {
+		/* Not a built-in modelled ME — serve from the dynamic store if the OLT
+		 * created it, so a GET of an OLT-provisioned ME returns OK (with its
+		 * stored attribute bytes, best-effort) rather than UNKNOWN_ME (which
+		 * aborts the OLT's config). */
+		struct omci_me_inst *e = omci_store_find(class_id, inst);
+
+		if (e) {
+			int n = e->blen > 26 ? 26 : e->blen;
+
+			memcpy(resp + 11, e->body, n);
+			rmask = mask;		/* echo requested mask; values best-effort */
+			rc = OMCI_RC_OK;
+		}
+	}
 	omci_put_be16(resp + 9, rmask);
 	return rc;
 }
@@ -2142,6 +2241,7 @@ static void rtl9602c_eth_omci_input(struct rtl9602c_eth *ep, const u8 *msg,
 		 * permanently ahead -> ME2-audit mismatch loop -> Deactivate(0x05). Zero it (mds_reset0,
 		 * default) so rsync converges to the OLT's lsync after the resync. */
 		ep->omci_mds = mds_reset0 ? 0 : (u8)omci_mds_seed;
+		omci_store_reset();		/* clear provisioned-ME store (OLT re-provisions) */
 		resp[8] = OMCI_RC_OK;
 		break;
 	case OMCI_MT_MIB_UPLOAD:
@@ -2156,9 +2256,9 @@ static void rtl9602c_eth_omci_input(struct rtl9602c_eth *ep, const u8 *msg,
 		 * reply). The old code wrote resp[8]=result + count at resp[9-10], so the
 		 * OLT read bytes 8-9 = (0<<8)|count_hi = 0 -> saw count=0 -> never issued
 		 * MIB-Upload-Next. Put the count at resp[8-9]. */
-		omci_put_be16(resp + 8, mib_nrows);
-		pr_info("rtl9602c-omci: MIB_UPLOAD -> count=%u (TID=%02x%02x)\n",
-			mib_nrows, msg[0], msg[1]);
+		omci_put_be16(resp + 8, mib_nrows + omci_store_n);
+		pr_info("rtl9602c-omci: MIB_UPLOAD -> count=%u (%u static + %u provisioned) (TID=%02x%02x)\n",
+			mib_nrows + omci_store_n, mib_nrows, omci_store_n, msg[0], msg[1]);
 		break;
 	case OMCI_MT_GET:
 		if (len < 10)		/* msg[8..9] = requested attribute mask; the
@@ -2173,7 +2273,21 @@ static void rtl9602c_eth_omci_input(struct rtl9602c_eth *ep, const u8 *msg,
 		break;
 	case OMCI_MT_SET:
 	case OMCI_MT_CREATE:
-	case OMCI_MT_DELETE:
+	case OMCI_MT_DELETE: {
+		u16 minst = (msg[6] << 8) | msg[7];
+
+		/* Dynamic MIB store: track the OLT's provisioned MEs (auto-adaptive — any
+		 * class/instance) so GET + MIB-Upload reflect the actual config and the OLT's
+		 * post-config audit passes (instead of re-provisioning every ~50s). Create adds
+		 * the ME with its set-by-create attribute body; Delete removes it. Set is NOT
+		 * stored: built-in/default MEs stay served by omci_me_fill + the static rows
+		 * (so they're not duplicated), and an OLT-created ME is already in the store. */
+		if (mt == OMCI_MT_CREATE)
+			omci_store_put(class_id, minst, msg + 8,
+				       (len > 8) ? (int)(len - 8) : 0);
+		else if (mt == OMCI_MT_DELETE)
+			omci_store_del(class_id, minst);
+
 		/* Mirror stock X111W omci_SyncMibData (omci_app @0x411c98): ONU-Data ME2 attr-1
 		 * (MIB-Data-Sync) is a 1-byte counter incremented by +1 per SUCCESSFULLY-applied
 		 * config message (Create/Set/Delete) — NOT per-attribute (popcount), confirmed by
@@ -2189,6 +2303,7 @@ static void rtl9602c_eth_omci_input(struct rtl9602c_eth *ep, const u8 *msg,
 			ep->omci_mds = 1;
 		resp[8] = OMCI_RC_OK;
 		break;
+	}
 	case OMCI_MT_GET_ALL_ALARMS:
 		omci_put_be16(resp + 9, 0x0000);	/* no active alarms */
 		break;
@@ -2212,6 +2327,18 @@ static void rtl9602c_eth_omci_input(struct rtl9602c_eth *ep, const u8 *msg,
 			omci_me_fill(ep, r->class_id, r->inst, r->mask,
 				     resp + 14, resp + 40, &wmask);
 			omci_put_be16(resp + 12, wmask);
+		} else if (seq < mib_nrows + omci_store_n) {
+			/* dynamically-provisioned MEs, after the static default MIB (only
+			 * populated if the OLT re-uploads mid-config; post-MIB-Reset the store
+			 * is empty so this serves nothing). Present-only row (mask=0): tells the
+			 * OLT the ME exists; attribute values are served via GET from the store. */
+			const struct omci_me_inst *e = omci_store_nth(seq - mib_nrows);
+
+			if (e) {
+				omci_put_be16(resp + 8, e->class_id);
+				omci_put_be16(resp + 10, e->inst);
+				omci_put_be16(resp + 12, 0x0000);
+			}
 		}
 		/* seq out of range -> empty (all-zero) row, still well-formed. */
 		break;
