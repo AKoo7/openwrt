@@ -1458,6 +1458,18 @@ static const struct r960_op c2_sds_tx[] = {
  * Default 1 = legacy behavior. */
 int rtl960x_c2_postmode_perturb = 1;
 
+/* A/B knob (gpon.serdes_cmu_settle_ms): milliseconds to wait AFTER forcing the 125M
+ * ref clock and BEFORE releasing the SerDes interface reset-B lines, so the TX CMU PLL
+ * locks to the ref before the serializer phase is latched. 0 = legacy (no extra settle).
+ * Candidate fix for the cold-start ~50% US-TX "Laser out" metastable serializer phase. */
+int rtl960x_c2_cmu_settle_ms;
+
+/* A/B knob (gpon.serdes_clkgate_rstb): 1 = gate the SerDes word clock (STOP_CLK=1)
+ * across the DIG_1D interface reset-B release and un-gate LAST, so the word divider
+ * restarts on one defined edge (defeats the async-reset-on-running-divider ~50%
+ * serializer-phase coin-flip). 0 = legacy free-running release. Cold-start fix candidate. */
+int rtl960x_c2_clkgate_rstb;
+
 /* A/B knob set by the board (gpon.serdes_sds_cfgrst). Default 0 = pulse ONLY
  * CMD_SDS_RST_PS bit0 in the SerDes reset (stock rev-A = the cold-start fix); 1 =
  * also assert CMD_SDS_CFG_RST_PS bit7 (legacy, leaves the extra reset domain
@@ -1534,11 +1546,39 @@ static int rtl9602c_ponmac_mode_set(const struct rtl960x_ops *o,
 	if (rtl960x_c2_analog_postreset)
 		c2_program_analog(o);
 
-	/* Step 4: release soft-reset-B lines, force 125M ref, pulse interface
-	 * reset-B. Re-clear FIB power-down, which the reset re-asserts. */
-	ret = r960_run(o, c2_sds_rstb, ARRAY_SIZE(c2_sds_rstb));
-	if (ret)
-		return ret;
+	/* Step 4: force the 125M ref clock, OPTIONALLY let the TX CMU PLL lock to it,
+	 * then release the interface reset-B lines. The TX serializer phase is latched
+	 * at the TX reset-B 0->1 edge (last writes of c2_sds_rstb); if the CMU has not
+	 * yet locked to the freshly-forced ref the captured phase is metastable
+	 * (cold-start ~50% "Laser out"). A CMU-lock settle therefore MUST be inserted
+	 * HERE — between the ref-force and the reset-B release — not at the end of
+	 * mode_set (by then the phase is already latched). Gated by
+	 * rtl960x_c2_cmu_settle_ms (default 0 = legacy: no extra settle). */
+	if (rtl960x_c2_clkgate_rstb) {
+		/* SYNCHRONOUS clock-gated reset-B release (cold-start metastability fix
+		 * candidate). Legacy releases the DIG_1D[14:16] interface reset-B with the
+		 * word-divider clock FREE-RUNNING (STOP_CLK=0 in DIG00_RUN=0xf30) — the
+		 * textbook async-reset-on-a-running-divider that latches a metastable ~50%
+		 * serializer word-phase. Here we GATE the word clock (STOP_CLK=1, 0xf31)
+		 * across the whole reset-B dance and UN-GATE it LAST, so the divider always
+		 * restarts on ONE defined edge. Final state (DIG00=0xf30, DIG_1D=0x1c000) is
+		 * identical to legacy -> O5 register config stays byte-identical. */
+		o->wr(C2_WSDS_DIG_00, C2_WSDS_DIG00_RUN | 1u);	/* STOP_CLK=1 (gate, 0xf31) */
+		ret = r960_run(o, c2_sds_rstb + 1, ARRAY_SIZE(c2_sds_rstb) - 1); /* reset-B dance, gated */
+		if (ret)
+			return ret;
+		o->wr(C2_WSDS_DIG_00, C2_WSDS_DIG00_RUN);	/* STOP_CLK=0 (un-gate LAST, 0xf30) */
+		mdelay(10);
+	} else {
+		ret = r960_run(o, c2_sds_rstb, 1);	/* WR DIG_00 = RUN (125M ref forced) */
+		if (ret)
+			return ret;
+		if (rtl960x_c2_cmu_settle_ms)
+			mdelay(rtl960x_c2_cmu_settle_ms);
+		ret = r960_run(o, c2_sds_rstb + 1, ARRAY_SIZE(c2_sds_rstb) - 1); /* reset-B dance */
+		if (ret)
+			return ret;
+	}
 	for (i = 0; i < ARRAY_SIZE(c2_fib_reg0_banks); i++)
 		o->wr(c2_fib_reg0_banks[i],
 		      o->rd(c2_fib_reg0_banks[i]) & ~C2_FIB_REG0_PDOWN);

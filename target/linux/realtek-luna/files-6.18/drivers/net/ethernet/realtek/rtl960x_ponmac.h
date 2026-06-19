@@ -84,4 +84,6 @@ extern int rtl960x_c2_postmode_perturb;
 extern int rtl960x_c2_sds_cfgrst;
 extern int rtl960x_c2_stock_analog;
 extern int rtl960x_c2_analog_postreset;
+extern int rtl960x_c2_cmu_settle_ms;
+extern int rtl960x_c2_clkgate_rstb;
 #endif /* _RTL960X_PONMAC_H */

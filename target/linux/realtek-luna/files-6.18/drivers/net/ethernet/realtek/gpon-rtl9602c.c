@@ -659,6 +659,27 @@ MODULE_PARM_DESC(serdes_stock_analog, "1=match live-stock SDS REG01=0x73a4 + REG
 static bool serdes_analog_postreset = true;
 module_param(serdes_analog_postreset, bool, 0644);
 MODULE_PARM_DESC(serdes_analog_postreset, "1=program full analog CMU/CDR table AFTER the SDS reset (stock rev-A, default, the cold-start determinism fix); 0=legacy pre-reset");
+/* serdes_cmu_settle_ms: ms to wait after forcing the 125M ref clock and BEFORE releasing
+ * the SerDes interface reset-B (which latches the TX serializer phase) — lets the TX CMU PLL
+ * lock first. 0 = legacy. Candidate fix for the cold-start ~50% US-TX "Laser out" metastability. */
+static unsigned int serdes_cmu_settle_ms;
+module_param(serdes_cmu_settle_ms, uint, 0644);
+MODULE_PARM_DESC(serdes_cmu_settle_ms, "ms TX-CMU-lock settle between 125M ref force and reset-B release (0=legacy default)");
+/* force_soc_clk: before the SerDes bring-up, write the 3 SoC sysctl/clock registers
+ * (0x18000100/12c/140) to the live-STOCK (100%-deterministic) values that OUR FAIL boot
+ * was found to differ from (stock 0x00440e00/0x024d024d/0x024d024d vs ours 0x00440f00/
+ * 0x02490249). Candidate fix for the cold-start ~50% US-TX metastability (stock-vs-ours
+ * clock-config diff, same methodology that found REG01/REG11). 0 = legacy (no write). */
+static bool force_soc_clk;
+module_param(force_soc_clk, bool, 0644);
+MODULE_PARM_DESC(force_soc_clk, "1=write live-stock SoC clock regs 0x18000100/12c/140 before SerDes bring-up (cold-start fix candidate); 0=legacy");
+/* serdes_clkgate_rstb: gate the SerDes word clock (STOP_CLK=1) across the interface
+ * reset-B release and un-gate LAST, so the word divider restarts on one defined edge
+ * (defeats the async-reset-on-running-divider ~50% serializer-phase coin-flip). The
+ * single highest-value cold-start fix candidate (ideation rank-1 fix). 0 = legacy. */
+static bool serdes_clkgate_rstb;
+module_param(serdes_clkgate_rstb, bool, 0644);
+MODULE_PARM_DESC(serdes_clkgate_rstb, "1=clock-gated (STOP_CLK) SerDes reset-B release, un-gate last (cold-start metastability fix candidate); 0=legacy free-running");
 /* sc_ldo_init: stock runs an LDO-init step (early in boot) that we OMIT — an
  * SC-indirect RMW of the DRAM-rail LDO byte 0xfdca (clear bits 2,3) + THERMAL_CTRL_0
  * (swcore 0x130)=0x00ec0005 (arm on-die over-temp ALARM comparator). Assessment:
@@ -5374,6 +5395,28 @@ static int __init rtl9602c_gpon_init(void)
 		rtl960x_c2_sds_cfgrst = serdes_sds_cfgrst;	/* A/B: SDS reset = stock bit0-only (default) vs legacy bit7+bit0 */
 		rtl960x_c2_stock_analog = serdes_stock_analog;	/* A/B: match live-stock SDS REG01/REG11 post-reset (default) */
 		rtl960x_c2_analog_postreset = serdes_analog_postreset;	/* A/B: program full analog CMU/CDR table AFTER the SDS reset (stock rev-A, default) = cold-start determinism */
+		rtl960x_c2_cmu_settle_ms = serdes_cmu_settle_ms;	/* A/B: TX-CMU-lock settle before reset-B (cold-start metastability candidate) */
+		rtl960x_c2_clkgate_rstb = serdes_clkgate_rstb;	/* A/B: clock-gated reset-B release (rank-1 cold-start fix candidate) */
+		if (force_soc_clk) {
+			/* Match the live-stock (100%-deterministic) SoC sysctl/clock regs that our
+			 * FAIL boot differed from, BEFORE the SerDes CMU locks. Same physical board,
+			 * so these are Board C's own stock values. */
+			static const struct { u32 off, val; } soc_clk[] = {
+				{ 0x18000100u, 0x00440e00u },
+				{ 0x1800012cu, 0x024d024du },
+				{ 0x18000140u, 0x024d024du },
+			};
+			unsigned int k;
+			for (k = 0; k < ARRAY_SIZE(soc_clk); k++) {
+				void __iomem *a = ioremap(soc_clk[k].off, 4);
+				if (a) {
+					writel(soc_clk[k].val, a);
+					pr_info("rtl9602c-gpon: force_soc_clk [%#x]<=%#x ->%#x\n",
+						soc_clk[k].off, soc_clk[k].val, readl(a));
+					iounmap(a);
+				}
+			}
+		}
 		if (family_lib) {
 			/* bring up via the clean-room family lib (the open-source path) */
 			sret = rtl960x_ponmac_mode_set(RTL960X_CHIP_9602C, RTL960X_REV_A,
