@@ -1500,6 +1500,24 @@ static const struct r960_op c2_sds_txresync[] = {
 	DLY(10),
 };
 
+/* A/B knob (gpon.serdes_minimal_analog): skip the golden-table writes that the stock rev-A
+ * GPON bring-up does NOT do (verified against stock) — the 3 DUPLICATE GPON
+ * per-rate banks and the 4 FIB-bank bodies (~134 of ~145 writes). Stock leaves these at HW
+ * state; they are redundant and lengthen the bring-up with ~134 extra bus transactions before
+ * the CMU/serializer phase latches. The active GPON bank (0x22708) + the FIB PDOWN-clear are
+ * kept. Cold-start determinism fix candidate (makes the bring-up timing stock-minimal). */
+int rtl960x_c2_minimal_analog;
+
+/* True for the SerDes offsets our golden table writes but the stock rev-A bring-up never does. */
+static bool c2_off_overconfig(u32 off)
+{
+	u32 a = off & 0xffffu;
+	return (a >= 0x2608 && a <= 0x265c) ||	/* duplicate GPON per-rate bank 1 */
+	       (a >= 0x2688 && a <= 0x26dc) ||	/* duplicate GPON per-rate bank 2 */
+	       (a >= 0x2788 && a <= 0x27dc) ||	/* duplicate GPON per-rate bank 3 */
+	       (a >= 0x2c00 && a <= 0x2df8);	/* the 4 FIB-bank bodies            */
+}
+
 /* Program the full analog CMU/CDR golden table + clear fiber power-down on every
  * FIB bank. Factored so it can run either BEFORE the SDS reset (legacy) or AFTER it
  * (stock rev-A, the cold-start determinism fix) per rtl960x_c2_analog_postreset. */
@@ -1507,8 +1525,11 @@ static void c2_program_analog(const struct rtl960x_ops *o)
 {
 	unsigned int i;
 
-	for (i = 0; i < ARRAY_SIZE(c2_analog); i++)
+	for (i = 0; i < ARRAY_SIZE(c2_analog); i++) {
+		if (rtl960x_c2_minimal_analog && c2_off_overconfig(c2_analog[i].off))
+			continue;	/* stock rev-A never writes these (over-configure) */
 		o->wr(c2_analog[i].off, c2_analog[i].val);
+	}
 	for (i = 0; i < ARRAY_SIZE(c2_fib_reg0_banks); i++)
 		o->wr(c2_fib_reg0_banks[i],
 		      o->rd(c2_fib_reg0_banks[i]) & ~C2_FIB_REG0_PDOWN);

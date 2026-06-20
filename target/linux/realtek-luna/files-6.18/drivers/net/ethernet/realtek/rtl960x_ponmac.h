@@ -87,4 +87,5 @@ extern int rtl960x_c2_analog_postreset;
 extern int rtl960x_c2_cmu_settle_ms;
 extern int rtl960x_c2_clkgate_rstb;
 extern int rtl960x_c2_skip_rstb_dance;
+extern int rtl960x_c2_minimal_analog;
 #endif /* _RTL960X_PONMAC_H */

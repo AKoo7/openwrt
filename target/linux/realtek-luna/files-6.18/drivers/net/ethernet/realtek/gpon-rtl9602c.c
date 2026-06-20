@@ -742,6 +742,15 @@ MODULE_PARM_DESC(serdes_clkgate_rstb, "1=clock-gated (STOP_CLK) SerDes reset-B r
 static bool serdes_skip_rstb_dance;
 module_param(serdes_skip_rstb_dance, bool, 0644);
 MODULE_PARM_DESC(serdes_skip_rstb_dance, "1=skip the c2_sds_rstb DIG_1D reset-B dance (already-released; gratuitous phase-latching pulse); 0=legacy dance");
+/* serdes_minimal_analog: our golden analog table does ~145 SerDes writes; the stock rev-A GPON
+ * bring-up does only ~23 — it never writes the 3 duplicate GPON per-rate banks
+ * (0x22608/0x22688/0x22788) nor the 4 FIB-bank bodies (0x22c00-0x22df8), ~134 redundant writes that
+ * lengthen the bring-up before the CMU/serializer phase latches. =1 skips those over-configure writes
+ * to match stock's minimal write-set (keeps the active GPON bank + FIB PDOWN-clear). Cold-start
+ * determinism fix candidate (timing/transaction-count); final O5 config unchanged (HW defaults). */
+static bool serdes_minimal_analog;
+module_param(serdes_minimal_analog, bool, 0644);
+MODULE_PARM_DESC(serdes_minimal_analog, "1=skip the golden-table writes stock omits (dup GPON banks + FIB bodies, ~134 writes) to match stock's minimal SerDes bring-up; 0=full golden table");
 /* bosa_before_serdes: CROSS-SUBSYSTEM ORDER fix candidate (cold-start ~50% determinism).
  * Stock stages the external RTL8290B BOSA analog (I2C calib + reset + a BOSA-ready settle
  * via europa's ready_check) BEFORE bringing up the SoC SerDes/CMU (ponmac mode_set). OUR
@@ -5632,6 +5641,7 @@ static int __init rtl9602c_gpon_init(void)
 		rtl960x_c2_cmu_settle_ms = serdes_cmu_settle_ms;	/* A/B: TX-CMU-lock settle before reset-B (cold-start metastability candidate) */
 		rtl960x_c2_clkgate_rstb = serdes_clkgate_rstb;	/* A/B: clock-gated reset-B release (rank-1 cold-start fix candidate) */
 		rtl960x_c2_skip_rstb_dance = serdes_skip_rstb_dance;	/* A/B: skip the gratuitous DIG_1D reset-B pulse (already released) */
+		rtl960x_c2_minimal_analog = serdes_minimal_analog;	/* A/B: skip the over-configure golden-table writes (match stock's minimal set) */
 		if (force_soc_clk) {
 			/* Match the live-stock (100%-deterministic) SoC sysctl/clock regs that our
 			 * FAIL boot differed from, BEFORE the SerDes CMU locks. Same physical board,
