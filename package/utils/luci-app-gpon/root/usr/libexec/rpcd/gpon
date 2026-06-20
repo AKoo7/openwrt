@@ -30,8 +30,15 @@ call)
 		json_add_int     onu_state      "${st:-0}"
 		json_add_string  onu_state_name "${name:-unknown}"
 		[ "${st:-0}" = "5" ] && json_add_boolean online 1 || json_add_boolean online 0
-		json_add_string  optic_rx_dbm   "$(raw_to_dbm "$rxr")"
-		json_add_string  optic_tx_dbm   "$(raw_to_dbm "$txr")"
+		# No fiber light (LOS) -> there is no valid optical power to report;
+		# show "n/a" rather than a stale last-good dBm reading.
+		if [ "${los:-0}" = "1" ]; then
+			json_add_string optic_rx_dbm "n/a"
+			json_add_string optic_tx_dbm "n/a"
+		else
+			json_add_string optic_rx_dbm "$(raw_to_dbm "$rxr")"
+			json_add_string optic_tx_dbm "$(raw_to_dbm "$txr")"
+		fi
 		json_add_boolean los            "${los:-0}"
 		json_dump
 		;;

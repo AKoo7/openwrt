@@ -509,6 +509,17 @@ MODULE_PARM_DESC(o5_ploam_keepalive_ticks, "emit No_message US-PLOAM every N 10m
 static uint o5_provision_watchdog_ticks;	/* default 0 = off (proven ineffective, see above) */
 module_param(o5_provision_watchdog_ticks, uint, 0644);
 MODULE_PARM_DESC(o5_provision_watchdog_ticks, "re-range if at O5 this many ticks with gpon0 RX=0 (0=off default; PROVEN INEFFECTIVE: re-range does not re-roll the cold-start serializer lock)");
+/* los_rerange_ticks: autonomous downstream-LOS recovery (fiber-pull / DS-light loss).
+ * When the downstream optical signal is lost the OLT cannot send a Deactivate (no DS
+ * light), so the ONU must notice the sustained LOS itself, tear down to O1, and re-
+ * acquire when light returns. Without this the FSM sits stale at O5 after a fiber pull
+ * and never re-ranges on reconnect (OLT LED stays dark). Fires after optic_los has been
+ * asserted this many consecutive ~10ms ticks (debounces transient dips / I2C pad-steal
+ * blips). 0 = off. Requires bosa_i2c_restore_pad so optic_los is live. */
+static uint los_rerange_ticks = 50;		/* ~500ms sustained LOS */
+module_param(los_rerange_ticks, uint, 0644);
+MODULE_PARM_DESC(los_rerange_ticks, "drop to O1 + re-range after downstream optical-LOS persists this many ~10ms ticks (fiber-pull recovery; 0=off, default 50)");
+static u32 gpon_los_run;			/* consecutive optic_los=1 tick count */
 
 /* last DS PLOAM type drained this cycle, surfaced on the periodic O5 line */
 static u8 gpon_last_ds_type;
@@ -531,7 +542,7 @@ module_param(laser_bias, uint, 0644);
 module_param(laser_mod, uint, 0644);
 MODULE_PARM_DESC(laser_bias, "BOSA bias DAC hi-8 (0x236) override; 0=keep A4-golden 0x19");
 MODULE_PARM_DESC(laser_mod, "BOSA mod DAC hi-8 (0x237) override for stronger burst peak; 0=keep golden 0x67");
-/* rev-A ModeV1 US-TX SerDes CMU/PLL + TX-LA-LDO writes (part of the stock rev-A GPON
+/* rev-A bring-up US-TX SerDes CMU/PLL + TX-LA-LDO writes (part of the stock rev-A GPON
  * mode-set analog config) that our gpon_serdes_init OMITS: SDS_ANA_COM_REG02/03/08 = the
  * TX CMU/PLL that clocks the US serializer, COM_REG24=0x8001 = REG_TXLA_LDOEN (TX limiting-amp
  * LDO/output stage). Without them the laser is DC-biased but the MAC's US data is not cleanly
@@ -542,7 +553,7 @@ static unsigned int serdes_modev1_tx;	/* default 0: TESTED (COM_REG02/03/08/24/2
 					 * degraded DS (CMU shared) -> the omitted ModeV1 TX SerDes regs are NOT the
 					 * gap; reverted to off. Param kept for reference. */
 module_param(serdes_modev1_tx, uint, 0444);
-MODULE_PARM_DESC(serdes_modev1_tx, "1=apply the rev-A ModeV1 US-TX SerDes CMU/PLL + TXLA_LDOEN writes (no effect)");
+MODULE_PARM_DESC(serdes_modev1_tx, "1=apply the rev-A bring-up US-TX SerDes CMU/PLL + TXLA_LDOEN writes (no effect)");
 
 /* serdes_tx_xtra: 0 (default) = ORACLE-PARITY — do NOT set the 3 SerDes-TX serializer-path bits
  * (0x220a8[5:4], 0x2281c[14], 0x22a30[8]) that the LIVE stock-ref ONU leaves clear (it ranges +
@@ -687,7 +698,25 @@ MODULE_PARM_DESC(serdes_txpll_relock, "1=re-lock TX CMU PLL (toggle CMU enable +
  * =1 re-enables the live read (for development of the glitch-free path). */
 static bool optical_poll;
 module_param(optical_poll, bool, 0644);
-MODULE_PARM_DESC(optical_poll, "1=periodic ANI-G DDM optical poll (default); 0=off (static snapshot)");
+MODULE_PARM_DESC(optical_poll, "1=periodic ANI-G DDM optical poll; 0=off default (the live /proc read + LuCI refresh already show current dBm without periodic BOSA I2C, which historically churned the OLT)");
+/* bosa_i2c_restore_pad: optional cleanup — return bus-0's SoC pad to the optical-SD
+ * function (SOC_IO_MODE_EN[13]=0) after each BOSA I2C transaction. DEFAULT OFF: the
+ * baseline leaves it at 1 and optic_los still reports LOS correctly (operator-confirmed
+ * on a real fiber pull), so this is NOT needed for LOS detection and is kept off to
+ * avoid perturbing the cold-start datapath. =1 only if a masked optic_los is ever
+ * observed. */
+static bool bosa_i2c_restore_pad;
+module_param(bosa_i2c_restore_pad, bool, 0644);
+MODULE_PARM_DESC(bosa_i2c_restore_pad, "restore SOC_IO_MODE_EN[13]=0 (optical-SD pad) after each BOSA I2C transaction (default 0; optic_los works without it)");
+/* lan_keep_open: LAN management must be reachable INDEPENDENT of the WAN/GPON state —
+ * it must NEVER be gated on O5. A bad cold-start (no O5) or a WAN/fiber disconnect
+ * (LOS -> re-range) must NOT kill LAN control of the ONU. When set (default), the
+ * switch VLAN_FILTER is never asserted for LAN-gating: LAN is open from boot and
+ * stays open through ranging / re-range / LOS. 0 = legacy (filter on during config,
+ * cleared at stable O5, re-armed on every drop below O5). */
+static bool lan_keep_open = true;
+module_param(lan_keep_open, bool, 0644);
+MODULE_PARM_DESC(lan_keep_open, "keep LAN open from boot independent of GPON/WAN state (default 1); 0=legacy O5-gated");
 /* force_soc_clk: before the SerDes bring-up, write the 3 SoC sysctl/clock registers
  * (0x18000100/12c/140) to the live-STOCK (100%-deterministic) values that OUR FAIL boot
  * was found to differ from (stock 0x00440e00/0x024d024d/0x024d024d vs ours 0x00440f00/
@@ -703,6 +732,32 @@ MODULE_PARM_DESC(force_soc_clk, "1=write live-stock SoC clock regs 0x18000100/12
 static bool serdes_clkgate_rstb;
 module_param(serdes_clkgate_rstb, bool, 0644);
 MODULE_PARM_DESC(serdes_clkgate_rstb, "1=clock-gated (STOP_CLK) SerDes reset-B release, un-gate last (cold-start metastability fix candidate); 0=legacy free-running");
+/* serdes_skip_rstb_dance: Live debug confirmed WSDS_DIG_1D is ALREADY 0x1c000 (interface reset-B
+ * released) at mode_set entry AND that the SDS reset (CMD_SDS_RST_PS bit0) does NOT clear it — so
+ * the c2_sds_rstb dance (assert DIG_1D[15/16]->0 then release ->1) is a GRATUITOUS TX/RX reset-B
+ * 1->0->1 PULSE on an already-running serializer = the textbook async-reset-on-running-divider that
+ * latches a metastable word-phase (cold-start ~50%). Stock rev-A bring-up NEVER pulses it. =1 skips
+ * the whole dance (DIG_00=0xf30 + the DIG_1D toggles) — DIG_1D/DIG_00 are already at their
+ * operational values, so no edge is issued. Cold-start determinism fix candidate; A/B vs the dance. */
+static bool serdes_skip_rstb_dance;
+module_param(serdes_skip_rstb_dance, bool, 0644);
+MODULE_PARM_DESC(serdes_skip_rstb_dance, "1=skip the c2_sds_rstb DIG_1D reset-B dance (already-released; gratuitous phase-latching pulse); 0=legacy dance");
+/* bosa_before_serdes: CROSS-SUBSYSTEM ORDER fix candidate (cold-start ~50% determinism).
+ * Stock stages the external RTL8290B BOSA analog (I2C calib + reset + a BOSA-ready settle
+ * via europa's ready_check) BEFORE bringing up the SoC SerDes/CMU (ponmac mode_set). OUR
+ * probe inverts this: it runs the SerDes mode_set (CMU lock + the RX_EN 0->1 start edge)
+ * FIRST, with the BOSA RX still powered-down, then calls bosa_rx_enable AFTER. A SerDes CMU/
+ * CDR that locks against an un-settled BOSA analog/shared-reference is a clean ~50% metastable
+ * lock. =1 moves bosa_probe()+bosa_rx_enable()+a settle to BEFORE the SerDes bring-up (stock
+ * order); the later duplicate calls are skipped. A/B vs the legacy SerDes-first order. */
+static bool bosa_before_serdes;
+module_param(bosa_before_serdes, bool, 0644);
+MODULE_PARM_DESC(bosa_before_serdes, "1=power+settle the BOSA RX before the SerDes bring-up (stock order); 0=legacy SerDes-first");
+/* bosa_settle_ms: settle delay after bosa_rx_enable when bosa_before_serdes=1, emulating
+ * stock europa's ~21ms post-reset + ready_check analog-settle before the SerDes CMU locks. */
+static uint bosa_settle_ms = 50;
+module_param(bosa_settle_ms, uint, 0644);
+MODULE_PARM_DESC(bosa_settle_ms, "ms to settle the BOSA analog before the SerDes bring-up when bosa_before_serdes=1 (default 50)");
 /* sc_ldo_init: stock runs an LDO-init step (early in boot) that we OMIT — an
  * SC-indirect RMW of the DRAM-rail LDO byte 0xfdca (clear bits 2,3) + THERMAL_CTRL_0
  * (swcore 0x130)=0x00ec0005 (arm on-die over-temp ALARM comparator). Assessment:
@@ -955,7 +1010,7 @@ static u8 bosa_slave_for(u16 reg)
 static int bosa_i2c_read8(u8 slave, u8 reg)
 {
 	u32 cfg;
-	int i;
+	int i, ret = -ETIMEDOUT;
 
 	/* Route I2C bus 0 to its pads (IO_MODE_EN.I2C_EN[14:13], bit13 = bus0). */
 	sw_field(SOC_IO_MODE_EN, 13, 13, 1);
@@ -977,13 +1032,18 @@ static int bosa_i2c_read8(u8 slave, u8 reg)
 		u32 cmd = sw_rd(I2C_IND_CMD);
 
 		if (!(cmd & I2C_CMD_BUSY)) {
-			if (cmd & I2C_CMD_NACK)
-				return -EIO;
-			return sw_rd(I2C_IND_RD) & 0xff;
+			ret = (cmd & I2C_CMD_NACK) ? -EIO :
+				(int)(sw_rd(I2C_IND_RD) & 0xff);
+			break;
 		}
 		udelay(10);
 	}
-	return -ETIMEDOUT;
+
+	/* Reconnect the shared optical-SD pad so optic_los stays live (see
+	 * bosa_i2c_restore_pad). */
+	if (bosa_i2c_restore_pad)
+		sw_field(SOC_IO_MODE_EN, 13, 13, 0);
+	return ret;
 }
 
 /*
@@ -1134,7 +1194,7 @@ static void gpon_optical_work_fn(struct work_struct *w)
 static int bosa_i2c_write8(u8 slave, u8 reg, u8 val)
 {
 	u32 cfg;
-	int i;
+	int i, ret = -ETIMEDOUT;
 
 	sw_field(SOC_IO_MODE_EN, 13, 13, 1);
 
@@ -1153,11 +1213,18 @@ static int bosa_i2c_write8(u8 slave, u8 reg, u8 val)
 	for (i = 0; i < I2C_BUSY_POLL_MAX; i++) {
 		u32 cmd = sw_rd(I2C_IND_CMD);
 
-		if (!(cmd & I2C_CMD_BUSY))
-			return (cmd & I2C_CMD_NACK) ? -EIO : 0;
+		if (!(cmd & I2C_CMD_BUSY)) {
+			ret = (cmd & I2C_CMD_NACK) ? -EIO : 0;
+			break;
+		}
 		udelay(10);
 	}
-	return -ETIMEDOUT;
+
+	/* Reconnect the shared optical-SD pad so optic_los stays live (see
+	 * bosa_i2c_restore_pad). */
+	if (bosa_i2c_restore_pad)
+		sw_field(SOC_IO_MODE_EN, 13, 13, 0);
+	return ret;
 }
 
 static int bosa_write_reg(u16 reg, u8 val)
@@ -2304,7 +2371,7 @@ static int gpon_serdes_init(void)	/* not __init: re-run on re-range from gpon_cd
 	/*
 	 * 6b. TX DATA PATH — route the digital US-framer data into the analog TX
 	 * serializer AND set the TX-data sample-clock edges, *** BEFORE *** switching
-	 * CFG_SDS_MODE to GPON. CRITICAL ORDERING for the rev-A ModeV1 SerDes: program
+	 * CFG_SDS_MODE to GPON. CRITICAL ORDERING for the rev-A bring-up SerDes: program
 	 * the D2A interconnect (WSDS_DIG_1E) and the SP_CFG_NEG_CLKWR_A2D /
 	 * SEP_CFG_NEG_CLKRD_D2A sample clocks before CFG_SDS_MODE=GPON, so the
 	 * serializer latches the *connected* data-path mux + clocks at mode-entry. The
@@ -2478,7 +2545,7 @@ static int __init gpon_serdes_init_stock(void)
 		      sw_rd(fib_reg0_banks[i]) & ~FIB_REG0_PDOWN);	/* fiber on */
 
 	/* ======================================================================
-	 * stock step 6: the inlined rev-A ModeV1 analog config.
+	 * stock step 6: the inlined rev-A bring-up analog config.
 	 * ==================================================================== */
 
 	/* --- ### TX ### PON TX CMU/PLL + TX-LA-LDO --- */
@@ -2703,8 +2770,11 @@ void rtl9602c_full_sdk_datapath_init(void)
 			for (port = 0; port <= 3; port++)
 				sw_field(0x13004, port, port, 1);	/* VLAN_INGRESS  */
 			/* VLAN_FILTER ON for ranging/config (reliable onlining); the FSM auto-clears
-			 * it once stably at O5 to open LAN access (see vlan_lan_open in gpon_fsm_poll). */
-			sw_field(0x13008, 0, 0, 1);		/* VLAN_FILTER on (config phase) */
+			 * it once stably at O5 to open LAN access (see vlan_lan_open in gpon_fsm_poll).
+			 * lan_keep_open (default) keeps LAN open from boot -> never assert the filter,
+			 * so a bad cold-start (no O5) or a WAN-disconnect can't kill LAN management. */
+			if (!lan_keep_open)
+				sw_field(0x13008, 0, 0, 1);	/* VLAN_FILTER on (config phase) */
 			sw_field(0x13008, 4, 4, 0);
 		}
 	}
@@ -4750,6 +4820,8 @@ static void gpon_fsm_set_state(u8 st)
 		return;
 	if (gpon_fsm_state != st)
 		pr_info("rtl9602c-gpon: ONU state O%u -> O%u\n", gpon_fsm_state, st);
+	if (prev != st)
+		gpon_los_run = 0;	/* fresh LOS debounce window on every transition */
 	gpon_fsm_state = st;
 
 	/* Hybrid LAN/VLAN bookkeeping: mark O5 entry; on any drop below O5, re-arm VLAN
@@ -4777,11 +4849,13 @@ static void gpon_fsm_set_state(u8 st)
 		}
 	} else if (st < 5 && prev >= 5) {
 		gpon_o5_entry_tick = 0;
-		if (gpon_vlan_lan_open) {
+		if (gpon_vlan_lan_open && !lan_keep_open) {
 			sw_field(0x13008, 0, 0, 1);	/* re-assert VLAN_FILTER for re-config */
 			gpon_vlan_lan_open = false;
 			pr_info("rtl9602c-gpon: re-range -> VLAN_FILTER re-armed (config phase)\n");
 		}
+		/* lan_keep_open (default): leave VLAN_FILTER cleared so LAN management
+		 * survives the WAN-down/re-range; the OLT re-config on resume tolerates it. */
 	}
 	/* The HW ONU_STATE field uses the same 1-based encoding as our state numbers:
 	 * UNKNOWN=0, O1=1, O2=2, O3=3, O4=4, O5=5. So O3 (Serial-Number, where the
@@ -5223,6 +5297,39 @@ static void gpon_fsm_poll(struct timer_list *t)
 		gpon_fsm_set_state(1);
 	}
 
+	/* Autonomous downstream-LOS recovery (fiber-pull / DS-light loss). The OLT cannot
+	 * send a Deactivate when downstream light is gone, so the ONU must notice the
+	 * sustained optical-LOS itself, tear down to O1 (mirroring the Deactivate->O1 re-
+	 * range, incl. the CDR/reset-B re-seat), and re-acquire when light returns. Without
+	 * this the FSM sits stale at O5 after a fiber pull and never re-ranges on reconnect.
+	 * Debounced (los_rerange_ticks consecutive asserts) against transient dips. Once at
+	 * O1 the state<2 guard stops counting until the FSM climbs back past O1 on relight. */
+	if (los_rerange_ticks && gpon_fsm_state >= 2) {
+		if (gpon_rd(GPON_GTC_DS_LOS_CFG_STS) & GPON_OPTIC_LOS_SIG) {
+			if (++gpon_los_run == los_rerange_ticks) {
+				pr_info("rtl9602c-gpon: downstream LOS %u ticks -> O1 (re-range on light return)\n",
+					gpon_los_run);
+				gpon_fsm_onu_id = 0xff;
+				gpon_omcc_installed = false;
+				gpon_tcont_installed = false;
+				gpon_data_installed = false;
+				gpon_aes_switch_time = 0xffffffff;
+				gpon_key_staged = false;
+				gpon_field(GPON_GTC_DS_ONU_STATUS, 15, 8, 0xff);
+				gpon_field(GPON_GTC_US_ONU_ID, 15, 8, 0xff);
+				if (cdr_reseat_on_reactivate) {
+					sw_field(WSDS_DIG_1D, 16, 16, 0);
+					udelay(500);
+					sw_field(WSDS_DIG_1D, 16, 16, 1);
+					schedule_work(&gpon_cdr_reset_work);
+				}
+				gpon_fsm_set_state(1);
+			}
+		} else {
+			gpon_los_run = 0;
+		}
+	}
+
 	/* Hybrid LAN/VLAN: once stably at O5 (config-apply done), clear VLAN_FILTER so the
 	 * LAN ports forward to the CPU (br-lan 192.168.1.1 management access). Re-armed on
 	 * any drop below O5 by gpon_fsm_set_state. */
@@ -5524,6 +5631,7 @@ static int __init rtl9602c_gpon_init(void)
 		rtl960x_c2_analog_postreset = serdes_analog_postreset;	/* A/B: program full analog CMU/CDR table AFTER the SDS reset (stock rev-A, default) = cold-start determinism */
 		rtl960x_c2_cmu_settle_ms = serdes_cmu_settle_ms;	/* A/B: TX-CMU-lock settle before reset-B (cold-start metastability candidate) */
 		rtl960x_c2_clkgate_rstb = serdes_clkgate_rstb;	/* A/B: clock-gated reset-B release (rank-1 cold-start fix candidate) */
+		rtl960x_c2_skip_rstb_dance = serdes_skip_rstb_dance;	/* A/B: skip the gratuitous DIG_1D reset-B pulse (already released) */
 		if (force_soc_clk) {
 			/* Match the live-stock (100%-deterministic) SoC sysctl/clock regs that our
 			 * FAIL boot differed from, BEFORE the SerDes CMU locks. Same physical board,
@@ -5543,6 +5651,20 @@ static int __init rtl9602c_gpon_init(void)
 					iounmap(a);
 				}
 			}
+		}
+		/* CROSS-SUBSYSTEM ORDER (bosa_before_serdes): stage the external BOSA RX
+		 * analog + a settle BEFORE the SoC SerDes CMU/serializer bring-up, matching
+		 * stock (europa/BOSA staged before ponmac mode_set). The SerDes CMU then locks
+		 * against a settled analog front-end instead of a still-powered-down BOSA — a
+		 * cold-start ~50% serializer-phase determinism fix candidate. The duplicate
+		 * bosa_probe()/bosa_rx_enable() below are skipped when this runs. */
+		if (bosa_before_serdes && !skip_bosa) {
+			bosa_probe();
+			bosa_rx_enable();
+			if (bosa_settle_ms)
+				mdelay(bosa_settle_ms);
+			pr_info("rtl9602c-gpon: BOSA RX up + %ums settle BEFORE SerDes (stock order)\n",
+				bosa_settle_ms);
 		}
 		if (family_lib) {
 			/* bring up via the clean-room family lib (the open-source path) */
@@ -5578,7 +5700,8 @@ static int __init rtl9602c_gpon_init(void)
 	 * it over I2C and only then does SDS_FIB_STATUS.SDS_SDET assert. This
 	 * validates the I2C transport before the RX-enable writes are added.
 	 */
-	bosa_probe();
+	if (!bosa_before_serdes)		/* else already probed before the SerDes */
+		bosa_probe();
 
 	/*
 	 * BISECTION: when skip_bosa=1 (warm boot), leave the external BOSA in whatever
@@ -5597,7 +5720,8 @@ static int __init rtl9602c_gpon_init(void)
 	 * what makes the real optical signal-detect assert — run it before the GPON
 	 * MAC reset below so the downstream framer locks on real recovered bits.
 	 */
-	bosa_rx_enable();
+	if (!bosa_before_serdes)		/* else already RX-enabled before the SerDes */
+		bosa_rx_enable();
 
 	/* Power on the BOSA optical transmitter (laser bias/modulation/APC) so the
 	 * ONU can send upstream PLOAM bursts during activation. The APC offset

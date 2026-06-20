@@ -1470,6 +1470,13 @@ int rtl960x_c2_cmu_settle_ms;
  * serializer-phase coin-flip). 0 = legacy free-running release. Cold-start fix candidate. */
 int rtl960x_c2_clkgate_rstb;
 
+/* A/B knob (gpon.serdes_skip_rstb_dance): live debug confirmed WSDS_DIG_1D is ALREADY 0x1c000 (interface
+ * reset-B released) before mode_set and the SDS reset does not clear it. =1 SKIPS the c2_sds_rstb
+ * dance (DIG_00=0xf30 + the DIG_1D[15/16] assert->0/release->1) entirely — issuing it is a gratuitous
+ * TX/RX reset-B 1->0->1 pulse on a running serializer (async-reset-on-running-divider phase latch).
+ * Stock rev-A bring-up never pulses it. Cold-start determinism fix candidate. 0 = legacy dance. */
+int rtl960x_c2_skip_rstb_dance;
+
 /* A/B knob set by the board (gpon.serdes_sds_cfgrst). Default 0 = pulse ONLY
  * CMD_SDS_RST_PS bit0 in the SerDes reset (stock rev-A = the cold-start fix); 1 =
  * also assert CMD_SDS_CFG_RST_PS bit7 (legacy, leaves the extra reset domain
@@ -1554,7 +1561,15 @@ static int rtl9602c_ponmac_mode_set(const struct rtl960x_ops *o,
 	 * HERE — between the ref-force and the reset-B release — not at the end of
 	 * mode_set (by then the phase is already latched). Gated by
 	 * rtl960x_c2_cmu_settle_ms (default 0 = legacy: no extra settle). */
-	if (rtl960x_c2_clkgate_rstb) {
+	if (rtl960x_c2_skip_rstb_dance) {
+		/* SKIP the dance entirely. Observed: DIG_1D is already 0x1c000 (interface
+		 * reset-B released) and DIG_00 already 0xf30 here, and the SDS reset does not
+		 * clear them — so the assert->release would be a gratuitous TX/RX reset-B
+		 * 1->0->1 pulse on a running serializer; the stock rev-A bring-up never pulses
+		 * it. Leave both registers at their already-operational values (no edge). */
+		pr_info("rtl9602c-gpon: skip interface reset-B dance (DIG_1D=0x%x already released)\n",
+			o->rd(C2_WSDS_DIG_1D));
+	} else if (rtl960x_c2_clkgate_rstb) {
 		/* SYNCHRONOUS clock-gated reset-B release (cold-start metastability fix
 		 * candidate). Legacy releases the DIG_1D[14:16] interface reset-B with the
 		 * word-divider clock FREE-RUNNING (STOP_CLK=0 in DIG00_RUN=0xf30) — the
