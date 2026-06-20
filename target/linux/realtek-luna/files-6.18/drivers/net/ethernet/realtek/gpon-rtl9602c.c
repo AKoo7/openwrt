@@ -682,15 +682,17 @@ MODULE_PARM_DESC(serdes_cmu_settle_ms, "ms TX-CMU-lock settle between 125M ref f
  * before the first upstream burst), re-lock the TX CMU PLL by toggling the CMU enable
  * 1->0->1, then re-sync the SerDes word FIFO read/write pointer (WSDS_DIG_1D[14] 0->1).
  * On a fresh power-on under strong downstream light the optical signal-detect can assert
- * before the CMU has settled, latching the TX PLL onto the WRONG clock rate (~50%,
- * un-frameable by the OLT = "Laser out"); re-toggling the CMU enable once the optics are
- * stable forces a clean re-acquire. This is the one bring-up step the clean-room port
- * omitted. DEFAULT 1 = on (cold-start determinism candidate); =0 = skip. */
-/* DEFAULT OFF: the O3-entry CMU re-toggle is an unvalidated cold-start-lock candidate
- * (the active-fiber failure was NOT cold-start, so it's untested); keep it gated. */
-static bool serdes_txpll_relock;
+ * before the CMU has settled, latching the TX PLL onto the WRONG clock rate on ~50% of cold
+ * power-ons, producing an upstream burst the OLT cannot frame ("Laser out") so it deactivates
+ * the ONU. Re-toggling the CMU enable once the optics are stable forces a clean re-acquire.
+ * The TIMING is what matters: doing this at O3 ENTRY, after the downstream framer has locked
+ * (the signal-detect transient is over), makes the lock deterministic; the same re-lock done
+ * earlier during SerDes mode-set does NOT help (it just re-rolls the same metastability).
+ * VALIDATED over repeated cold power-cuts on the RTL9602C: ON = 5/5 upstream-framed, stable-O5
+ * boots; OFF = the ~50% deactivate-on-cold-start failure returns. DEFAULT ON; =0 disables. */
+static bool serdes_txpll_relock = true;
 module_param(serdes_txpll_relock, bool, 0644);
-MODULE_PARM_DESC(serdes_txpll_relock, "1=re-lock TX CMU PLL (toggle CMU enable + FIFO re-sync) at O3 entry before first US burst (cold-start candidate, default off); 0=skip");
+MODULE_PARM_DESC(serdes_txpll_relock, "1=re-lock the TX CMU PLL (toggle CMU enable + FIFO re-sync) at O3 entry before the first US burst — fixes the ~50% cold-start lock-to-wrong-rate (default on); 0=skip");
 /* optical_poll: periodic ANI-G DDM optical read. DEFAULT OFF — the periodic BOSA I2C
  * read (in any context) transiently disturbs the optical path and provokes the OLT
  * op=0xff dealloc/DEACT churn (no WAN); proven by A/B (poll on=churn, off=clean WAN).
