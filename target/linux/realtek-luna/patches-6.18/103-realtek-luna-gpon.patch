@@ -1,15 +1,18 @@
-Subject: [PATCH] realtek-luna: clean-room RTL9602C GPON MAC foundation
-
-Adds the Kconfig/Makefile wiring for the GPON MAC foundation driver
-(drivers/net/ethernet/realtek/gpon-rtl9602c.c, supplied via files-6.18).
-Anchored on the RTL9602C_ETH entries added by 101-realtek-luna-eth.patch.
+Subject: [PATCH] realtek-luna: RTL9602C ETH + GPON MAC Kconfig/Makefile wiring
 
 --- a/drivers/net/ethernet/realtek/Kconfig
 +++ b/drivers/net/ethernet/realtek/Kconfig
-@@ -15,6 +15,14 @@ config RTL9602C_ETH
- 	help
- 	  Clean-room driver for the RTL9602C GMAC + on-chip switch core.
-
+@@ -15,6 +15,21 @@
+ 	  the questions about Realtek devices. If you say Y, you will be asked for
+ 	  your specific card in the following questions.
+ 
++config RTL9602C_ETH
++	tristate "Realtek RTL9602C (Luna) GMAC + switch"
++	depends on REALTEK_LUNA
++	default y
++	help
++	  Clean-room driver for the RTL9602C GMAC + on-chip switch core.
++
 +config RTL9602C_GPON
 +	tristate "Realtek RTL9602C (Luna) GPON MAC"
 +	depends on REALTEK_LUNA
@@ -19,17 +22,16 @@ Anchored on the RTL9602C_ETH entries added by 101-realtek-luna-eth.patch.
 +	  GPON MAC register block (SWCORE + 0x700000) and exposes /proc/gpon.
 +
  if NET_VENDOR_REALTEK
-
- # ... existing drivers ...
+ 
+ config ATP
 --- a/drivers/net/ethernet/realtek/Makefile
 +++ b/drivers/net/ethernet/realtek/Makefile
-@@ -2,6 +2,8 @@
- #
+@@ -3,6 +3,8 @@
  # Makefile for the Realtek network device drivers.
  #
- obj-$(CONFIG_RTL9602C_ETH) += rtl9602c_eth.o
-+obj-$(CONFIG_RTL9602C_GPON) += gpon-rtl9602c.o
-+obj-$(CONFIG_RTL9602C_GPON) += rtl960x_ponmac.o
+ 
++obj-$(CONFIG_RTL9602C_ETH) += rtl9602c_eth.o
++obj-$(CONFIG_RTL9602C_GPON) += gpon-rtl9602c.o rtl960x_ponmac.o
  obj-$(CONFIG_8139CP) += 8139cp.o
  obj-$(CONFIG_8139TOO) += 8139too.o
  obj-$(CONFIG_ATP) += atp.o
