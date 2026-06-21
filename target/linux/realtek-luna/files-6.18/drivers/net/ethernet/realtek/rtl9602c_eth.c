@@ -471,6 +471,19 @@ struct tx_desc { u32 opts1, addr, opts2, opts3, opts4; };
  * 0x4070). The earlier 0x02 (bit1 only) was a misread of a runtime snapshot. */
 #define CPUTAG1_LOW		0x02	/* live-stock ref ONU devmem: CPUTAG1CR = 0x4002 (the earlier 0x4070 derivation was wrong) */
 
+/* The switch L34 (NAPT) offload module is compiled in via this driver's TU to
+ * avoid a separate Kbuild object; it carries its own header include guard. */
+#include "rtl9602c_l34.c"
+
+/* HW NAT (switch L34 offload) gate. Module-param gated (not Kconfig) so it can
+ * be toggled without an OpenWrt kernel-config round-trip. Default off: engine
+ * init is validated datapath-safe (WAN + internet stay 0% loss when enabled),
+ * but per-flow offload is still being built, so the stock path is software
+ * forwarding until rtl9602c_eth.hw_nat=1 is set. */
+static int hw_nat;	/* 0 = off (default); 1 = init the L34 engine */
+module_param(hw_nat, int, 0444);
+MODULE_PARM_DESC(hw_nat, "enable RTL9602C switch L34 hardware NAT offload (0=off)");
+
 struct rtl9602c_eth {
 	void __iomem	*base;
 	void __iomem	*sw;	/* switch core */
@@ -551,6 +564,7 @@ struct rtl9602c_eth {
 	struct timer_list poll_timer;	/* IRQ-driven: 100ms TX-unpark backstop; no IRQ: 2ms pure-poll */
 	struct napi_struct napi;
 	int		irq;	/* GMAC0 INTC input (platform_get_irq); <=0 = pure-poll fallback */
+	struct rtl9602c_l34 l34;	/* switch L3/L4 (NAPT) hardware-offload engine */
 	/* Host uplink port, learned from the RX descriptor src_port_num. All RX
 	 * arrives on the board's single connected LAN port, so this resolves to the
 	 * physical switch port the host is on — we then steer CPU->LAN TX there
@@ -3852,6 +3866,16 @@ static int rtl9602c_eth_probe(struct platform_device *pdev)
 		eth_hw_addr_set(ndev, mac);
 	else
 		eth_hw_addr_random(ndev);
+
+	/* Bring up the switch L3/L4 NAT engine (gated by the hw_nat param). This
+	 * writes switch-core registers, so it is validated for datapath safety
+	 * before any per-flow programming is added. */
+	if (hw_nat) {
+		if (rtl9602c_l34_init(&ep->l34, ep->sw))
+			dev_warn(dev, "L34 hw-nat init failed; software forwarding\n");
+		else
+			dev_info(dev, "L34 hw-nat engine initialised\n");
+	}
 
 	ndev->netdev_ops = &rtl9602c_eth_netdev_ops;
 	netif_carrier_off(ndev);
