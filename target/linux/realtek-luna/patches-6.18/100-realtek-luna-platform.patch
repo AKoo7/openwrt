@@ -12,7 +12,7 @@ Subject: [PATCH] mips: add Realtek Luna GPON ONU (RTL960xC) platform
  platform-$(CONFIG_SGI_IP27)		+= sgi-ip27/
 --- a/arch/mips/Kconfig
 +++ b/arch/mips/Kconfig
-@@ -676,6 +676,20 @@ config MACH_NINTENDO64
+@@ -676,6 +676,28 @@ config MACH_NINTENDO64
  	select DMA_NONCOHERENT
  	select IRQ_MIPS_CPU
 
