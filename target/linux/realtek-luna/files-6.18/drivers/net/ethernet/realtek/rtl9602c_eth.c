@@ -480,7 +480,7 @@ struct tx_desc { u32 opts1, addr, opts2, opts3, opts4; };
  * init is validated datapath-safe (WAN + internet stay 0% loss when enabled),
  * but per-flow offload is still being built, so the stock path is software
  * forwarding until rtl9602c_eth.hw_nat=1 is set. */
-static int hw_nat;	/* 0 = off (default); 1 = init the L34 engine */
+static int hw_nat = 0;	/* default off (gated); engine armed lazily on first offload, never at boot */
 module_param(hw_nat, int, 0444);
 MODULE_PARM_DESC(hw_nat, "enable RTL9602C switch L34 hardware NAT offload (0=off)");
 
@@ -3871,10 +3871,12 @@ static int rtl9602c_eth_probe(struct platform_device *pdev)
 	 * writes switch-core registers, so it is validated for datapath safety
 	 * before any per-flow programming is added. */
 	if (hw_nat) {
-		if (rtl9602c_l34_init(&ep->l34, ep->sw))
+		if (rtl9602c_l34_init(&ep->l34, ep->sw)) {
 			dev_warn(dev, "L34 hw-nat init failed; software forwarding\n");
-		else
+		} else {
 			dev_info(dev, "L34 hw-nat engine initialised\n");
+			rtl9602c_l34_proc_init(&ep->l34);	/* bring-up harness */
+		}
 	}
 
 	ndev->netdev_ops = &rtl9602c_eth_netdev_ops;

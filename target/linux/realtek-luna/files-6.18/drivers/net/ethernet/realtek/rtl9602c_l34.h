@@ -139,8 +139,12 @@ enum l34_tbl {
 #define L34_NETIF_ENRTR_W	1
 #define L34_NETIF_MTU_LSP	65
 #define L34_NETIF_MTU_W		14
+#define L34_NETIF_L34_LSP	82	/* classify this interface into the L34 NAT domain */
+#define L34_NETIF_L34_W		1
 #define L34_NETIF_IP_LSP	83	/* interface IP, spans w2..w3 */
 #define L34_NETIF_IP_W		32
+
+#define L34_EXTIP_SLOTS		8	/* EXTIP/EXTIP_IDX is 3-bit: netif idx must be < 8 */
 #define L34_NETIF_DEF_VLAN	1
 #define L34_NETIF_DEF_MTU	1500
 #define L34_NETIF_DEF_MACMASK	0x7
@@ -162,6 +166,59 @@ enum l34_tbl {
 #define L34_ARP_NHIDX_LSP	33	/* -> L2 unicast entry */
 #define L34_ARP_NHIDX_W		11
 
+/* L3 ROUTE (type 0, 2 words, 16 slots). The per-netif local route (process=ARP)
+ * classifies an ingress frame into the L34 NAT domain and sets US/DS direction;
+ * it is what an offloaded NAPT flow needs in order to match. Slot = netif idx. */
+#define L34_RT_IP_LSP		0
+#define L34_RT_IP_W		32
+#define L34_RT_MASK_LSP		32	/* prefix code 0..31 (0 => /1 anchor) */
+#define L34_RT_MASK_W		5
+#define L34_RT_VALID_LSP	37
+#define L34_RT_VALID_W		1
+#define L34_RT_PROCESS_LSP	38	/* 0=CPU 1=DROP 2=ARP(local) 3=NH(global) */
+#define L34_RT_PROCESS_W	2
+#define L34_RT_INT_LSP		40	/* 1 = LAN, 0 = WAN */
+#define L34_RT_INT_W		1
+#define L34_RT_DENTIF_LSP	41	/* netif index (local-route view of [44:41]) */
+#define L34_RT_DENTIF_W		4
+#define L34_RT_RT2WANINF_LSP	45	/* route to WAN interface */
+#define L34_RT_RT2WANINF_W	1
+#define L34_RT_PROCESS_CPU	0	/* terminate locally (to the CPU) */
+#define L34_RT_PROCESS_ARP	2
+
+/*
+ * L2 unicast table (the gateway/peer destination MAC). Reached through a
+ * SEPARATE indirect block from the L34 NAT block: a MAC-method insert lets the
+ * engine hash the MAC, place it in a free way, and report the assigned index
+ * that NEXTHOP/ARP nhIdx then reference.
+ */
+#define L2_CMD			0x12000
+#define  L2_CMD_TYPE_SH		0	/* [2:0] table type (0 = L2_UC) */
+#define  L2_CMD_WR		BIT(3)	/* 0 = read, 1 = write */
+#define  L2_CMD_METHOD_SH	4	/* [6:4] 0 = MAC-hash, 1 = direct address */
+#define L2_STS			0x12004
+#define  L2_STS_ADDR_MASK	0x3ff	/* [9:0] hardware-assigned entry address */
+#define  L2_STS_CAM		BIT(10)	/* hash(0)/CAM(1): index = (cam << 10) | addr */
+#define  L2_STS_HIT		BIT(12)
+#define  L2_STS_BUSY		BIT(13)
+#define L2_WDATA		0x12008	/* word0..2 @ +4 */
+#define L2_RDATA		0x1201c	/* word0..2 @ +4 */
+#define L34_WORDS_L2UC		3
+#define L2_METHOD_MAC		0
+
+/* L2_UC entry (3 words). The 48-bit MAC is packed octet[0] at the field MSB. */
+#define L2UC_MAC_LSP		0
+#define L2UC_STATIC_LSP		62	/* no-source-learn => static (not aged out) */
+#define L2UC_STATIC_W		1
+#define L2UC_SPA_LSP		65	/* [66:65] egress port */
+#define L2UC_SPA_W		2
+#define L2UC_AGE_LSP		67	/* static forces this non-zero */
+#define L2UC_AGE_W		3
+#define L2UC_ARPUSED_LSP	73
+#define L2UC_ARPUSED_W		1
+#define L2UC_VALID_LSP		77
+#define L2UC_VALID_W		1
+
 /* Per-flow programming request, filled by the flow-offload glue (endian-safe:
  * addresses/ports are kept in host order here and packed with explicit math). */
 struct l34_flow {
@@ -178,13 +235,20 @@ struct l34_flow {
 struct rtl9602c_l34 {
 	void __iomem	*sw;		/* switch-core MMIO base (offsets above are relative) */
 	struct mutex	lock;		/* serialises table ops */
-	bool		ready;
+	bool		ready;		/* table-access plumbing usable */
+	bool		engine_on;	/* NAT engine enabled (deferred, lazy) */
 };
 
 /* Public API (mainline flow-offload glue calls these). */
 int  rtl9602c_l34_init(struct rtl9602c_l34 *l, void __iomem *sw);
+int  rtl9602c_l34_wan_setup(struct rtl9602c_l34 *l, u8 idx, u32 wan_ip,
+			    const u8 *wan_mac, u32 gw_ip, const u8 *gw_mac,
+			    u8 wan_port, u16 vlan);
+int  rtl9602c_l34_lan_setup(struct rtl9602c_l34 *l, u8 idx, u32 lan_ip,
+			    const u8 *lan_mac, u32 lan_net, u8 prefix, u16 vlan);
 int  rtl9602c_l34_flow_add(struct rtl9602c_l34 *l, struct l34_flow *f);
 int  rtl9602c_l34_flow_del(struct rtl9602c_l34 *l, struct l34_flow *f);
 int  rtl9602c_l34_flow_hit(struct rtl9602c_l34 *l, u16 hw_index, bool *active);
+void rtl9602c_l34_proc_init(struct rtl9602c_l34 *l);	/* bring-up test harness */
 
 #endif /* _RTL9602C_L34_H */
