@@ -35,3 +35,9 @@ git-src
 .cproject
 .ccache
 .vscode*
+# AI assistant context / private lab notes — never commit
+CLAUDE.md
+**/CLAUDE.md
+.claude
+.claude/
+**/.claude/
