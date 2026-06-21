@@ -54,8 +54,15 @@
 		interrupt-controller;
 		#interrupt-cells = <1>;
 		interrupt-parent = <&cpuintc>;
-		/* SoC interrupt aggregator feeds CP0 HW IRQ line 2 */
-		interrupts = <2>;
+		/*
+		 * The aggregator routes each input (GIRR nibble = target CP0 HW
+		 * IRQ) onto one of several CP0 lines, not just line 2: the loaded
+		 * routing uses values 2, 3 and 6 (e.g. the SoC timer is on 6).
+		 * Cascade the dispatch on every CP0 line the routing targets so
+		 * those interrupts are delivered (the dispatch scans all GISR
+		 * words regardless of which line woke it).
+		 */
+		interrupts = <2>, <3>, <6>;
 	};
 
 	uart0: serial@18002000 {
@@ -69,16 +76,17 @@
 		status = "okay";
 	};
 
-	timer@18003100 {
+	timer@18003200 {
 		/*
 		 * SoC "rlx timer" channel TC0 (CP0 Count is unreliable on this
-		 * core, so this drives the system tick). Base observed on the
-		 * RTL9602C unit at 0x18003100; the RTL9607C documents the TC
-		 * block at 0x18003200 — if the tick never fires on first boot,
-		 * try 0x18003200 here.
+		 * core, so this drives the system tick). The TC register block is
+		 * at 0x18003200 (TC0 DATA/CNT/CTL/INT at +0x00/+0x04/+0x08/+0x0c);
+		 * 0x18003100 is a different block whose +0x00 happens to be
+		 * writable, which is why the earlier base accepted the reload
+		 * write yet the control/interrupt writes never stuck.
 		 */
 		compatible = "realtek,rtl9602c-timer";
-		reg = <0x18003100 0x10>;
+		reg = <0x18003200 0x20>;
 		clocks = <&lx_clk>;
 		interrupt-parent = <&intc>;
 		interrupts = <43>;
