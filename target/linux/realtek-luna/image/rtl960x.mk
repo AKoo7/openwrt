@@ -17,7 +17,8 @@ define Device/hsgq_x111w
   #   firewall4(+nft)   - lan/wan zones, lan->wan forward + masquerade (NAT)
   #   odhcpd-ipv6only   - LAN IPv6 RA/DHCPv6 server (distributes the WAN PD)
   #   odhcp6c           - WAN DHCPv6 client (PD request toward the OLT)
+  #   ppp ppp-mod-pppoe - PPPoE WAN client (alternative WAN proto to IPoE/DHCP)
   DEVICE_PACKAGES := gpon-provision luci-app-gpon luci-base luci-mod-admin-full luci-theme-bootstrap uhttpd uhttpd-mod-ubus rpcd rpcd-mod-file \
-	dnsmasq firewall4 odhcpd-ipv6only odhcp6c
+	dnsmasq firewall4 odhcpd-ipv6only odhcp6c ppp ppp-mod-pppoe
 endef
 TARGET_DEVICES += hsgq_x111w
