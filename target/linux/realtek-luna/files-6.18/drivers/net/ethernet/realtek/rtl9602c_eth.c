@@ -2235,6 +2235,12 @@ static void rtl9602c_eth_omci_input(struct rtl9602c_eth *ep, const u8 *msg,
 			    class_id, (msg[6] << 8) | msg[7], msg[2], blen, msg + 8);
 	}
 
+	/* Tell the gpon driver the OLT has created the WAN GEM-port-network-CTP (ME268):
+	 * it installs OUR data GEM only after this, idempotently over the OLT's gem, never
+	 * proactively (proactive install churn-locked the OLT on a 2nd+ admit). */
+	if (class_id == 268 && mt == OMCI_MT_CREATE)
+		gpon_omci_note_gem_create();
+
 	if (devid != 0x0a)		/* only baseline modelled */
 		return;
 

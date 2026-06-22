@@ -71,6 +71,8 @@ void rtl9602c_full_sdk_datapath_init(void);
  * handler once the OMCC is up. Defined in gpon-rtl9602c.c. Returns 0 on success,
  * -EAGAIN if the OMCC isn't installed yet. */
 int gpon_install_data_gem(void);
+/* eth OMCI RX -> gpon: the OLT issued the GEM-CTP (ME268) Create; gate the data-GEM install on it. */
+void gpon_omci_note_gem_create(void);
 
 /* Emit an OMCI Attribute-Value-Change reporting the HGU WAN-egress (VEIP ME329) operational,
  * so the OLT un-gates downstream user-data forwarding. The OLT never polls the data MEs after

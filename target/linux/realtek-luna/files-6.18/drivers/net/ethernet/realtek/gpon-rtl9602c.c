@@ -923,6 +923,12 @@ static u32 gpon_ds_rx;		/* total downstream PLOAMs drained (DS-lock liveness) */
 static bool gpon_omcc_installed;	/* OMCC GEM datapath installed (one-shot, on Configure_Port-ID) */
 static bool gpon_tcont_installed;	/* OMCC T-CONT/alloc-id bound (one-shot, on Assign_Alloc-ID) */
 static bool gpon_data_installed;	/* WAN data GEM (193) datapath installed (one-shot, on OMCI GEM-CTP create) */
+static bool gpon_data_gem_solicited;	/* OLT has sent the OMCI GEM-CTP (ME268) Create -> only THEN install
+					 * our data GEM, idempotently OVER the OLT's gem. Installing it
+					 * proactively at PLOAM config (before the OLT's ME268) made the OLT
+					 * unable to reconcile our gem on a 2nd+ admit and churn-lock (op=0xff
+					 * reclaim->DEACT). Stock waits for the OLT's create. Cleared on Deactivate
+					 * so each re-admit waits for the OLT's fresh ME268. Set from the eth OMCI rx. */
 static bool gpon_data_tcont_installed;	/* the OLT's DATA Alloc-ID bound to the DATA T-CONT (8) */
 static u16 gpon_omcc_alloc;		/* the OMCC's (first) Alloc-ID, on T-CONT 16 */
 static u16 gpon_data_alloc;		/* the OLT's data Alloc-ID, on T-CONT 8 */
@@ -4560,6 +4566,16 @@ static int gpon_install_omcc(u16 gem)
  *       with tx_dst_stream_id=flow1; SID2QID[flow1]=qid64 routes them to T-CONT 16's grants.
  * One-shot (gpon_data_installed); re-armed on Deactivate. Requires the OMCC up first.
  */
+
+/* Called from the eth OMCI RX when the OLT issues the GEM-port-network-CTP (ME268)
+ * Create -- the cue that the OLT now expects (and holds its own view of) the data
+ * GEM. The FSM poll installs ours only AFTER this, so we never push it proactively
+ * ahead of the OLT (the 2nd-admit churn cause). Set-only; cleared on Deactivate. */
+void gpon_omci_note_gem_create(void)
+{
+	gpon_data_gem_solicited = true;
+}
+
 int gpon_install_data_gem(void)
 {
 	int i;
@@ -5175,6 +5191,7 @@ static void gpon_fsm_handle(const u8 *m)
 			gpon_omcc_installed = false;
 			gpon_tcont_installed = false;
 			gpon_data_installed = false;	/* re-install WAN data GEM on re-config */
+			gpon_data_gem_solicited = false;	/* re-wait for the OLT's fresh ME268 before re-installing */
 			gpon_aes_switch_time = 0xffffffff;	/* re-arm 0x13 on next activation */
 			gpon_key_staged = false;
 			gpon_field(GPON_GTC_DS_ONU_STATUS, 15, 8, 0xff);
@@ -5236,12 +5253,12 @@ static void gpon_fsm_handle(const u8 *m)
 					gpon_omcc_installed = true;
 			}
 			gpon_send_ack(m);
-			/* Install the WAN data GEM NOW (config phase), not ~30s later while
-			 * Online: a US-NIC modeset while Online glitches the burst -> "Laser
-			 * out". Doing it here keeps the modeset in the tolerated config window
-			 * (one-shot; gem-ids hardcoded so it needs no OMCI ME268 yet). */
-			if (data_gem_en && gpon_omcc_installed && !gpon_data_installed)
-				gpon_install_data_gem();
+			/* The WAN data-GEM install is now driven from the FSM poll, gated on the
+			 * OLT's OMCI ME268 (GEM-CTP) Create (gpon_data_gem_solicited) -- installing it
+			 * here at PLOAM config (before the OLT created its own gem) made the OLT unable
+			 * to reconcile our gem on a 2nd+ admit and churn-lock (op=0xff reclaim->DEACT).
+			 * The ME268 still arrives inside the tolerated config window, clear of the
+			 * Online "Laser out" modeset glitch. */
 			if (trace)
 				pr_info_ratelimited("rtl9602c-gpon: ACK type=0x%02x d=%*phN\n",
 						    type, 8, d);
@@ -5444,6 +5461,14 @@ static void gpon_fsm_poll(struct timer_list *t)
 	 * polls the data MEs it creates; it un-gates DOWNSTREAM user-data forwarding only when the
 	 * ONU reports the port up. Send a few times; re-armed on each O5 entry. OMCI TX on the
 	 * established OMCC (not a modeset), so it does not disturb the US burst. */
+	/* Install the WAN data GEM once the OLT has issued its ME268 (GEM-CTP) Create --
+	 * idempotently over the OLT's gem, never proactively ahead of it (the 2nd-admit
+	 * churn cause). Driven from the poll (process/timer context) so the US-NIC modeset
+	 * stays off the OMCI-RX softirq; the ME268 arrives in the tolerated config window. */
+	if (gpon_fsm_state == 5 && data_gem_en && gpon_omcc_installed &&
+	    gpon_data_gem_solicited && !gpon_data_installed)
+		gpon_install_data_gem();
+
 	if (gpon_fsm_state == 5 && gpon_omcc_installed && gpon_avc_sent < 3 &&
 	    gpon_o5_entry_tick && (gpon_fsm_ticks - gpon_o5_entry_tick) > 2500 &&
 	    ((gpon_fsm_ticks - gpon_o5_entry_tick) % 150) == 0) {
