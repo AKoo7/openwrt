@@ -306,11 +306,11 @@
 #define LED_LINKACT		0xf78u
 #define LED_TYPE_UTP0		0x01u		/* switch port 0 = FE 100M */
 #define LED_TYPE_UTP1		0x02u		/* switch port 1 = GE 1G   */
-/* Confirmed by cable test: a cable in the FE port lit the panel GE LED -> the
- * GE-labelled LED is controller index 1, driven from the GE port (UTP1) below.
- * The FE panel LED is also a switch-LED index (it lights when force-driven) but
- * its exact controller index is not yet pinned down, so it is left unconfigured. */
+/* Controller index -> physical panel LED, confirmed by cable test: the
+ * GE-labelled LED is index 1 (driven from the GE port, UTP1) and the FE-labelled
+ * LED is index 15 (driven from the FE port, UTP0). */
 #define GE_LED_IDX		1u
+#define FE_LED_IDX		15u
 
 /*
  * SoC GPIO controller (its own register page at phys 0x18003300, outside the
@@ -1042,14 +1042,15 @@ static void gpon_led_init(void)
 	gpon_led_pon_val = LED_FORCE_OFF;
 	gpon_led_los_val = LED_FORCE_OFF;
 
-	/* GE Ethernet port-link LED, hardware-auto: the switch lights it directly
-	 * from the GE port's (switch port 1, UTP1) link + activity, no CPU. The FE
-	 * panel LED is also a switch-LED-controller index but its exact index is not
-	 * yet pinned down, so it is left unconfigured here (a follow-up). */
+	/* Ethernet port-link LEDs, hardware-auto: the switch lights each from its
+	 * OWN port's link + activity, no CPU. FE = index 15 (switch port0, UTP0),
+	 * GE = index 1 (switch port1, UTP1) -- both confirmed by cable test, so an
+	 * FE-plug lights only FE and a GE-plug lights only GE. */
+	gpon_led_port(FE_LED_IDX, LED_TYPE_UTP0);
 	gpon_led_port(GE_LED_IDX, LED_TYPE_UTP1);
 
-	pr_info("rtl9602c-gpon: panel LEDs init (PON idx%u / LOS idx%u force-mode; GE idx%u link-auto)\n",
-		PON_LED_IDX, LOS_LED_IDX, GE_LED_IDX);
+	pr_info("rtl9602c-gpon: panel LEDs init (PON idx%u / LOS idx%u force-mode; FE idx%u / GE idx%u link-auto)\n",
+		PON_LED_IDX, LOS_LED_IDX, FE_LED_IDX, GE_LED_IDX);
 }
 
 
