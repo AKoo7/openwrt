@@ -350,6 +350,11 @@ bool rtl92fe_rx_query_desc(struct ieee80211_hw *hw,
 	status->isampdu = (bool)(get_rx_desc_paggr(pdesc) == 1);
 	status->timestamp_low = get_rx_desc_tsfl(pdesc);
 	status->is_cck = RTL92FE_RX_HAL_IS_CCK_RATE(status->rate);
+	/* Tag HT (MCS) frames so the RX rate maps to an HT MCS index instead of
+	 * collapsing to legacy rate_idx 0. Without this, mac80211/iwinfo report the
+	 * station RX rate as 0 Mbit/s and the width as 0 MHz (an empty rate_info).
+	 * The AP runs HT20, so the 20 MHz width is correct once the rate is set. */
+	status->is_ht = IS_HT_RATE(status->rate);
 
 	status->macid = get_rx_desc_macid(pdesc);
 	if (get_rx_status_desc_pattern_match(pdesc))
