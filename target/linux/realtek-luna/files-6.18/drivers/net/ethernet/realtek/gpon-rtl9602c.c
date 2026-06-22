@@ -521,9 +521,9 @@ MODULE_PARM_DESC(o5_rearm_burst_gate, "re-apply US burst-gate cluster + No_messa
  * (10ms each) while at O5 with an assigned ONU-ID, so a valid PLOAM is present in the OLT's
  * granted slots regardless of how the shared US-PLOAM buffer was last written, defeating the
  * OLT's PLOAM/ack-liveness timeout. 0 = disabled. Default 100 (~1s). */
-static uint o5_ploam_keepalive_ticks = 100;
+static uint o5_ploam_keepalive_ticks;	/* default OFF (match stock: zero unsolicited US-PLOAM at O5) */
 module_param(o5_ploam_keepalive_ticks, uint, 0644);
-MODULE_PARM_DESC(o5_ploam_keepalive_ticks, "emit No_message US-PLOAM every N 10ms ticks at O5 (0=off, default 100)");
+MODULE_PARM_DESC(o5_ploam_keepalive_ticks, "emit No_message US-PLOAM every N 10ms ticks at O5 (0=off, default 0 -- stock emits no unsolicited US-PLOAM at O5)");
 
 /* o5_provision_watchdog_ticks: a "Laser out" boot reaches O5 LOCALLY but the OLT
  * cannot frame our US burst (the TX-serializer lock PHASE is non-deterministic per
@@ -554,9 +554,12 @@ MODULE_PARM_DESC(o5_provision_watchdog_ticks, "re-range if at O5 this many ticks
  * and never re-ranges on reconnect (OLT LED stays dark). Fires after optic_los has been
  * asserted this many consecutive ~10ms ticks (debounces transient dips / I2C pad-steal
  * blips). 0 = off. Requires bosa_i2c_restore_pad so optic_los is live. */
-static uint los_rerange_ticks = 50;		/* ~500ms sustained LOS */
+static uint los_rerange_ticks = 500;		/* ~5s sustained LOS: ride transient dips / I2C
+						 * pad-steal / healthy-but-slow without a hard re-range
+						 * (stock holds O6+TO2 and pops back to O5; a longer
+						 * debounce approximates that without an O6 state) */
 module_param(los_rerange_ticks, uint, 0644);
-MODULE_PARM_DESC(los_rerange_ticks, "drop to O1 + re-range after downstream optical-LOS persists this many ~10ms ticks (fiber-pull recovery; 0=off, default 50)");
+MODULE_PARM_DESC(los_rerange_ticks, "drop to O1 + re-range after downstream optical-LOS persists this many ~10ms ticks (fiber-pull recovery; 0=off, default 500 ~5s -- debounced so transient dips do not force a churn-feeding re-range)");
 static u32 gpon_los_run;			/* consecutive optic_los=1 tick count */
 
 /* last DS PLOAM type drained this cycle, surfaced on the periodic O5 line */
@@ -934,7 +937,7 @@ static u16 gpon_data_alloc;		/* the OLT's data Alloc-ID, on T-CONT 8 */
  * gpon.data_tcont=1 enables the per-data-alloc T-CONT 8 bind for multi-alloc OLTs. */
 static bool data_tcont;		/* default off: single-alloc OLT (this lab) -> data rides T-CONT 16 */
 module_param(data_tcont, bool, 0644);
-MODULE_PARM_DESC(data_tcont, "bind the OLT data Alloc-ID to its own T-CONT 8 + route data US to qid 32 (default on, the WAN-stability fix)");
+MODULE_PARM_DESC(data_tcont, "bind the OLT data Alloc-ID to its own T-CONT 8 (default OFF -- single-alloc OLT like this lab rides data on T-CONT 16; =1 ONLY for multi-alloc OLTs: on a single-alloc OLT =1 routes data to a grant-less T-CONT 8 and PROVOKES the op=0xFF reclaim -> deact churn)");
 
 static inline u32 gpon_rd(u32 off) { return ioread32(gpon_base + off); }
 static inline void gpon_wr(u32 off, u32 v) { iowrite32(v, gpon_base + off); }
@@ -3927,17 +3930,33 @@ static int gpon_proc_show(struct seq_file *s, void *v)
 			   !!(r30 & BIT(7)), !!(r30 & BIT(3)), !!(r30 & BIT(2)),
 			   r33 & 0xff, r32 & 0xff, fault & 0xff);
 	}
-	/* Fiber optical power for the LuCI overview: the RTL8290B MCU publishes
-	 * finished SFF-8472 DDM power words on its A2/DDM page (slave 0x51 = the
-	 * 0x1xx bank), so no per-board calibration is needed. RX @0x68/0x69, TX
-	 * @0x66/0x67, unit 0.1 microWatt/LSB. Emit the raw u16; userspace converts
-	 * dBm = 10*log10(raw/10000) (no in-kernel log10/FPU). 0x0000/0xffff = n/a. */
+	/* Fiber optical power. The words at 0x166-0x169 (slave 0x51) are NOT live on
+	 * this BOSA: the driver's own init image programmed them and the MCU does not
+	 * refresh them from the ADC, so they never move with the optic -> a frozen UI.
+	 * Read the LIVE sigma-delta RSSI ADC on the page-3 bank (slave 0x55) instead --
+	 * proven reachable (the bosa_tx block above reads 0x31e/0x320/0x321 live every
+	 * call). optic_dbg dumps the candidate live-ADC bytes so the exact RX word can
+	 * be confirmed against a known attenuation before the dBm scale is calibrated.
+	 * Emit the raw u16; userspace converts. 0x0000/0xffff = n/a. */
 	{
-		int rxw = bosa_read16_median(0x168);
+		/* RX optical power: the live RSSI ADC byte at 0x311 (slave 0x55) tracks the
+		 * optic -- bench-confirmed against the 5 dB attenuator: code 0x3a @ ~-26.5 dBm
+		 * (attenuator in) -> 0x8c @ ~-5.8 dBm (attenuator out). The 0x30e/0x30f word is
+		 * a constant/cycling mux channel, NOT RX. 2-point linear-in-dB fit, integer/no
+		 * FPU: centi-dBm = code*2513/100 - 4100 (refine vs the rtl8290b.data table). */
+		int rxc = bosa_read_reg(0x311) & 0xff;
+		int rx_cdbm = (rxc * 2513) / 100 - 4100;
 		int txw = bosa_read16_median(0x166);
 
-		seq_printf(s, "optic_rx_raw: 0x%04x optic_tx_raw: 0x%04x\n",
-			   rxw & 0xffff, txw & 0xffff);
+		seq_printf(s, "optic_rx_raw: 0x%02x optic_rx_cdbm: %d optic_tx_raw: 0x%04x\n",
+			   rxc, rx_cdbm, txw & 0xffff);
+		seq_printf(s, "optic_dbg: 30c=%02x 30d=%02x 30e=%02x 30f=%02x 310=%02x 311=%02x 312=%02x | 166=%02x 167=%02x 168=%02x 169=%02x\n",
+			   bosa_read_reg(0x30c) & 0xff, bosa_read_reg(0x30d) & 0xff,
+			   bosa_read_reg(0x30e) & 0xff, bosa_read_reg(0x30f) & 0xff,
+			   bosa_read_reg(0x310) & 0xff, bosa_read_reg(0x311) & 0xff,
+			   bosa_read_reg(0x312) & 0xff, bosa_read_reg(0x166) & 0xff,
+			   bosa_read_reg(0x167) & 0xff, bosa_read_reg(0x168) & 0xff,
+			   bosa_read_reg(0x169) & 0xff);
 		/* ANI-G ME263 #10/#14 cached levels (OMCI 0.002 dB, 2's-comp) reported to
 		 * the OLT — refreshed from the DDM words on the FSM tick. */
 		seq_printf(s, "anig_rx_level: 0x%04x anig_tx_level: 0x%04x\n",
@@ -5160,7 +5179,16 @@ static void gpon_fsm_handle(const u8 *m)
 			gpon_key_staged = false;
 			gpon_field(GPON_GTC_DS_ONU_STATUS, 15, 8, 0xff);
 			gpon_field(GPON_GTC_US_ONU_ID, 15, 8, 0xff);
-			if (cdr_reseat_on_reactivate) {
+			/* Re-seat the serializer ONLY when the prior O5 was SHORT/marginal (a real
+			 * US-burst-quality fault). A healthy, long-provisioned O5 that the OLT
+			 * deactivated is NOT a serializer fault -- re-rolling it there (as happens
+			 * on every churn-loop deact) only manufactures a fresh re-range the OLT must
+			 * re-admit, feeding the HG08 churn-lock. Stock re-acquires gently and never
+			 * re-rolls the 9602C CDR on a deactivate. ~500 ticks (~5s) of held O5 marks a
+			 * healthy provision (the captured loop held O5 ~103s before the deact). */
+			if (cdr_reseat_on_reactivate &&
+			    !(gpon_fsm_state == 5 && gpon_o5_entry_tick &&
+			      (gpon_fsm_ticks - gpon_o5_entry_tick) > 500)) {
 				/* re-seat US-TX SerDes interface reset-B (softirq-safe, TX-only; the
 				 * locked DS RX framer is undisturbed) so the next re-range starts from a
 				 * fresh serializer lock instead of the prior marginal one (cuts flapping). */
@@ -5172,6 +5200,9 @@ static void gpon_fsm_handle(const u8 *m)
 				 * here in softirq. The interface reset-B re-strobe above does not re-lock
 				 * the serializer CDR; this does. */
 				schedule_work(&gpon_cdr_reset_work);
+			} else if (cdr_reseat_on_reactivate) {
+				pr_info("rtl9602c-gpon: deact after healthy O5 (%u ticks) -> skip serializer re-roll (match stock)\n",
+					gpon_o5_entry_tick ? gpon_fsm_ticks - gpon_o5_entry_tick : 0);
 			}
 			gpon_fsm_set_state(1);
 		}
@@ -5252,6 +5283,16 @@ static void gpon_fsm_handle(const u8 *m)
 							alloc, GPON_DATA_TCONT, GPON_DATA_PHYS_QID);
 					}
 				}
+			} else if (d[2] == 0xff && gpon_tcont_installed &&
+				   alloc == gpon_omcc_alloc) {
+				/* OLT revoked the OMCC/active alloc (this single-alloc OLT reuses one
+				 * Alloc-ID for OMCC + data). Don't fall through to a bare ack and loop a
+				 * full re-range: clear the bind so the next op=0x1 for this alloc re-binds
+				 * T-CONT 16 cleanly (idempotent CAM) and re-arm the operational report.
+				 * Self-heal in place -- never a reboot. */
+				gpon_tcont_installed = false;
+				gpon_avc_sent = 0;
+				pr_info("rtl9602c-gpon: OMCC alloc 0x%x revoked -> re-bind on next allocate\n", alloc);
 			} else if (d[2] == 0xff && data_tcont &&
 				   gpon_data_tcont_installed && alloc == gpon_data_alloc) {
 				/* OLT deallocated the data Alloc-ID: allow a clean re-bind on the next
