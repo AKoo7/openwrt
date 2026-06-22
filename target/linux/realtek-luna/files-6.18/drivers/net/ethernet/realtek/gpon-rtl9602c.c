@@ -549,18 +549,21 @@ module_param(o5_provision_watchdog_ticks, uint, 0644);
 MODULE_PARM_DESC(o5_provision_watchdog_ticks, "re-range if at O5 this many ticks with gpon0 RX=0 (0=off default; PROVEN INEFFECTIVE: re-range does not re-roll the cold-start serializer lock)");
 /* los_rerange_ticks: autonomous downstream-LOS recovery (fiber-pull / DS-light loss).
  * When the downstream optical signal is lost the OLT cannot send a Deactivate (no DS
- * light), so the ONU must notice the sustained LOS itself, tear down to O1, and re-
- * acquire when light returns. Without this the FSM sits stale at O5 after a fiber pull
- * and never re-ranges on reconnect (OLT LED stays dark). Fires after optic_los has been
- * asserted this many consecutive ~10ms ticks (debounces transient dips / I2C pad-steal
- * blips). 0 = off. Requires bosa_i2c_restore_pad so optic_los is live. */
-static uint los_rerange_ticks = 500;		/* ~5s sustained LOS: ride transient dips / I2C
-						 * pad-steal / healthy-but-slow without a hard re-range
-						 * (stock holds O6+TO2 and pops back to O5; a longer
-						 * debounce approximates that without an O6 state) */
+ * light), so the ONU must notice the LOS itself, tear down to O1, and re-acquire when
+ * light returns. Without this the FSM sits stale at O5 after a fiber pull and never re-
+ * ranges on reconnect (the OLT marks us "Laser out" / its LED stays dark). Stock detects
+ * LOS via the HW LOS/LOF alarm essentially immediately and exits O5->O6->(TO2 100ms)->O1;
+ * to match that speed without adding a non-stock O6 state we use a SHORT debounce, but
+ * reject I2C pad-steal dips by ALSO requiring the SoC SerDes signal-detect
+ * (SDS_FIB_STATUS.SDS_SDET) to be gone -- a pad-steal perturbs optic_los alone, a real
+ * fiber pull drops both. 0 = off. */
+static uint los_rerange_ticks = 30;		/* ~300ms of (optic_los & !sds_sdet): catches a real
+						 * 2-4s fiber pull, ~3x stock's 100ms TO2; a sub-second
+						 * pad-steal can neither reach it nor (lacking
+						 * !sds_sdet) be counted at all */
 module_param(los_rerange_ticks, uint, 0644);
-MODULE_PARM_DESC(los_rerange_ticks, "drop to O1 + re-range after downstream optical-LOS persists this many ~10ms ticks (fiber-pull recovery; 0=off, default 500 ~5s -- debounced so transient dips do not force a churn-feeding re-range)");
-static u32 gpon_los_run;			/* consecutive optic_los=1 tick count */
+MODULE_PARM_DESC(los_rerange_ticks, "drop to O1 + re-range after a REAL downstream LOS (optic_los AND no SerDes sig-detect) persists this many ~10ms ticks (fiber-pull recovery; 0=off, default 30 ~300ms ~= stock TO2)");
+static u32 gpon_los_run;			/* consecutive real-LOS (optic_los & !sds_sdet) tick count */
 
 /* last DS PLOAM type drained this cycle, surfaced on the periodic O5 line */
 static u8 gpon_last_ds_type;
@@ -5514,14 +5517,23 @@ static void gpon_fsm_poll(struct timer_list *t)
 	 * Debounced (los_rerange_ticks consecutive asserts) against transient dips. Once at
 	 * O1 the state<2 guard stops counting until the FSM climbs back past O1 on relight. */
 	if (los_rerange_ticks && gpon_fsm_state >= 2) {
-		if (gpon_rd(GPON_GTC_DS_LOS_CFG_STS) & GPON_OPTIC_LOS_SIG) {
+		bool optic_los = !!(gpon_rd(GPON_GTC_DS_LOS_CFG_STS) & GPON_OPTIC_LOS_SIG);
+		bool sds_dark  = !(sw_rd(SDS_FIB_STATUS) & SDS_FIB_SDS_SDET);
+
+		/* Real DS-light loss = the GTC optical-LOS AND the SoC SerDes signal-detect both
+		 * gone. An I2C pad-steal perturbs optic_los alone (sds_sdet stays 1); an internal
+		 * SerDes re-seat can blip sds_sdet alone (optic_los stays 0); only a true fiber
+		 * pull drops BOTH. Requiring the AND lets the debounce be short (stock-fast)
+		 * without false-tripping on either transient. */
+		if (optic_los && sds_dark) {
 			if (++gpon_los_run == los_rerange_ticks) {
-				pr_info("rtl9602c-gpon: downstream LOS %u ticks -> O1 (re-range on light return)\n",
+				pr_info("rtl9602c-gpon: downstream LOS %u ticks (optic_los & !sds_sdet) -> O1 (re-range on light return)\n",
 					gpon_los_run);
 				gpon_fsm_onu_id = 0xff;
 				gpon_omcc_installed = false;
 				gpon_tcont_installed = false;
 				gpon_data_installed = false;
+				gpon_data_gem_solicited = false;	/* re-wait for the OLT's fresh ME268 on re-admit */
 				gpon_aes_switch_time = 0xffffffff;
 				gpon_key_staged = false;
 				gpon_field(GPON_GTC_DS_ONU_STATUS, 15, 8, 0xff);
