@@ -5473,11 +5473,28 @@ static void gpon_fsm_poll(struct timer_list *t)
 		}
 	}
 
-	/* Hybrid LAN/VLAN: once stably at O5 (config-apply done), clear VLAN_FILTER so the
-	 * LAN ports forward to the CPU (br-lan 192.168.1.1 management access). Re-armed on
-	 * any drop below O5 by gpon_fsm_set_state. */
-	if (gpon_fsm_state == 5 && !gpon_vlan_lan_open && vlan_lan_o5_ticks &&
-	    gpon_o5_entry_tick && (gpon_fsm_ticks - gpon_o5_entry_tick) > vlan_lan_o5_ticks) {
+	/* Hybrid LAN/VLAN: clear VLAN_FILTER (0x13008 bit0) so the LAN ports forward to the
+	 * CPU (br-lan 192.168.1.1 management access). This silicon does not forward
+	 * LAN-port<->CPU-port traffic while the ingress VLAN filter is on, so the host's ARP
+	 * round-trip dies until it is cleared.
+	 *
+	 * lan_keep_open (default): the LAN must be reachable from boot, independent of the
+	 * GPON FSM state. The switch eth-init and config-apply force the filter ON, and
+	 * rtl9602c_eth_open() runs at userspace ifup -- LATER than this poll first runs -- so
+	 * it can re-assert the filter after a one-shot clear. The O5-held gate (legacy branch)
+	 * only clears it at O5, never at O1 / gpon_hold / churn. So clear it on EVERY poll:
+	 * the write is idempotent, costs one MMIO, and undoes any late eth_open re-assert
+	 * within a single tick -> the LAN stays reachable in every state. */
+	if (lan_keep_open) {
+		sw_field(0x13008, 0, 0, 0);		/* VLAN_FILTER off -> LAN open, every state */
+		if (!gpon_vlan_lan_open) {
+			gpon_vlan_lan_open = true;
+			pr_info("rtl9602c-gpon: lan_keep_open -> VLAN_FILTER off (LAN access open)\n");
+		}
+	} else if (gpon_fsm_state == 5 && !gpon_vlan_lan_open && vlan_lan_o5_ticks &&
+		   gpon_o5_entry_tick && (gpon_fsm_ticks - gpon_o5_entry_tick) > vlan_lan_o5_ticks) {
+		/* legacy O5-gated: keep filtering on through ranging/config-apply, then clear
+		 * once the ONU has held O5 for vlan_lan_o5_ticks. Re-armed on any drop below O5. */
 		sw_field(0x13008, 0, 0, 0);		/* VLAN_FILTER off -> open LAN */
 		gpon_vlan_lan_open = true;
 		pr_info("rtl9602c-gpon: O5 stable %u ticks -> VLAN_FILTER off (LAN access open)\n",
