@@ -275,6 +275,44 @@
 #define SOC_IO_GPIO_EN_W1	0x00000819u	/* enable GPIO 32,35,36,43     */
 
 /*
+ * Front-panel LED controller (SWCORE window). Each panel LED has an index whose
+ * 2-bit "force value" the CPU can drive directly — 0=off, 1=on, 2=blink — once
+ * the index is placed in CPU force-mode and enabled for parallel (vs serial-
+ * shift) output. A working unit lights the green PON LED solid once ranged to
+ * the OLT and lights the red LOS LED only while downstream light is absent.
+ * Board X111W wires PON-status to index 12 and LOS to index 13. Offsets are
+ * into swcore_base (phys 0x1b000000).
+ */
+#define LED_MODE_SEL		0x1e000		/* [0] 0 = parallel output      */
+#define LED_DATA_CFG(idx)	(0x1e004 + (idx) * 4)	/* [12] CPU force-mode  */
+#define   LED_CPU_FORCE_BIT	12
+#define LED_FORCE_VALUE		0x1e04c		/* [idx*2+1:idx*2] force value  */
+#define LED_BLINK_RATE		0x1e050		/* [14:12] force blink period   */
+#define LED_PARA_EN		0x1e05c		/* [n+1] LEDn parallel-enable    */
+#define   LED_SERI_DATA_EN_BIT	19
+#define   LED_SERI_CLK_EN_BIT	18
+#define LED_IO_EN		0x23014		/* [n] LEDn pad-output enable    */
+#define   LED_SERI_OUT_EN_BIT	17
+#define LED_FORCE_OFF		0u
+#define LED_FORCE_ON		1u
+#define LED_FORCE_BLINK		2u
+#define LED_BLINK_512MS		4u		/* [14:12] period code           */
+#define PON_LED_IDX		12u
+#define LOS_LED_IDX		13u
+/* Ethernet port-link LEDs: hardware-auto (the switch lights them straight from
+ * port link + activity, no CPU). 0xf78 = link at every speed (bits 8..11) +
+ * activity at every speed (bits 3..6). The switch port map is port0=FE(100M),
+ * port1=GE(1G), so each LED is typed to its own port. */
+#define LED_LINKACT		0xf78u
+#define LED_TYPE_UTP0		0x01u		/* switch port 0 = FE 100M */
+#define LED_TYPE_UTP1		0x02u		/* switch port 1 = GE 1G   */
+/* Confirmed by cable test: a cable in the FE port lit the panel GE LED -> the
+ * GE-labelled LED is controller index 1, driven from the GE port (UTP1) below.
+ * The FE panel LED is also a switch-LED index (it lights when force-driven) but
+ * its exact controller index is not yet pinned down, so it is left unconfigured. */
+#define GE_LED_IDX		1u
+
+/*
  * SoC GPIO controller (its own register page at phys 0x18003300, outside the
  * switch-core window). The optical signal-detect is wired to a board GPIO; a
  * working (O5) unit enables a specific set of pins here with GPIO 21 as an
@@ -924,6 +962,96 @@ static void pi_field(u32 off, unsigned int msb, unsigned int lsb, u32 val)
 
 	pi_wr(off, (pi_rd(off) & ~mask) | ((val << lsb) & mask));
 }
+
+/*
+ * Front-panel PON/LOS LEDs. The stock unit lights the green PON LED once it
+ * ranges to the OLT and the red LOS LED only while downstream light is lost;
+ * OpenWrt shipped no LED support, so without this the panel sits in its power-
+ * on state (LOS stuck on, PON dark). Driven entirely from the activation FSM.
+ */
+static bool gpon_leds = true;
+module_param(gpon_leds, bool, 0644);
+MODULE_PARM_DESC(gpon_leds, "drive the front-panel PON/LOS LEDs from GPON state (default on)");
+
+static u32 gpon_led_pon_val = ~0u;	/* last value written (forces first update) */
+static u32 gpon_led_los_val = ~0u;
+
+/* Drive one LED index's 2-bit parallel force value (0=off 1=on 2=blink). */
+static void gpon_led_force(unsigned int idx, u32 val)
+{
+	sw_field(LED_FORCE_VALUE, idx * 2 + 1, idx * 2, val);
+}
+
+/* Claim one index for CPU-forced parallel output (parallel + pad + force-mode). */
+static void gpon_led_claim(unsigned int idx)
+{
+	sw_field(LED_PARA_EN, idx + 1, idx + 1, 1);		/* parallel-enable   */
+	sw_field(LED_IO_EN, idx, idx, 1);			/* pad-output enable */
+	sw_field(LED_DATA_CFG(idx), LED_CPU_FORCE_BIT, LED_CPU_FORCE_BIT, 1);
+}
+
+/* Configure one LED index as a hardware-auto port-link/activity LED: the switch
+ * lights it directly from the port's link state + traffic, no CPU involvement,
+ * so plug/unplug is reflected with zero software. CPU_FORCE_MOD stays 0. */
+static void gpon_led_port(unsigned int idx, u32 type)
+{
+	sw_wr(LED_DATA_CFG(idx), (type << 16) | LED_LINKACT);
+	sw_field(LED_PARA_EN, idx + 1, idx + 1, 1);		/* parallel-enable   */
+	sw_field(LED_IO_EN, idx, idx, 1);			/* pad-output enable */
+}
+
+/* Green PON LED: solid when operational (O5), blinking while ranging (O2..O4),
+ * off when down (O1/unknown). */
+static void gpon_led_pon_set(u8 st)
+{
+	u32 v = (st >= 5) ? LED_FORCE_ON : (st >= 2) ? LED_FORCE_BLINK : LED_FORCE_OFF;
+
+	if (!gpon_leds || v == gpon_led_pon_val)
+		return;
+	gpon_led_force(PON_LED_IDX, v);
+	gpon_led_pon_val = v;
+}
+
+/* Red LOS LED: on only while the downstream optical signal is lost. */
+static void gpon_led_los_set(bool los)
+{
+	u32 v = los ? LED_FORCE_ON : LED_FORCE_OFF;
+
+	if (!gpon_leds || v == gpon_led_los_val)
+		return;
+	gpon_led_force(LOS_LED_IDX, v);
+	gpon_led_los_val = v;
+}
+
+/* Put the controller in parallel mode and claim the PON/LOS indices. Only the
+ * two indices we own are touched, so any other panel LED keeps its power-on
+ * configuration. */
+static void gpon_led_init(void)
+{
+	if (!gpon_leds)
+		return;
+	sw_field(LED_PARA_EN, LED_SERI_DATA_EN_BIT, LED_SERI_DATA_EN_BIT, 0);
+	sw_field(LED_PARA_EN, LED_SERI_CLK_EN_BIT, LED_SERI_CLK_EN_BIT, 0);
+	sw_field(LED_IO_EN, LED_SERI_OUT_EN_BIT, LED_SERI_OUT_EN_BIT, 0);
+	sw_field(LED_MODE_SEL, 0, 0, 0);			/* parallel output   */
+	sw_field(LED_BLINK_RATE, 14, 12, LED_BLINK_512MS);
+	gpon_led_claim(PON_LED_IDX);
+	gpon_led_claim(LOS_LED_IDX);
+	gpon_led_force(PON_LED_IDX, LED_FORCE_OFF);
+	gpon_led_force(LOS_LED_IDX, LED_FORCE_OFF);
+	gpon_led_pon_val = LED_FORCE_OFF;
+	gpon_led_los_val = LED_FORCE_OFF;
+
+	/* GE Ethernet port-link LED, hardware-auto: the switch lights it directly
+	 * from the GE port's (switch port 1, UTP1) link + activity, no CPU. The FE
+	 * panel LED is also a switch-LED-controller index but its exact index is not
+	 * yet pinned down, so it is left unconfigured here (a follow-up). */
+	gpon_led_port(GE_LED_IDX, LED_TYPE_UTP1);
+
+	pr_info("rtl9602c-gpon: panel LEDs init (PON idx%u / LOS idx%u force-mode; GE idx%u link-auto)\n",
+		PON_LED_IDX, LOS_LED_IDX, GE_LED_IDX);
+}
+
 
 /* Read-modify-write the bit-field [msb:lsb] of the GPON-block register at off. */
 static void gpon_field(u32 off, unsigned int msb, unsigned int lsb, u32 val)
@@ -4873,6 +5001,8 @@ static void gpon_fsm_set_state(u8 st)
 	 * GTC's auto-SN-burst transmitter is gated) = register value 3 = our st.
 	 * Write st. */
 	gpon_field(GPON_GTC_DS_ONU_STATUS, 3, 0, st);
+
+	gpon_led_pon_set(st);
 }
 
 /*
@@ -5232,6 +5362,7 @@ static void gpon_fsm_poll(struct timer_list *t)
 	int guard = 0;
 
 	gpon_fsm_ticks++;
+	gpon_led_los_set((gpon_rd(GPON_GTC_DS_LOS_CFG_STS) & GPON_OPTIC_LOS_SIG) != 0);
 	/* SN was (re)provisioned after ranging began (the driver started with the
 	 * placeholder SN, which the OLT auto-ranges as a phantom that never matches
 	 * the provisioned ONU). Drop to O1 and re-offer the new Serial_Number. */
@@ -5625,6 +5756,8 @@ static int __init rtl9602c_gpon_init(void)
 	}
 	pr_info("rtl9602c-gpon: GPIO pads set (gpio_en0=0x%08x gpio_en1=0x%08x)\n",
 		sw_rd(SOC_IO_GPIO_EN), sw_rd(SOC_IO_GPIO_EN + 4));
+
+	gpon_led_init();
 
 	/*
 	 * Bring up the PON SerDes so the MAC core gets its clock, then confirm the
