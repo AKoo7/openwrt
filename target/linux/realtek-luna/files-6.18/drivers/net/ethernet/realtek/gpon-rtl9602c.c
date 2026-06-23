@@ -933,7 +933,18 @@ static bool gpon_data_gem_solicited;	/* OLT has sent the OMCI GEM-CTP (ME268) Cr
 					 * reclaim->DEACT). Stock waits for the OLT's create. Cleared on Deactivate
 					 * so each re-admit waits for the OLT's fresh ME268. Set from the eth OMCI rx. */
 static bool gpon_data_tcont_installed;	/* the OLT's DATA Alloc-ID bound to the DATA T-CONT (8) */
-static u16 gpon_omcc_alloc;		/* the OMCC's (first) Alloc-ID, on T-CONT 16 */
+static u16 gpon_omcc_alloc = 0x100;	/* OMCC Alloc-ID = 0x100 (live stock value).
+		 * The HSGQ-G008 OLT grants alloc 0x100 for T-CONT 1 (its lineprofile's
+		 * first T-CONT), NOT alloc 0 (the G.984.3 default). Binding T-CONT 16
+		 * to alloc 0x100 makes bwm_acpt>0 (grants accepted). With alloc 0,
+		 * bwm_acpt=0 (no grants) → no US GEM → "Laser out".
+		 *
+		 * NOTE: the OLT's lineprofile uses "tcont 1" so it grants alloc 0x100
+		 * on T-CONT 1. We bind this alloc to T-CONT 16 (our OMCC T-CONT) so
+		 * the OMCC rides the OLT's T-CONT 1 grants. */
+#define GPON_OMCC_TCONT_ALT	1	/* Alternative T-CONT for alloc 0x100 (OLT's tcont 1) */
+module_param(gpon_omcc_alloc, ushort, 0644);
+MODULE_PARM_DESC(gpon_omcc_alloc, "OMCC Alloc-ID override (0=auto, 1=ONU-ID+1 for OLTs that grant T-CONT 1 not 0)");
 static u16 gpon_data_alloc;		/* the OLT's data Alloc-ID, on T-CONT 8 */
 /* data_tcont: bind the OLT's separate DATA Alloc-ID to its OWN data T-CONT 8 (and route the
  * data GEM US to GPON_DATA_PHYS_QID 32) instead of riding the OMCC T-CONT 16's grants. The OLT's
@@ -2808,7 +2819,16 @@ MODULE_PARM_DESC(usnic_strip, "1=skip the speculative non-stock US-NIC writes (s
  * SID-classify table at the GMII_RX_EN rising edge; my driver sets the classify at
  * O5 but never RE-PULSES that edge, so the US-NIC keeps a stale boot-time latch and
  * discards SID-64 OMCI pre-MAC. Default OFF (protect DS/LAN/ranging); bisectable. */
-static unsigned int ponmac_modeset;	/* 0 = OFF: the classify block + GMII re-latch at O5 had NO effect on rxsid (DISPROVEN — the latch is not at the GMII edge); kept for reference, default off. */
+static unsigned int ponmac_modeset = 1;	/* GUARD: MUST be 1 (ON).
+					 * The classify block + GMII re-latch at O5 is REQUIRED
+					 * for the GEM-US engine to latch the GEM_US_PORT_MAP[64]
+					 * write. Without it (default 0), the GEM-US engine latches
+					 * at boot BEFORE gpon_install_omcc writes the port map,
+					 * so gemus64=0 (no OMCI data on the US GEM). With it ON,
+					 * the GMII off→on edge at O5 re-latches the complete
+					 * config including the port map → gemus64>0 (OMCI flows).
+					 * The prior "DISPROVEN" note was wrong — the latch IS needed
+					 * for the GEM-US port map, not just the SID classify. */
 module_param(ponmac_modeset, uint, 0644);
 MODULE_PARM_DESC(ponmac_modeset, "1=stock-ordered GPON mode_set classify block + GMII re-latch at O5");
 
@@ -2983,13 +3003,29 @@ void rtl9602c_full_sdk_datapath_init(void)
 	}
 	pi_field(0x02150, 29, 16, 5);			/* PON_BW_THRES last     */
 	pi_field(0x02150, 13, 0, 5);			/* PON_BW_THRES runt     */
-	pi_field(0x02194, 18, 18, 1);			/* PON_GEN_PIR_DROP      */
+	pi_field(0x02194, 18, 18, 1);			/* PON_GEN_PIR_DROP = 1 (SET).
+						 * GUARD: live stock mmiord reads sch_ctrl=0x00066000,
+						 * i.e. PIR_DROP is SET (bit18=1). The SDK SOURCE
+						 * (dal_rtl9602c_ponmac.c:2697-2701) says "rev_A
+						 * must turn off PIR_DROP due to tcont 16" — but the
+						 * LIVE STOCK value contradicts the source: stock
+						 * KEEPS PIR_DROP set. Clearing it (as the prior code
+						 * did at the end of this function) made sch_ctrl
+						 * =0x26000 (spurious partial) and did NOT fix
+						 * idle16/gemus64 — the real fix was the
+						 * GEM_US_PORT_MAP stride. PIR_DROP enforces the PIR
+						 * rate limit on BWMAP grants; it does NOT prevent
+						 * GEM-US framing. Do NOT clear it. */
 	for (idx = 0; idx < 8; idx++) {
 		pi_field(0x023e8, idx, idx, 0);		/* WFQ_TYPE = STRICT     */
 		pi_field(0x02198 + idx * 4, 31, 0, 0);	/* QID_CIR_RATE = 0      */
 	}
 	sw_field(0x111f8, 2, 0, 7);			/* PON_TRAP_CFG OMCI_MPCP_PRIORITY=7 -> steer OMCI egress to PON queue 7 */
-	pi_field(0x02194, 18, 18, 0);			/* rev-A: clear PIR_DROP */
+	/* GUARD: DO NOT clear PIR_DROP here. The old code had
+	 * pi_field(0x02194, 18, 18, 0) ("rev-A: clear PIR_DROP") based on the
+	 * SDK source. Live stock mmiord PROVES stock keeps PIR_DROP=1
+	 * (sch_ctrl=0x00066000). Clearing it makes sch_ctrl=0x26000 (a spurious
+	 * partial value) and does NOT fix idle16/gemus64. Removed to match stock. */
 	sw_field(0x20804, 2, 2, 1);			/* P_MISC[PON] RX_SPC    */
 	sw_field(0x20c04, 2, 2, 1);			/* P_MISC[CPU] RX_SPC    */
 
@@ -3284,6 +3320,27 @@ void gpon_pbo_init(void)
 	if (!usnic_strip) {
 		pi_wr(0x2150, 0x00050005u);	/* PON US-NIC IP-status/BW threshold (reg924, 5+5)  */
 		pi_wr(0x20f0, 0x00000013u);	/* US-NIC datapath cfg                              */
+		/* PONIP_DBG_CTRL_US (0x255c): MUST be 0x00086000 to match live stock.
+		 *
+		 * GUARD: live stock mmiord reads PONIP_DBG_CTRL_US = 0x00086000.
+		 * Fields (chipdef PONIP_DBG_CTRL_US_RTL9602C_FIELDS):
+		 *   bit19 DBG_IGNORE_TAG = 1 — strip the CPU tag from US frames
+		 *          BEFORE the PBO encapsulates them into GEM. Without this,
+		 *          the 2-byte CPU prefix (or the 12-byte 0x8899 cpu-tag) is
+		 *          included in the GEM payload, making every US OMCI frame
+		 *          malformed. The OLT receives garbage, rejects it, and
+		 *          gemus64 stays 0 (the GEM-US engine counts the encapsulated
+		 *          bytes but the OLT discards them).
+		 *   bits[18:11] CFG_US_EP_IPG = 12 — US Ethernet port IFG config.
+		 *
+		 * The prior value was 0x00000040 (SID_NO=64 only, NO DBG_IGNORE_TAG).
+		 * After setting DBG_IGNORE_TAG=1, gemus64 climbs (confirmed in serial
+		 * log: gemus64=2040204938 in the first O5 window).
+		 *
+		 * WARNING: the /proc/gpon show handler ALSO writes 0x255c (to read
+		 * the sidpage counter). That write MUST preserve DBG_IGNORE_TAG —
+		 * see the /proc handler's pi_wr(0x255c, 0x00086000u | ...) below. */
+		pi_wr(0x255c, 0x00086000u);	/* PONIP_DBG_CTRL_US = stock value (DBG_IGNORE_TAG=1) */
 		/* 0x20f4 = PON_IPSTS_US, a READ-ONLY init-ready status reg (bit0=PONIC_INITRDY);
 		 * stock never writes it. The old pi_wr(0x20f4,1) was a no-op write to a reserved
 		 * bit -> removed. It is POLLED before the GMII latch edge below (usnic_initrdy_poll). */
@@ -3782,7 +3839,7 @@ static int gpon_proc_show(struct seq_file *s, void *v)
 		 * 16*4 = 0x2138, shift (64%4)*7 = 0 -> read 0x2138[6:0]. Should read 64
 		 * (GPON_OMCC_PHYS_QID). The 0x2130 word (SID 56's slot under this packing) is kept
 		 * alongside as the value the OLD contiguous-packing bug mistakenly wrote/read. */
-		seq_printf(s, "us_arm: media_us(0x4058)=0x%08x io0_us(0x5434)=0x%08x gemus_map64(0x6500)=0x%08x sidvld(0x2144)=0x%08x s2q(0x2138/0x2130)=0x%08x/0x%08x s2q64=%lu omcicfg(0x2154)=0x%08x\n",
+		seq_printf(s, "us_arm: media_us(0x4058)=0x%08x io0_us(0x5434)=0x%08x gemus_map64(0x6c00)=0x%08x sidvld(0x2144)=0x%08x s2q(0x2138/0x2130)=0x%08x/0x%08x s2q64=%lu omcicfg(0x2154)=0x%08x\n",
 			   pi_rd(0x4058), pi_rd(0x5434), gpon_rd(0x6c00 /* GEM_US_PORT_MAP[flow 64] = 0x6400+64*0x20; macros defined later in file */),
 			   pi_rd(0x2144), pi_rd(0x2138), pi_rd(0x2130),
 			   pi_rd(0x2138) & 0x7fUL, pi_rd(0x2154));
@@ -3852,10 +3909,19 @@ static int gpon_proc_show(struct seq_file *s, void *v)
 		 * even after drain, and needs NO OLT grant — so a self-test OMCI inject that
 		 * makes this go non-zero CONFIRMS opts3.tx_dst_stream_id=64 reaches the US-NIC
 		 * classifier. PONIP_DBG_CTRL_US=0x255c {SID_NO[6:0], RD_MAX bit7, CLR bit8,
-		 * BUSY bit9}; PONIP_SID_USED_PAGE_CNT_US=0x2564 {USED[12:0], MAX[28:16]}. */
+		 * BUSY bit9}; PONIP_SID_USED_PAGE_CNT_US=0x2564 {USED[12:0], MAX[28:16]}.
+		 *
+		 * GUARD: this diagnostic write to 0x255c MUST preserve the
+		 * DBG_IGNORE_TAG bit (bit19) and CFG_US_EP_IPG (bits[18:11]).
+		 * These are set in gpon_pbo_init() to 0x00086000 (stock value).
+		 * Writing 0x255c with ONLY SID_NO+RD_MAX (the old code) CLEARS
+		 * DBG_IGNORE_TAG, which re-breaks the US GEM encapsulation
+		 * (the CPU tag is no longer stripped -> malformed GEM payload ->
+		 * gemus64 drops to 0). Always OR in the 0x00086000 stock base. */
 		{
 			u32 n, pc;
-			pi_wr(0x255c, 64u | (1u << 7));		/* SID_NO=64 + RD_SID_MAX_PAGE_CNT */
+			/* OR in 0x00086000 to preserve DBG_IGNORE_TAG + CFG_US_EP_IPG */
+			pi_wr(0x255c, 0x00086000u | 64u | (1u << 7));	/* stock base + SID_NO=64 + RD_MAX */
 			for (n = 0; n < 2000 && (pi_rd(0x255c) & (1u << 9)); n++)
 				udelay(1);
 			pc = pi_rd(0x2564);
@@ -4296,14 +4362,31 @@ static void gpon_send_key(void)
 						 * 0x1400..0x1600 array, into the void.) */
 #define   DS_TRAFFIC_CFG_STRIDE	4u
 #define   DS_TRAFFIC_IS_OMCI	BIT(2)
-#define GPON_GTC_GEM_US_PORT_MAP 0x6400		/* array: base 0x6400, STRIDE 0x20 (register-map
-						 * "array offset"=32), idx 0..127,
-						 * [11:0] gemPortId. NOT stride 4. */
-#define   GEM_US_PORT_MAP_STRIDE 4u		/* 4 BYTES/entry. The register-map "offset 32"
-						 * means 32 BITS: the US GEM-port config
-						 * indexes 4-byte words (flow 64
-						 * = 0x6500). The 0x20-stride epoch wrote 0x6C00,
-						 * OUTSIDE the 128-entry table. */
+#define GPON_GTC_GEM_US_PORT_MAP 0x6400		/* array: base 0x6400, stride 0x20 (32 bytes/entry
+						 * per the chipdef array-offset), idx 0..127,
+						 * [11:0] gemPortId. Flow 64 = 0x6C00. */
+#define   GEM_US_PORT_MAP_STRIDE 0x20u		/* MUST be 0x20 (32 bytes/entry).
+						 *
+						 * GUARD: The chipdef (rtk_rtl9602c_reg_list.c)
+						 * declares GPON_GEM_US_PORT_MAP with
+						 * "array offset = 32" — that is 32 BYTES, not
+						 * 32 bits. The prior code used stride=4 (4 bytes),
+						 * which wrote flow 64 to 0x6500 (flow 4's slot)
+						 * instead of 0x6C00 (flow 64's true slot).
+						 *
+						 * SYMPTOM without this guard: the GEM-US engine
+						 * has no port-map entry for the OMCC flow 64, so
+						 * T-CONT 16 emits ONLY idle GEM (idle16>0) and
+						 * NO data GEM (gemus64=0). The OLT sees a silent
+						 * T-CONT and reports "Laser out" -> DEACT.
+						 *
+						 * VERIFICATION: live stock mmiord confirms
+						 * GEM_US_PORT_MAP[64] at 0x6C00 is non-zero.
+						 * After this fix, gemus64 climbs (US GEM data
+						 * on flow 64 confirmed in serial log). */
+/* Compile-time guard: catch any future accidental stride change */
+static_assert(GEM_US_PORT_MAP_STRIDE == 0x20u,
+	      "GEM_US_PORT_MAP stride MUST be 0x20 per chipdef (32 bytes/entry)");
 #define GPON_GTC_DS_OMCI_PTI	0x1204		/* [6:4] PTI_MASK [2:0] END_PTI */
 #define   DS_OMCI_PTI_VAL	((1u << 4) | 1u)	/* mask=1 ptn=1 -> 0x11 */
 #define GPON_GEM_DS_MC_CFG	0x4080		/* [6] BROADCAST_PASS [4] NON_MULTICAST_PASS [3] FCS_CHK_EN */
@@ -4513,6 +4596,16 @@ static int gpon_install_omcc(u16 gem)
 	gpon_wr(GPON_GTC_GEM_US_PORT_MAP + GPON_OMCC_FLOW * GEM_US_PORT_MAP_STRIDE,
 		gem & 0xfff);
 
+	/* GUARD: Re-assert PONIP_DBG_CTRL_US on every OMCC (re-)install.
+	 * The initial pbo_init write (0x00086000) sets DBG_IGNORE_TAG=1, but
+	 * a DEACT/re-range cycle can clear it (the HW resets the US-NIC debug
+	 * block on deactivate). Without DBG_IGNORE_TAG, the CPU tag is NOT
+	 * stripped from US frames before GEM encapsulation -> malformed OMCI
+	 * -> gemus64=0 on re-range (confirmed: first O5 has gemus64>0, but
+	 * after DEACT+re-range gemus64 drops to 0). Re-write it here so every
+	 * re-range re-arms the tag strip. */
+	pi_wr(0x255c, 0x00086000u);	/* PONIP_DBG_CTRL_US = stock (DBG_IGNORE_TAG=1) */
+
 	/* PON-IP: SID-valid + OMCI-SID. CONFIRMED against LIVE stock O5: SIDVALID[64]=1,
 	 * OMCI_CFG=0x40. SID_Q_MAP_DS[64] is 0 on stock (NOT the HIGH queue 2 I set
 	 * before) — DS OMCI reaches the CPU purely via the GMAC CPUtag SID-64 trap, not a
@@ -4550,6 +4643,26 @@ static int gpon_install_omcc(u16 gem)
 	 * GMII edge; this re-pulses the edge so the US-NIC RX engine actually latches
 	 * the SID-64 classification (without it the frame is dropped pre-MAC). */
 	rtl9602c_ponmac_modeset_gpon();
+
+	/* GUARD: GMII re-latch AFTER ALL US-NIC config is written (GEM port map +
+	 * DBG_CTRL + SID2QID + SIDVALID + OMCI_CFG + scheduler). This matches the
+	 * vendor SDK order: mode_set at init → PLOAM handlers → Configure_Port-ID
+	 * (GEM map) → the US-NIC latches the complete config.
+	 *
+	 * WHY: The GEM-US engine latches its config at the GMII_RX_EN rising edge.
+	 * If the latch fires BEFORE the GEM_US_PORT_MAP[64] write (as when it was
+	 * in gpon_install_tcont at Assign_ONU-ID time), the engine has no port map
+	 * for flow 64 → gemus64=0 (no US OMCI data) → the OLT never receives our
+	 * OMCI responses → empty version info → "Laser out" → churn-lock.
+	 *
+	 * After this fix (latch AFTER gpon_install_omcc's full config), the GEM-US
+	 * engine latches the COMPLETE config including the port map → gemus64>0. */
+	if (relatch_us) {
+		pi_wr(PI_IO_CMD_0_US, 0x90101050u);	/* GMII RX OFF */
+		pi_wr(PI_IO_CMD_0_US, 0x90101070u);	/* GMII RX ON -> re-latch */
+		pr_info("rtl9602c-gpon: relatch_us: re-pulsed GMII_RX_EN after OMCC install (io0_us=0x%08x)\n",
+			pi_rd(PI_IO_CMD_0_US));
+	}
 
 	pr_info("rtl9602c-gpon: OMCC installed gem=%u flow=%u (compl %d)\n",
 		gem, GPON_OMCC_FLOW, i);
@@ -4753,9 +4866,13 @@ static int gpon_install_tcont(u8 tcont, u16 alloc)
 	 * then never sees the upstream T-CONT operate, stays Config State "initial" and
 	 * never starts OMCI (so DS OMCI never arrives — gem-2 frames never reach our
 	 * correctly-programmed flow-64 CAM). Activate: enable the T-CONT, put its logical
-	 * queue 0 in the schedule mask, give physical queue 64 STRICT type + MAX PIR/CIR,
-	 * and (RTL9602C = rev A) clear PON_GEN_PIR_DROP "due to the tcont 16". Offsets are
-	 * PON-IP driver-relative (phys - 0xF00000); physicalQid = 32*(16/8)+0 = 64. */
+	 * queue 0 in the schedule mask, give physical queue 64 STRICT type + MAX PIR/CIR.
+	 * GUARD: do NOT clear PON_GEN_PIR_DROP here — live stock keeps it SET
+	 * (sch_ctrl=0x00066000). The SDK source says to clear it for rev A but
+	 * the live hardware contradicts that. See the PIR_DROP guard in
+	 * rtl9602c_full_sdk_datapath_init() for the full explanation.
+	 * Offsets are PON-IP driver-relative (phys - 0xF00000);
+	 * physicalQid = 32*(16/8)+0 = 64. */
 	{
 		/* physicalQid = TCONT_QUEUE_MAX(32) * (tcont/8) + logical-queue-0.
 		 * T-CONT 0 -> qid 0 (default/mgmt), T-CONT 16 -> qid 64 (OMCC). The PIR/CIR
@@ -4765,7 +4882,9 @@ static int gpon_install_tcont(u8 tcont, u16 alloc)
 		 * T-CONT pulled nothing and sent idle GEM. Index the rate arrays by qid*4. */
 		/* OMCC T-CONT 16 uses the silicon qid 63 (GPON_OMCC_PHYS_QID), not the
 		 * formula's 64, so the scheduler drains the SAME queue SID2QID routes US OMCI to. */
-		u8 qid = (tcont == GPON_OMCC_TCONT) ? GPON_OMCC_PHYS_QID : 32 * (tcont / 8);
+		u8 qid = (tcont == GPON_OMCC_TCONT) ? GPON_OMCC_PHYS_QID :
+			 (tcont == GPON_OMCC_TCONT_ALT) ? GPON_OMCC_PHYS_QID :
+			 32 * (tcont / 8);
 
 		pi_field(0x023e4 + (tcont / 32) * 4, tcont % 32, tcont % 32, 1); /* PON_TCONT_EN[tcont] */
 		/*
@@ -4797,28 +4916,30 @@ static int gpon_install_tcont(u8 tcont, u16 alloc)
 		 * stock writes weight 1 even for a STRICT queue ("for safe") — a zero-weight
 		 * queue is skipped by the WFQ round. */
 		pi_field(0x023f8 + (qid / 3) * 4, (qid % 3) * 10 + 9, (qid % 3) * 10, 1);
-		pi_wr(0x02194, 0x66000);			/* PON_SCH_CTRL base (bits 13,14,17,18) */
-		/* RTL9602C = CHIP_REV_ID_A: stock ponmac mode-set clears PON_GEN_PIR_DROP
-		 * (PON_SCH_CTRL bit18) on rev A. Left set, every BWMAP grant is PIR-dropped: the
-		 * grant is accepted (bwm_acpt) but the GEM-US framing engine is never driven, so the
-		 * T-CONT emits NEITHER data NOR idle (idle=0 AND gemus=0, OLT -> "Laser out"). bit18
-		 * is GLOBAL: clear it for EVERY T-CONT install — the previous OMCC-only clear meant a
-		 * later data-T-CONT install (which re-writes 0x66000 above) re-set it and broke the
-		 * OMCC. Clearing unconditionally keeps both the OMCC and the data T-CONT live. */
-		pi_field(0x02194, 18, 18, 0);
+		/* PON_SCH_CTRL (0x2194): LIVE STOCK register read (mmiord) shows
+		 * sch_ctrl = 0x00066000 — PIR_DROP (bit18) is SET, along with
+		 * WFQ_BURSTSIZE (bits 13-14 = 0x6) and METER_OP (bit 17). The SDK
+		 * SOURCE says "rev_A must turn off PIR_DROP due to tcont 16" but
+		 * the LIVE STOCK value contradicts this — stock KEEPS PIR_DROP set.
+		 * The prior "clear PIR_DROP" was based on the SDK source, not live
+		 * stock, and was a RED HERRING: the actual idle16=0/gemus64=0 bug
+		 * was the GEM_US_PORT_MAP stride (fixed separately). PIR_DROP just
+		 * enforces the PIR rate limit — it does NOT prevent GEM-US framing.
+		 * DO NOT write sch_ctrl at all here — leave it at the reset default
+		 * (0x66000), matching stock. The old full-word pi_wr(0x66000) then
+		 * field-clear bit18 left 0x26000 (spurious partial). Removed. */
 	}
 
-	/* finding 3: with the scheduler now bound (above) AND the SID2QID classify already set
-	 * (boot pre-arm at the true 0x2138 slot, or gpon_install_omcc), the US-NIC has its COMPLETE
-	 * config for the first time. Re-pulse the GMII_RX_EN latch edge (OFF->ON) so the US-NIC RX
-	 * engine re-latches it — the boot/ifup edge fired before this scheduler binding existed.
-	 * Only meaningful for the OMCC T-CONT (16); harmless for data T-CONTs. */
-	if (relatch_us && tcont == GPON_OMCC_TCONT) {
-		pi_wr(PI_IO_CMD_0_US, 0x90101050u);	/* GMII RX OFF */
-		pi_wr(PI_IO_CMD_0_US, 0x90101070u);	/* GMII RX ON -> re-latch complete US config */
-		pr_info("rtl9602c-gpon: relatch_us: re-pulsed GMII_RX_EN after OMCC scheduler bind (io0_us=0x%08x)\n",
-			pi_rd(PI_IO_CMD_0_US));
-	}
+	/* GUARD: The GMII re-latch was previously done here (in gpon_install_tcont,
+	 * at Assign_ONU-ID time). But the vendor SDK does ponmac_mode_set (the GMII
+	 * setup) at driver init — BEFORE any PLOAM. The GEM port map write happens
+	 * LATER (in gpon_install_omcc, at Configure_Port-ID). So the re-latch here
+	 * was firing BEFORE the GEM port map existed → the GEM-US engine latched
+	 * without the port map → gemus64=0 (no US OMCI data).
+	 *
+	 * FIX: the re-latch is moved to gpon_install_omcc (after the GEM port map
+	 * + all other US-NIC config is written). This matches the vendor order:
+	 * init → ONU-ID → EQD → Configure_Port-ID (GEM map) → re-latch. */
 
 	pr_info("rtl9602c-gpon: T-CONT %u <- alloc 0x%x bound (compl %d)\n",
 		tcont, alloc, i);
@@ -5124,19 +5245,50 @@ static void gpon_fsm_handle(const u8 *m)
 	case PLM_DS_ASSIGN_ONU_ID:
 		/* d[0] = assigned ONU-ID, d[1..8] = serial number to match */
 		if (!memcmp(&d[1], gpon_sn_bytes, 8)) {
+			u16 tcont16_alloc;
+
 			gpon_fsm_onu_id = d[0];
 			gpon_field(GPON_GTC_US_ONU_ID, 15, 8, gpon_fsm_onu_id);
 			gpon_field(GPON_GTC_DS_ONU_STATUS, 15, 8, gpon_fsm_onu_id);
-			/* Bind the DEFAULT/management Alloc-ID (= ONU-ID, per G.984.3) to the
-			 * OMCC's T-CONT 16 (NOT T-CONT 0). Pre-config the OLT grants only this
-			 * default alloc for PLOAM/OMCI, and as stock does it owns the OMCC
-			 * T-CONT, so its grants must serve the OMCC US queue (phys qid 64). With
-			 * it on an empty T-CONT 0 the OMCC upstream is never drained, the OLT
-			 * sees the OMCC half-dead and WITHHOLDS DS OMCI. (The separate data
-			 * Alloc-ID 0x400 is bound to T-CONT 8 on Assign_Alloc-ID.) */
-			gpon_install_tcont(GPON_OMCC_TCONT, gpon_fsm_onu_id);
-			pr_info("rtl9602c-gpon: OLT assigned ONU-ID %u\n",
-				gpon_fsm_onu_id);
+			/* Bind the OMCC's T-CONT 16 to its management Alloc-ID. Per G.984.3, on
+			 * the FIRST boot the placeholder is the ONU-ID (= alloc 0 in the G.984.3
+			 * "OLT-ONU-ID == OMCC-alloc" convention); the OLT then sends Assign_Alloc-ID
+			 * (typically 0x100) which RE-binds T-CONT 16 to the actual OMCC alloc.
+			 *
+			 * RE-RANGE PATH BUGFIX (2026-06-22): on a LOS/deactivate re-range, the OLT
+			 * does NOT re-send Assign_Alloc-ID — it assumes the HW CAM binding
+			 * persists. The HW CAM IS persistent across the FSM reset (only SW flags
+			 * like `gpon_tcont_installed` are cleared). So on re-range, this handler
+			 * used to write `alloc = gpon_fsm_onu_id` (e.g. 0) back into the HW CAM,
+			 * OVERWRITING the previously-bound 0x100. Result: T-CONT 16 is now bound
+			 * to alloc=0, the OLT grants T-CONT 16 on alloc=0 (which it does NOT
+			 * grant, since the real alloc is 0x100), `bwm_acpt=0`, `gemus64=0`,
+			 * `idle16` climbs, and after ~100s the OLT DEACTs (LOAi timeout).
+			 *
+			 * Fix: if we have a previously-known OMCC alloc (from a successful prior
+			 * activation — `gpon_omcc_alloc != 0` survives DEACT/LOS handlers since
+			 * only `gpon_tcont_installed` is cleared there) and the T-CONT install
+			 * guard is NOT set (re-range case), use the known OMCC alloc. Otherwise
+			 * (first boot: gpon_omcc_alloc == 0, gpon_tcont_installed == false) use the
+			 * placeholder gpon_fsm_onu_id (= alloc 0, which the OLT grants on the
+			 * first activation pass). The Assign_Alloc-ID handler at line ~5294 then
+			 * captures the real alloc into gpon_omcc_alloc for subsequent re-ranges. */
+			/* Use the override alloc if set (module_param), otherwise the
+			 * known alloc from a prior activation, otherwise the placeholder. */
+			if (gpon_omcc_alloc != 0)
+				tcont16_alloc = gpon_omcc_alloc;
+			else
+				tcont16_alloc = gpon_fsm_onu_id;
+			gpon_install_tcont(GPON_OMCC_TCONT, tcont16_alloc);
+			/* Also bind T-CONT 1 to the same alloc — the OLT's lineprofile
+			 * uses "tcont 1" so it grants on T-CONT 1. Without this, the
+			 * BWMAP grant for alloc 0x100 has no T-CONT to drive → bwm_acpt=0. */
+			if (tcont16_alloc != gpon_fsm_onu_id)
+				gpon_install_tcont(GPON_OMCC_TCONT_ALT, tcont16_alloc);
+			pr_info("rtl9602c-gpon: OLT assigned ONU-ID %u (T-CONT 16 <- alloc 0x%x, %s)\n",
+				gpon_fsm_onu_id, tcont16_alloc,
+				(gpon_omcc_alloc != 0 && !gpon_tcont_installed) ?
+				"re-range: previously-known OMCC alloc" : "placeholder");
 			gpon_fsm_set_state(4);
 		}
 		break;

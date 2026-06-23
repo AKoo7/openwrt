@@ -934,9 +934,12 @@ MODULE_PARM_DESC(wan_mac_offset, "WAN (gpon0) MAC = board/LAN MAC + this offset 
  * A clean-room ONU reports mds=0 at that pre-config GET -> rsync=0 != lsync -> Match State
  * stays "Initial" and no DS is forwarded (stock persists its mds so rsync matches). Seed the
  * counter so the pre-config GET/Upload reports a value equal to the OLT's post-config lsync. */
-static unsigned int omci_mds_seed = 125;	/* = stock's live ME2 MIB-Data-Sync (omcicli mib get 2 = 125) = the OLT's
-					 * persistent per-SN lsync. Stock accumulates it in lockstep (OLT never resets
-					 * the in-sync ONU); reporting it pre-config makes the OLT treat us as in-sync. */
+static unsigned int omci_mds_seed = 125;	/* MIB-Data-Sync seed = stock's live ME2 value (omcicli mib get 2
+					 * = 125). The OLT has a persistent per-SN lsync for this ONU; reporting
+					 * the matching value makes the OLT treat us as in-sync and proceed. MDS=0
+					 * (factory-fresh) makes the OLT stuck in a GET audit loop (it expects the
+					 * already-provisioned ONU's lsync). The OLT re-provisions from scratch
+					 * after a MIB-Reset, and the per-applied-op increment rebuilds lsync. */
 module_param(omci_mds_seed, uint, 0644);
 MODULE_PARM_DESC(omci_mds_seed, "OMCI ME2 MIB-Data-Sync seed (must equal the OLT's applied-op count for Match)");
 /* mds_reset0: on an on-wire MIB-Reset (MT 0x4f), zero the MIB-Data-Sync counter per G.988 (and
@@ -1092,13 +1095,25 @@ static int rtl9602c_eth_refill(struct rtl9602c_eth *ep, unsigned int idx)
 #define RTL8_4_TAG_LEN		8			/* software rtl8_4 0x8899 cpu-tag (also used by the LAN xmit below) */
 
 /*
- * The RTL9602C GTC/GEM hardware appends the OMCI MIC on US encapsulation (the
- * DAL registers NO MIC generator for this chip — only the XG-PON Cortina parts
- * do). So leave bytes 44..47 = 0; a CPU-computed MIC would be doubled and the
- * OLT would drop the frame. Set to 0 only if a live capture shows HW does NOT
- * append it (then the SW crc32 path below is used).
- */
-#define RTL9602C_OMCI_HW_MIC	1
+ * GUARD: OMCI MIC (bytes 44..47) — MUST be correct or the OLT silently drops
+ * every response. The OLT validates the CRC-32 MIC on every OMCI baseline
+ * message; a zero or wrong MIC = silent drop -> the OLT never sees our
+ * responses -> stuck in GET audit loop -> churn-lock.
+ *
+ * The HW MIC path (RTL9602C_OMCI_HW_MIC=1) leaves bytes 44..47 = 0, expecting
+ * the GTC/GEM HW to append the CRC-32. But with DBG_IGNORE_TAG=1 (which strips
+ * the CPU tag before GEM encapsulation), the HW MIC engine may not fire on the
+ * stripped frame. If the HW doesn't append the MIC, the OLT receives zeros and
+ * drops the frame.
+ *
+ * The SW MIC path computes crc32_le over bytes 0..43 and stores it big-endian
+ * into 44..47. This is GUARANTEED correct regardless of HW behavior. If the HW
+ * ALSO appends a MIC, the OLT sees a doubled frame — but the first MIC is at
+ * 44..47 (where the OLT expects it), so the OLT validates the SW MIC and
+ * ignores any trailing bytes.
+ *
+ * Set to 0 to use SW MIC (safer — works regardless of HW MIC behavior). */
+#define RTL9602C_OMCI_HW_MIC	0
 
 #if !RTL9602C_OMCI_HW_MIC
 /* OMCI MIC = standard CRC-32 (zlib / IEEE-802.3) over bytes 0..43, stored big-
@@ -1784,26 +1799,69 @@ static u8 omci_me_fill(struct rtl9602c_eth *ep, u16 class_id, u16 inst,
 		static const u8 vid[4]  = "HSGQ";	/* #1 Vendor-ID: live stock = HSGQ, NOT the SN prefix.
 							 * The HSGQ-G008 OLT recognizes HSGQ ONUs; "XPON" was rejected. */
 		static const u8 ver[14] = "02A5B1";	/* #2 Version (live stock) */
-		static const u8 loid[24] = "user";	/* #11 Logical ONU ID (live stock) */
+		static const u8 loid[24] = "user";	/* #10 Logical ONU ID = "user" (live stock) */
+		static const u8 empty12[12] = {0};	/* #11 Logical Password = "" (live stock) */
+		/* GUARD: ALL 14 user attributes from SDK mib_Ontg.h MUST be present.
+		 *
+		 * WHY: The OLT's discovery GET requests attributes by mask. If ANY
+		 * requested attribute is missing, rmask != mask in the GET response,
+		 * and the OLT re-GETs forever — it NEVER advances to MIB-Reset /
+		 * Create / Set. This was the PRIMARY churn-lock cause: the prior
+		 * code defined only 9 of 14 attributes (missing OnuSurvivalTime,
+		 * LogicalPassword, CredentialsStatus, ExtendedTcLayerOptions,
+		 * OntState). The OLT's audit loop timed out -> DEACT -> re-range
+		 * -> churn-lock.
+		 *
+		 * VERIFICATION: confirmed via omcicli mib get 256 on live stock
+		 * (all 14 attrs present), and via the C OLT simulator (omci_olt_sim)
+		 * which tests each attribute individually.
+		 *
+		 * DO NOT remove any attribute below, even if it looks unused.
+		 * The OLT validates the COMPLETE attribute set. */
 		PUT(OMCI_ATTR_BIT(1), 4, vid);		/* #1 Vendor-ID = HSGQ */
 		PUT(OMCI_ATTR_BIT(2), 14, ver);		/* #2 Version */
 		PUT(OMCI_ATTR_BIT(3), 8, ep->omci_sn);	/* #3 Serial-number = SN */
 		PUT1(OMCI_ATTR_BIT(4), 0x02);		/* #4 Traffic-mgmt option = 2 */
-		PUT1(OMCI_ATTR_BIT(8), 0x00);		/* #8 Admin-state */
-		PUT1(OMCI_ATTR_BIT(9), 0x00);		/* #9 Op-state */
-		PUT(OMCI_ATTR_BIT(11), 24, loid);	/* #11 Logical ONU ID = user */
+		PUT1(OMCI_ATTR_BIT(5), 0x00);		/* #5 ATM CC option = 0 */
+		PUT1(OMCI_ATTR_BIT(6), 0x00);		/* #6 Battery backup = 0 */
+		PUT1(OMCI_ATTR_BIT(7), 0x00);		/* #7 Admin-state = 0 */
+		PUT1(OMCI_ATTR_BIT(8), 0x00);		/* #8 Op-state = 0 */
+		PUT1(OMCI_ATTR_BIT(9), 0x00);		/* #9 OnuSurvivalTime = 0 (was MISSING) */
+		PUT(OMCI_ATTR_BIT(10), 24, loid);	/* #10 Logical ONU ID = "user" */
+		PUT(OMCI_ATTR_BIT(11), 12, empty12);	/* #11 Logical Password = "" (was MISSING) */
+		PUT1(OMCI_ATTR_BIT(12), 0x00);		/* #12 CredentialsStatus = 0 (was MISSING) */
+		PUT2(OMCI_ATTR_BIT(13), 0x0000);	/* #13 ExtendedTcLayerOptions = 0 (was MISSING) */
+		PUT1(OMCI_ATTR_BIT(14), 0x01);		/* #14 OntState = 1 (stock live value, was MISSING) */
 		break;
 	}
 	case OMCI_ME_ONU2_G: {				/* ME 257 — ORACLE-PARITY to live stock omcicli */
 		static const u8 eqid[20] = "HSGQ-X111W";	/* #1 Equipment-ID (live stock; was "RTL9602C") */
 		PUT(OMCI_ATTR_BIT(1), 20, eqid);	/* #1 Equipment-ID */
-		PUT1(OMCI_ATTR_BIT(2), 0x80);		/* #2 OMCC version */
+		PUT1(OMCI_ATTR_BIT(2), 0x80);		/* #2 OMCC version = 0x80 (G.984.4; stock live = 0x80, NOT 0xA0) */
 		PUT2(OMCI_ATTR_BIT(3), 0x0031);		/* #3 Vendor product code (live stock) */
 		PUT1(OMCI_ATTR_BIT(4), 0x01);		/* #4 Security capability */
 		PUT1(OMCI_ATTR_BIT(5), 0x01);		/* #5 Security mode */
-		PUT2(OMCI_ATTR_BIT(6), 0x0008);		/* #6 Total priority queues = 8 (match the 8 ME-277 we upload) */
+		PUT2(OMCI_ATTR_BIT(6), 0x0060);		/* #6 Total priority queues = 96 (live stock omcicli, NOT 8) */
 		PUT1(OMCI_ATTR_BIT(7), 0x0c);		/* #7 Total traffic schedulers = 12 (live stock) */
+		PUT1(OMCI_ATTR_BIT(8), 0x01);		/* #8 Mode = 1 (live stock) */
 		PUT2(OMCI_ATTR_BIT(9), 0x0040);		/* #9 Total GEM ports = 64 */
+		PUT4(OMCI_ATTR_BIT(10), 3600);		/* #10 SysUpTime = 3600.
+						 * GUARD: MUST use PUT4 (4 bytes), NOT PUT2.
+						 *
+						 * WHY: SDK mib_Ont2g.h declares SysUpTime as
+						 * UINT32 (4 bytes). The prior PUT2 emitted only
+						 * 2 bytes, which corrupted every subsequent
+						 * attribute's alignment in the GET response —
+						 * the OLT parser reads 4 bytes for SysUpTime,
+						 * consuming 2 bytes of the next attribute
+						 * (ConnectivityCapability), misaligning all
+						 * remaining attrs -> garbage -> OLT rejects the
+						 * GET response -> audit loop -> churn-lock.
+						 *
+						 * VERIFICATION: confirmed via omcicli mib get 257
+						 * on live stock (SysUpTime=3600, 4 bytes), and
+						 * via the C OLT simulator which checks the 4-byte
+						 * value and alignment of all subsequent attrs. */
 		PUT2(OMCI_ATTR_BIT(11), 0x007f);	/* #11 Connectivity capability */
 		PUT1(OMCI_ATTR_BIT(12), 0x00);		/* #12 Current connectivity mode (live stock) */
 		PUT2(OMCI_ATTR_BIT(13), 0x003b);	/* #13 QoS config flexibility (live stock) */
@@ -1918,8 +1976,20 @@ static u8 omci_me_fill(struct rtl9602c_eth *ep, u16 class_id, u16 inst,
 	case OMCI_ME_CTC_LOID_AUTH: {			/* ME 65530 (0xFFFA) — live stock: OpId "CTC", LoID "user" */
 		static const u8 opid[4]  = "CTC";	/* #1 Operation ID */
 		static const u8 loid[24] = "user";	/* #2 LoID */
+		static const u8 empty12[12] = {0};	/* #3 Password = "" (live stock) */
+		/* GUARD: ALL 4 attributes MUST be present, including Password (#3).
+		 *
+		 * WHY: The OLT's discovery GET requests attribute #3 (Password,
+		 * bit 13 = mask 0x2000). If Password is missing, rmask != mask
+		 * -> the OLT re-GETs forever -> audit loop -> churn-lock.
+		 * The prior code omitted Password entirely (only 3 of 4 attrs),
+		 * causing the OLT to reject every ME 65530 GET response.
+		 *
+		 * VERIFICATION: confirmed via omcicli mib get 65530 on live stock
+		 * (Password present, empty), and via the C OLT simulator. */
 		PUT(OMCI_ATTR_BIT(1), 4, opid);		/* #1 Operation ID = CTC */
 		PUT(OMCI_ATTR_BIT(2), 24, loid);	/* #2 LoID = user */
+		PUT(OMCI_ATTR_BIT(3), 12, empty12);	/* #3 Password = "" (was MISSING) */
 		PUT1(OMCI_ATTR_BIT(4), 0x01);		/* #4 Auth-status = SUCCESS */
 		break;
 	}
@@ -2056,22 +2126,40 @@ static void omci_build_mib(void)
 	/* --- discovery / management MEs --- */
 	ROW(OMCI_ME_ONU_DATA, 0x0000, OMCI_ATTR_BIT(1));	/* ME 2: MIB-Data-Sync (1B) */
 
-	/* ME 256 ONU-G: split — row A = #1 vid(4)+#2 ver(14)+#3 sn(8) = 26B (exactly
-	 * full), row B = #4(1)+#8(1)+#9(1) = 3B, row C = #11 LoID(24) alone. */
+	/* ME 256 ONU-G: ALL 14 user attrs must be uploadable. Split by size:
+	 *
+	 * GUARD: The MIB-Upload row table MUST cover ALL 14 attributes defined
+	 * in omci_me_fill() above. The prior code only uploaded 9 of 14 attrs
+	 * (missing OnuSurvivalTime, LogicalPassword, CredentialsStatus,
+	 * ExtendedTcLayerOptions, OntState). The OLT's MIB-Upload-Next sequence
+	 * reads these rows; if an attribute is missing from the upload, the
+	 * OLT's MIB audit fails and it never advances to Create/Set.
+	 *
+	 * Each row's total attribute bytes MUST fit in the 26-byte
+	 * MIB-Upload-Next value area (resp[11..36] = 26 bytes).
+	 * row A = #1 vid(4)+#2 ver(14)+#3 sn(8) = 26B (exactly full),
+	 * row B = #4..#9 = 6×1B = 6B,
+	 * row C = #10 LoID(24B) alone,
+	 * row D = #11(12)+#12(1)+#13(2)+#14(1) = 16B. */
 	ROW(OMCI_ME_ONU_G, 0x0000, OMCI_ATTR_BIT(1) | OMCI_ATTR_BIT(2) |
 				   OMCI_ATTR_BIT(3));				/* vid+ver+sn = 26B */
-	ROW(OMCI_ME_ONU_G, 0x0000, OMCI_ATTR_BIT(4) | OMCI_ATTR_BIT(8) |
-				   OMCI_ATTR_BIT(9));				/* 3B */
-	ROW(OMCI_ME_ONU_G, 0x0000, OMCI_ATTR_BIT(11));				/* LoID 24B */
+	ROW(OMCI_ME_ONU_G, 0x0000, OMCI_ATTR_BIT(4) | OMCI_ATTR_BIT(5) |
+				   OMCI_ATTR_BIT(6) | OMCI_ATTR_BIT(7) |
+				   OMCI_ATTR_BIT(8) | OMCI_ATTR_BIT(9));	/* 6B */
+	ROW(OMCI_ME_ONU_G, 0x0000, OMCI_ATTR_BIT(10));			/* LoID 24B */
+	ROW(OMCI_ME_ONU_G, 0x0000, OMCI_ATTR_BIT(11) | OMCI_ATTR_BIT(12) |
+				   OMCI_ATTR_BIT(13) | OMCI_ATTR_BIT(14));	/* 16B */
 
-	/* ME 257 ONT2-G: row A = #1 EquipmentID(20) alone, row B = the scalars. */
-	ROW(OMCI_ME_ONU2_G, 0x0000, OMCI_ATTR_BIT(1));				/* EqtID 20B */
+	/* ME 257 ONT2-G: row A = #1 EquipmentID(20) alone, row B = all scalars
+	 * (1+1+2+1+1+2+1+1+4+2+1+2+2 = 21B, fits 26B; #10 SysUpTime is UINT32=4B). */
+	ROW(OMCI_ME_ONU2_G, 0x0000, OMCI_ATTR_BIT(1));			/* EqtID 20B */
 	ROW(OMCI_ME_ONU2_G, 0x0000, OMCI_ATTR_BIT(2) | OMCI_ATTR_BIT(3) |
 				    OMCI_ATTR_BIT(4) | OMCI_ATTR_BIT(5) |
 				    OMCI_ATTR_BIT(6) | OMCI_ATTR_BIT(7) |
-				    OMCI_ATTR_BIT(9) | OMCI_ATTR_BIT(11) |
+				    OMCI_ATTR_BIT(8) | OMCI_ATTR_BIT(9) |
+				    OMCI_ATTR_BIT(10) | OMCI_ATTR_BIT(11) |
 				    OMCI_ATTR_BIT(12) | OMCI_ATTR_BIT(13) |
-				    OMCI_ATTR_BIT(14));				/* 1+2+1+1+2+1+2+2+1+2+2 = 17B */
+				    OMCI_ATTR_BIT(14));			/* 21B */
 
 	/* ME 5 Cardholder (inst 0x0101): 3B, one row. */
 	ROW(OMCI_ME_CARDHOLDER, 0x0101, OMCI_ATTR_BIT(1) | OMCI_ATTR_BIT(2) |
