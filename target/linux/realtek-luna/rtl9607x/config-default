@@ -1,0 +1,115 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# RTL9607C (interAptiv) kernel-config deltas, layered over the shared
+# config-6.18 (which carries the RLX/RTL960xC values for the rtl960x
+# subtarget). Each value here is the proven-good one from a kernel that
+# boots this exact board to "VFS: Mounted root"; it overrides the RLX value
+# for this subtarget only and leaves rtl960x untouched.
+
+#
+# CPU: MIPS interAptiv (MIPS32 R2) instead of the RLX "Taroko" (R1/R3K).
+# Crucially we do NOT select CPU_R3K_TLB here, which is what keeps the ASID
+# at the R4000 layout (SHIFT=0 / BITS=8) rather than the R3000 6/6 -- the
+# inherited-from-the-RLX-subtarget bring-up landmine.
+#
+# CONFIG_CPU_MIPS32_R1 is not set
+CONFIG_CPU_MIPS32_R2=y
+CONFIG_SYS_HAS_CPU_MIPS32_R2=y
+# CONFIG_CPU_MIPSR1 is not set
+CONFIG_CPU_MIPSR2=y
+CONFIG_CPU_HAS_PREFETCH=y
+CONFIG_CPU_R4K_FPU=y
+
+#
+# Coherent Processing System: GIC interrupt controller, Coherency Manager,
+# Cluster Power Controller. Single core, no CPU hotplug, no MT/multi-VPE SMP.
+#
+CONFIG_MIPS_CPS=y
+CONFIG_MIPS_GIC=y
+CONFIG_CLKSRC_MIPS_GIC=y
+# CLKSRC_MIPS_GIC selects CLOCKSOURCE_WATCHDOG, whose skew bound is a new
+# prompted int with no value in the minimal merged config -- pin its default
+# so kernel syncconfig stays non-interactive on a clean build.
+CONFIG_CLOCKSOURCE_WATCHDOG=y
+CONFIG_CLOCKSOURCE_WATCHDOG_MAX_SKEW_US=125
+CONFIG_SMP=y
+CONFIG_NR_CPUS=1
+# CONFIG_FORCE_NR_CPUS is not set
+# CONFIG_HOTPLUG_CPU is not set
+# CONFIG_MIPS_MT_SMP is not set
+CONFIG_CPU_MIPSR2_IRQ_VI=y
+CONFIG_CPU_MIPSR2_IRQ_EI=y
+# Pin the SMP/CPS-gated symbols that only become visible once SMP is on, so
+# the minimal merged config carries a value for each and the kernel config
+# step never has a NEW symbol to prompt for. RPS/RFS/flow-limit take their
+# upstream defaults; the CPS NS16550 early-UART poke stays off (the normal
+# 8250 console handles output).
+CONFIG_RPS=y
+CONFIG_RFS_ACCEL=y
+CONFIG_NET_FLOW_LIMIT=y
+# CONFIG_MIPS_CPS_NS16550_BOOL is not set
+
+#
+# System tick + clocksource come from the Realtek Otto SoC timer. The GIC
+# local timer / CP0 compare are not used (no gic-timer node in the DT).
+#
+CONFIG_REALTEK_OTTO_TIMER=y
+
+#
+# 100 Hz, matching the proven-good 9607C bring-up.
+#
+# CONFIG_HZ_250 is not set
+CONFIG_HZ_100=y
+CONFIG_HZ=100
+
+#
+# 512 MB DDR3 used as 320 MB of low memory; high memory disabled.
+#
+# CONFIG_HIGHMEM is not set
+
+#
+# Kernel debugging -- the reason this subtarget exists (these symbols do not
+# exist on the 9602C's 3.18 stock kernel). NOTE: OpenWrt gates ftrace/kprobes/
+# dynamic-debug through its own buildroot CONFIG_KERNEL_* options, which are
+# appended after this fragment and win, so these lines only take effect when
+# the build config also sets CONFIG_KERNEL_FTRACE=y / CONFIG_KERNEL_KPROBES=y /
+# CONFIG_KERNEL_DYNAMIC_DEBUG=y (etc.). They are kept here to record intent.
+# DEBUG_INFO and MAGIC_SYSRQ are already enabled in the shared config.
+#
+CONFIG_FTRACE=y
+CONFIG_FUNCTION_TRACER=y
+CONFIG_DYNAMIC_FTRACE=y
+CONFIG_KPROBES=y
+CONFIG_KPROBE_EVENTS=y
+CONFIG_DYNAMIC_DEBUG=y
+
+#
+# Run-from-RAM initramfs bring-up: no on-board flash backing for M1. The
+# RTL9602C GMAC/GPON drivers are for the r1/RLX sibling and do not apply here;
+# this SoC uses its own RTL9607C NIC + switch driver (M2). GPON lands in M3+.
+#
+# CONFIG_MTD_ROM is not set
+# CONFIG_MTD_PHYSMAP is not set
+# CONFIG_RTL9602C_ETH is not set
+# CONFIG_RTL9602C_GPON is not set
+# The on-chip NIC + switch live under the Realtek vendor menu, so the kernel
+# only descends into drivers/net/ethernet/realtek/ when this umbrella is set.
+CONFIG_NET_VENDOR_REALTEK=y
+CONFIG_RTL9607C_ETH=y
+#
+# The host-bridge driver built under CONFIG_PCI is the RTL9602C PCIe controller:
+# its late_initcall unconditionally registers the controller and runs SoC clock /
+# SerDes bring-up against 9602C register offsets, which differ on this SoC and
+# wedge the late-initcall phase. PCIe/WiFi for this SoC is M2+; keep PCI off for M1.
+# CONFIG_PCI is not set
+
+#
+# Match the proven-good 9607C kernel's known-good config: disable the OpenWrt
+# hardening options the stock kernel does NOT use, in case one wedges
+# mm_core_init early on this big-endian interAptiv. Bisect aid for M1 bring-up;
+# re-evaluate (re-enable individually) for the verify phase.
+#
+# CONFIG_HARDENED_USERCOPY is not set
+# CONFIG_FORTIFY_SOURCE is not set
+# CONFIG_SLAB_FREELIST_HARDENED is not set
+# CONFIG_SLAB_FREELIST_RANDOM is not set
