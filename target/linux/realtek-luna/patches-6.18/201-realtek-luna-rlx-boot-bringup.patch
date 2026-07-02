@@ -11,7 +11,7 @@ branch-to-break, cache-flush barriers, module-reloc / kexec / r4kcache support.
  cflags-$(CONFIG_CPU_R4300)	+= $(call cc-option,-march=r4300,-march=mips3) -Wa,--trap
  cflags-$(CONFIG_CPU_R4X00)	+= $(call cc-option,-march=r4600,-march=mips3) -Wa,--trap
  cflags-$(CONFIG_CPU_TX49XX)	+= $(call cc-option,-march=r4600,-march=mips3) -Wa,--trap
-+ifeq ($(CONFIG_REALTEK_LUNA),y)
++ifeq ($(CONFIG_CPU_R3K_TLB),y)
 +# The RLX ("Taroko") core uses the MIPS32 TLB/cache config but its ALU traps the
 +# SPECIAL2 multiply/count-leading group (mul/madd/msub/clz/clo) that a mips32
 +# toolchain emits.  Those faults are emulated on the reserved-instruction path,

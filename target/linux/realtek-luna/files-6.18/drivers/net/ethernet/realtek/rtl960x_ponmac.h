@@ -33,9 +33,10 @@ enum rtl960x_chip {
 	RTL960X_CHIP_9607F,	/* no register map observed yet - bring-up TBD */
 };
 
-/* Chip revision id as read from HW: A=0x1, B=0x2, ... rev>A => B+ */
+/* Chip revision id as read from HW: A=0x1, B=0x2, C=0x3, ... rev>A => B+ */
 #define RTL960X_REV_A		0x1
 #define RTL960X_REV_B		0x2
+#define RTL960X_REV_C		0x3
 
 /* Subtype (9602C family): pick GponModeV3 (9601C) vs V2 on rev>A. */
 #define RTL960X_SUBTYPE_NONE		0x00
@@ -79,6 +80,9 @@ int rtl960x_ponmac_mode_set(enum rtl960x_chip chip, int rev, int subtype,
 			    enum rtl960x_ponmode mode, const struct rtl960x_ops *o);
 int rtl960x_ponmac_serdes_cdr_reset(enum rtl960x_chip chip,
 				    const struct rtl960x_ops *o);
+
+struct seq_file;
+void rtl960x_c7_diag(const struct rtl960x_ops *o, struct seq_file *s);
 
 extern int rtl960x_c2_postmode_perturb;
 extern int rtl960x_c2_sds_cfgrst;

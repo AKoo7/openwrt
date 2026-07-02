@@ -34,7 +34,7 @@ Index: linux-6.18.31/arch/mips/include/asm/cpu-features.h
 + * fallbacks below take precedence.  (The core does implement the MIPS32
 + * LL/SC and PREF instructions, so those are left at their ISA defaults.)
 + */
-+#ifdef CONFIG_REALTEK_LUNA
++#ifdef CONFIG_CPU_R3K_TLB
 +#define cpu_has_4kex		0
 +#define cpu_has_3kex		1
 +#define cpu_has_3k_cache	0
@@ -55,7 +55,7 @@ Index: linux-6.18.31/arch/mips/include/asm/isadep.h
  #define __ASM_ISADEP_H
  
 -#if defined(CONFIG_CPU_R3000)
-+#if defined(CONFIG_CPU_R3000) || defined(CONFIG_REALTEK_LUNA)
++#if defined(CONFIG_CPU_R3000) || defined(CONFIG_CPU_R3K_TLB)
  /*
 - * R2000 or R3000
 + * R2000 or R3000 -- and the RLX "Taroko" core, which shares the R3000-style
@@ -71,7 +71,7 @@ Index: linux-6.18.31/arch/mips/include/asm/mipsregs.h
  #define read_c0_contextconfig()		__read_32bit_c0_register($4, 1)
  #define write_c0_contextconfig(val)	__write_32bit_c0_register($4, 1, val)
  
-+#ifdef CONFIG_REALTEK_LUNA
++#ifdef CONFIG_CPU_R3K_TLB
 +/*
 + * The RLX "Taroko" core has no architectural UserLocal register (CP0 $4,2).
 + * Its per-thread pointer lives in the Lexra coprocessor register $8, reached
@@ -113,7 +113,7 @@ Index: linux-6.18.31/arch/mips/kernel/Makefile
  		   vdso.o cacheinfo.o
  
  ifdef CONFIG_CPU_R3K_TLB
-+ifdef CONFIG_REALTEK_LUNA
++ifdef CONFIG_CPU_R3K_TLB
 +# The RLX "Taroko" PRId is identified by cpu_probe_legacy() in cpu-probe.c,
 +# not by the minimal cpu-r3k-probe.c, so use the full probe even though this
 +# core uses an R3000-style TLB.
@@ -147,7 +147,7 @@ Index: linux-6.18.31/arch/mips/kernel/process.c
  		p->thread.reg29 = childksp;
  		p->thread.reg31 = (unsigned long) ret_from_kernel_thread;
 -#if defined(CONFIG_CPU_R3000)
-+#if defined(CONFIG_CPU_R3000) || defined(CONFIG_REALTEK_LUNA)
++#if defined(CONFIG_CPU_R3000) || defined(CONFIG_CPU_R3K_TLB)
 +		/*
 +		 * The RLX core returns from exceptions R3000-style via the
 +		 * KU/IE bit stack rather than the R4000 EXL bit, so prime the
@@ -164,7 +164,7 @@ Index: linux-6.18.31/arch/mips/kernel/traps.c
  	goto out;
  }
  
-+#ifdef CONFIG_REALTEK_LUNA
++#ifdef CONFIG_CPU_R3K_TLB
 +/*
 + * The RLX "Taroko" core implements the MIPS-I integer base but not a handful of
 + * later opcodes a mips32 toolchain still emits: the SPECIAL2 multiply /
@@ -275,7 +275,7 @@ Index: linux-6.18.31/arch/mips/kernel/traps.c
 +
 +	return 0;
 +}
-+#endif /* CONFIG_REALTEK_LUNA */
++#endif /* CONFIG_CPU_R3K_TLB */
 +
  asmlinkage void do_ri(struct pt_regs *regs)
  {
@@ -284,7 +284,7 @@ Index: linux-6.18.31/arch/mips/kernel/traps.c
  	unsigned int opcode = 0;
  	int status = -1;
  
-+#ifdef CONFIG_REALTEK_LUNA
++#ifdef CONFIG_CPU_R3K_TLB
 +	/*
 +	 * Emulate the SPECIAL2 / conditional-trap opcodes the RLX core lacks.
 +	 * This runs before die_if_kernel() below because mips32-built kernel
@@ -325,7 +325,7 @@ Index: linux-6.18.31/arch/mips/mm/c-r4k.c
  
  static void nxp_pr4450_fixup_config(void)
  {
-+#ifndef CONFIG_REALTEK_LUNA
++#ifndef CONFIG_CPU_R3K_TLB
  	unsigned long config0;
  
  	config0 = read_c0_config();
@@ -341,7 +341,7 @@ Index: linux-6.18.31/arch/mips/mm/c-r4k.c
  
  static void coherency_setup(void)
  {
-+#ifdef CONFIG_REALTEK_LUNA
++#ifdef CONFIG_CPU_R3K_TLB
 +	/*
 +	 * The RLX core pairs an R3000-style TLB (whose EntryLo carries a single
 +	 * "uncached" bit, not the R4000 3-bit cache-coherency field) with an
@@ -364,7 +364,7 @@ Index: linux-6.18.31/arch/mips/mm/c-r4k.c
  	}
  }
  
-+#ifdef CONFIG_REALTEK_LUNA
++#ifdef CONFIG_CPU_R3K_TLB
 +/*
 + * The RLX "Taroko" core provides a single-shot cache-control register (CP0
 + * $20) that writes back+invalidates the whole D-cache and invalidates the
@@ -401,7 +401,7 @@ Index: linux-6.18.31/arch/mips/mm/c-r4k.c
 +		: "r" (LUNA_CCTL_D_WBINV), "r" (LUNA_CCTL_I_INV)
 +		: "memory");
 +}
-+#endif /* CONFIG_REALTEK_LUNA */
++#endif /* CONFIG_CPU_R3K_TLB */
 +
  void r4k_cache_init(void)
  {
@@ -410,7 +410,7 @@ Index: linux-6.18.31/arch/mips/mm/c-r4k.c
  	_dma_cache_inv		= r4k_dma_cache_inv;
  #endif /* CONFIG_DMA_NONCOHERENT */
  
-+#ifdef CONFIG_REALTEK_LUNA
++#ifdef CONFIG_CPU_R3K_TLB
 +	/*
 +	 * Route every whole-cache and range/page maintenance hook through the
 +	 * geometry-independent cache-control blast.  The DMA hooks set just
@@ -431,7 +431,7 @@ Index: linux-6.18.31/arch/mips/mm/c-r4k.c
 +	local_flush_icache_range	= (void *)luna_flush_cache_all;
 +	__flush_icache_user_range	= (void *)luna_flush_cache_all;
 +	__local_flush_icache_user_range	= (void *)luna_flush_cache_all;
-+#endif /* CONFIG_REALTEK_LUNA */
++#endif /* CONFIG_CPU_R3K_TLB */
 +
  	build_clear_page();
  	build_copy_page();
@@ -440,7 +440,7 @@ Index: linux-6.18.31/arch/mips/mm/c-r4k.c
  	 * caches. Therefore, do not use CONFIG_MIPS_CMP to decide whether
  	 * or not to flush caches.
  	 */
-+#ifdef CONFIG_REALTEK_LUNA
++#ifdef CONFIG_CPU_R3K_TLB
 +	luna_flush_cache_all();
 +#else
  	local_r4k___flush_cache_all(NULL);
@@ -463,7 +463,7 @@ Index: linux-6.18.31/arch/mips/mm/init.c
 +	 * colour-coherent temporary mapping, so skip kmap_coherent and take the
 +	 * plain-copy path (which marks the folio dcache-dirty for a later flush).
 +	 */
-+	if (!IS_ENABLED(CONFIG_REALTEK_LUNA) && cpu_has_dc_aliases &&
++	if (!IS_ENABLED(CONFIG_CPU_R3K_TLB) && cpu_has_dc_aliases &&
  	    folio_mapped(src) && !folio_test_dcache_dirty(src)) {
  		vfrom = kmap_coherent(from, vaddr);
  		copy_page(vto, vfrom);
@@ -473,7 +473,7 @@ Index: linux-6.18.31/arch/mips/mm/init.c
  
 -	if (cpu_has_dc_aliases &&
 +	/* RLX: skip the colour-coherent mapping; see copy_user_highpage(). */
-+	if (!IS_ENABLED(CONFIG_REALTEK_LUNA) && cpu_has_dc_aliases &&
++	if (!IS_ENABLED(CONFIG_CPU_R3K_TLB) && cpu_has_dc_aliases &&
  	    folio_mapped(folio) && !folio_test_dcache_dirty(folio)) {
  		void *vto = kmap_coherent(page, vaddr) + (vaddr & ~PAGE_MASK);
  		memcpy(vto, src, len);
@@ -483,7 +483,7 @@ Index: linux-6.18.31/arch/mips/mm/init.c
  
 -	if (cpu_has_dc_aliases &&
 +	/* RLX: skip the colour-coherent mapping; see copy_user_highpage(). */
-+	if (!IS_ENABLED(CONFIG_REALTEK_LUNA) && cpu_has_dc_aliases &&
++	if (!IS_ENABLED(CONFIG_CPU_R3K_TLB) && cpu_has_dc_aliases &&
  	    folio_mapped(folio) && !folio_test_dcache_dirty(folio)) {
  		void *vfrom = kmap_coherent(page, vaddr) + (vaddr & ~PAGE_MASK);
  		memcpy(dst, vfrom, len);
@@ -502,7 +502,7 @@ Index: linux-6.18.31/arch/mips/mm/tlbex.c
 +	 * instead: VA bits [21:12] select the pte within its page, scaled by 4
 +	 * -> (BadVAddr >> 10) & 0xffc.
 +	 */
-+#ifdef CONFIG_REALTEK_LUNA
++#ifdef CONFIG_CPU_R3K_TLB
 +	uasm_i_mfc0(p, pte, C0_BADVADDR);
 +	uasm_i_lw(p, ptr, 0, ptr); /* cp0 delay */
 +	uasm_i_srl(p, pte, pte, 10); /* load delay */

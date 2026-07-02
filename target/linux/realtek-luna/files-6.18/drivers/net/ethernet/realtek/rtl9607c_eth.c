@@ -541,7 +541,7 @@ static void eth_switch_init(struct rtl9607c_eth *ep)
 	/* SW_SRC_PORT_PERMIT (0x1C114) is a per-source-port EGRESS-FILTER ENABLE
 	 * (EN, 1 bit/port), NOT a permit bitmap: EN=1 turns on source-port egress
 	 * filtering and DROPS the forwarded frame after lookup/flood selection. The
-	 * vendor l2_init leaves it 0 (no filtering = forward). Writing all-ones here
+	 * working firmware leaves it 0 (no filtering = forward). Writing all-ones here
 	 * silently dropped every LAN->CPU frame (port RX climbed, CPU RX stayed flat).
 	 * Correct forwarding-permissive value is 0. */
 	sw_wr(ep, SW_SRC_PORT_PERMIT, 0x00000000);
@@ -1069,6 +1069,35 @@ static struct platform_driver rtl9607c_eth_driver = {
 	},
 };
 module_platform_driver(rtl9607c_eth_driver);
+
+/*
+ * GPON OMCI glue stubs — the shared GPON FSM (gpon-rtl9602c.c) references these
+ * symbols declared in rtl9602c_gpon_nic.h. On the 9602C the real implementations
+ * live in rtl9602c_eth.c; on the 9607C the OMCI datapath is M4 and these are
+ * minimal no-ops so the kernel links. They are enough for M3 (reach O5 + DS).
+ */
+#include "rtl9602c_gpon_nic.h"
+
+void rtl9602c_eth_set_omci_sid(unsigned int sid) { }
+EXPORT_SYMBOL(rtl9602c_eth_set_omci_sid);
+
+void rtl9602c_eth_set_omci_identity(const u8 *sn8) { }
+EXPORT_SYMBOL(rtl9602c_eth_set_omci_identity);
+
+u32 rtl9602c_eth_omci_rx_count(void) { return 0; }
+EXPORT_SYMBOL(rtl9602c_eth_omci_rx_count);
+
+u32 rtl9602c_eth_wan_rx_count(void) { return 0; }
+EXPORT_SYMBOL(rtl9602c_eth_wan_rx_count);
+
+u32 rtl9602c_eth_omci_tx_dirty(void) { return 0; }
+EXPORT_SYMBOL(rtl9602c_eth_omci_tx_dirty);
+
+void rtl9602c_eth_omci_selftest(void) { }
+EXPORT_SYMBOL(rtl9602c_eth_omci_selftest);
+
+void rtl9602c_eth_omci_report_oper_up(void) { }
+EXPORT_SYMBOL(rtl9602c_eth_omci_report_oper_up);
 
 MODULE_DESCRIPTION("Realtek RTL9607C GMAC0 + switch Ethernet driver");
 MODULE_LICENSE("GPL");

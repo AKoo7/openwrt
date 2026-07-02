@@ -85,13 +85,16 @@ CONFIG_DYNAMIC_DEBUG=y
 
 #
 # Run-from-RAM initramfs bring-up: no on-board flash backing for M1. The
-# RTL9602C GMAC/GPON drivers are for the r1/RLX sibling and do not apply here;
-# this SoC uses its own RTL9607C NIC + switch driver (M2). GPON lands in M3+.
+# RTL9602C GMAC driver is for the r1/RLX sibling and does not apply here; this
+# SoC uses its own RTL9607C NIC + switch driver (M2). The GPON driver IS shared
+# (chip-agnostic family lib + the interAptiv c7 path, picked by DT compatible),
+# so it is enabled here for M3 (SerDes/PON-MAC ranging -> O5).
 #
 # CONFIG_MTD_ROM is not set
 # CONFIG_MTD_PHYSMAP is not set
 # CONFIG_RTL9602C_ETH is not set
-# CONFIG_RTL9602C_GPON is not set
+CONFIG_RTL9602C_GPON=y
+# CONFIG_RTL9607C_GPON is not set
 # The on-chip NIC + switch live under the Realtek vendor menu, so the kernel
 # only descends into drivers/net/ethernet/realtek/ when this umbrella is set.
 CONFIG_NET_VENDOR_REALTEK=y
@@ -113,3 +116,4 @@ CONFIG_RTL9607C_ETH=y
 # CONFIG_FORTIFY_SOURCE is not set
 # CONFIG_SLAB_FREELIST_HARDENED is not set
 # CONFIG_SLAB_FREELIST_RANDOM is not set
+# CONFIG_LD_DEAD_CODE_DATA_ELIMINATION is not set

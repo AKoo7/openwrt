@@ -26,6 +26,8 @@
 #include <linux/delay.h>
 #include <linux/errno.h>
 #include <linux/kernel.h>
+#include <linux/seq_file.h>
+#include <linux/bits.h>
 
 /* ---- op-table format (original) --------------------------------------- */
 enum r960_opc {
@@ -760,6 +762,7 @@ static int rtl9603cvd_serdes_cdr_reset(const struct rtl960x_ops *o)
 #define C7_SDS_ANA_GPON37	0x1b040714u /* analog GPON: GPHY dly-clk/lock-up lim */
 #define C7_SDS_ANA_GPON43	0x1b04072cu /* analog GPON: TX delay-clock select    */
 #define C7_FIB_EXT_REG21	0x1b040e54u /* fiber ext: analog-ready status        */
+#define C7_FIB_REG0		0x1b040c00u /* [11] FP_CFG_FIB_PDOWN (0 = fiber on) */
 
 /* fixed chip parameters for the GPON datapath */
 #define C7_PON_PORT		5	/* PON port index for per-port registers */
@@ -941,6 +944,7 @@ static int c7_gpon_post(const struct rtl960x_ops *o)
  * drop will not knock the MAC down.
  */
 static const struct r960_op c7_sds_v1[] = {
+	WR(C7_FIB_REG0,            0x1140),	/* fiber analog: power on (PDOWN=0)*/
 	FLD(C7_SDS_CFG,        4,  0, 0x1f),	/* lane mode: off (parked)        */
 	FLD(C7_WSDS_DIG_00,    4,  4, 0x1),	/* force 125 MHz reference clock   */
 	FLD(C7_WSDS_DIG_02,   10, 10, 0x0),	/* clear BEN power-down            */
@@ -980,6 +984,7 @@ static const struct r960_op c7_sds_v1[] = {
  * (Kp1/Kp2, RX Kp1_2/Kp2_2) plus a CDR Kd write that only exists on this rev.
  */
 static const struct r960_op c7_sds_v2[] = {
+	WR(C7_FIB_REG0,            0x1140),	/* fiber analog: power on (PDOWN=0)*/
 	FLD(C7_SDS_CFG,        4,  0, 0x1f),	/* lane mode: off (parked)        */
 	FLD(C7_WSDS_DIG_00,    4,  4, 0x1),	/* force 125 MHz reference clock   */
 	FLD(C7_WSDS_DIG_02,   10, 10, 0x0),	/* clear BEN power-down            */
@@ -1021,6 +1026,7 @@ static const struct r960_op c7_sds_v2[] = {
  * lock limits, then switch into GPON and reset+re-arm as the other revs do.
  */
 static const struct r960_op c7_sds_v3[] = {
+	WR(C7_FIB_REG0,            0x1140),	/* fiber analog: power on (PDOWN=0)*/
 	FLD(C7_SDS_CFG,        4,  0, 0x1f),	/* lane mode: off (parked)        */
 	FLD(C7_WSDS_DIG_00,    4,  4, 0x1),	/* force 125 MHz reference clock   */
 	FLD(C7_WSDS_DIG_02,   10, 10, 0x0),	/* clear BEN power-down            */
@@ -1720,10 +1726,10 @@ static int rtl9602c_ponmac_mode_set(const struct rtl960x_ops *o,
  * values open logical queues 0..9 on T-CONT 0 (0x3FF) and the same 10-queue
  * width in the high half-word for T-CONT 1 (0x03FF0000), and enable T-CONT 0
  * and 1 (0x03). These are the literal whole-word values the stock EPON
- * bring-up writes; they overwrite the earlier per-queue queue_add(0..7 on
+ * bring-up writes; they overwrite the earlier per-queue add (queues 0..7 on
  * sched 0) loop, and the per-queue strict/CIR=0/PIR=max/weight=1 shaping is
  * already applied to every queue by rtl9601b_ponmac_init - so the stock
- * queue_add loop collapses to these authoritative whole-word writes. */
+ * per-queue-add loop collapses to these authoritative whole-word writes. */
 #define C1B_R_QMAP0		0x1BF0213Cu	/* == C1B_R_QMAP_BASE (T-CONT 0) */
 #define C1B_R_QMAP1		0x1BF02140u	/* QMAP_BASE + 4    (T-CONT 1)  */
 /* C1B_R_TCONT_EN (0x1BF0215C) is already defined in the GPON section.         */
@@ -2552,6 +2558,47 @@ static int rtl9607c_ponmac_mode_set_epon(const struct rtl960x_ops *o,
 	return c7_epon_post(o);
 }
 
+
+/*
+ * 9607C live diagnostic: print the SerDes / FIB / GTC-LOS status registers
+ * that pin down the downstream signal-detect state. Read-only, for /proc/gpon.
+ */
+#define C7_SDS_FIB_STATUS	0x1b00028cu
+#define C7_GTC_DS_LOS		0x1b701040u
+/*
+ * FIB signal-detect source-select / force. The FIB front-end that produces
+ * SDS_SDET has its own SD source mux; neither the working firmware's GPON mode-set nor our
+ * port programs it (left at power-on reset), so it is the prime untried lead
+ * for a dead SDS_SDET: [2] SEL_RX_SD selects the RX SD source, [10] FRC_SD
+ * force-asserts it. Read it here so the live state is visible in /proc/gpon.
+ */
+#define C7_FIB_REG16		0x1b040c40u
+
+void rtl960x_c7_diag(const struct rtl960x_ops *o, struct seq_file *s)
+{
+	u32 fib0, com09, fib21, sds_sts, gtc_los, sds_cfg, wsd18, fib16;
+
+	if (!o || !o->rd)
+		return;
+
+	fib0    = o->rd(C7_FIB_REG0);
+	com09   = o->rd(C7_SDS_ANA_COM09);
+	fib21   = o->rd(C7_FIB_EXT_REG21);
+	sds_sts = o->rd(C7_SDS_FIB_STATUS);
+	gtc_los = o->rd(C7_GTC_DS_LOS);
+	sds_cfg = o->rd(C7_SDS_CFG);
+	wsd18   = o->rd(C7_WSDS_DIG_18);
+	fib16   = o->rd(C7_FIB_REG16);
+
+	seq_printf(s,
+		"c7_sd: fib_reg0=0x%08x com09=0x%08x fib21=0x%08x sds_fib_sts=0x%08x gtc_los=0x%08x sds_cfg=0x%08x wsd18=0x%08x fib_reg16=0x%08x\n",
+		fib0, com09, fib21, sds_sts, gtc_los, sds_cfg, wsd18, fib16);
+	seq_printf(s,
+		"c7_sd: sds_sdet=%u fib100_sdet=%u link_ok=%u analog_ready=%u optic_los=%u frc_los=%u sel_rx_sd=%u frc_sd=%u\n",
+		!!(sds_sts & BIT(17)), !!(sds_sts & BIT(2)), !!(sds_sts & BIT(4)),
+		!!(fib21 & BIT(13)), !!(gtc_los & BIT(8)),
+		!!(wsd18 & BIT(14)), !!(fib16 & BIT(2)), !!(fib16 & BIT(10)));
+}
 
 /* ---- dispatch --------------------------------------------------------- */
 int rtl960x_ponmac_init(enum rtl960x_chip chip, int rev, int subtype,
