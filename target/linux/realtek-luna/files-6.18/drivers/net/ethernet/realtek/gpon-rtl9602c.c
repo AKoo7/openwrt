@@ -946,15 +946,18 @@ static bool gpon_data_gem_solicited;	/* OLT has sent the OMCI GEM-CTP (ME268) Cr
 					 * reclaim->DEACT). Stock waits for the OLT's create. Cleared on Deactivate
 					 * so each re-admit waits for the OLT's fresh ME268. Set from the eth OMCI rx. */
 static bool gpon_data_tcont_installed;	/* the OLT's DATA Alloc-ID bound to the DATA T-CONT (8) */
-static u16 gpon_omcc_alloc = 0x100;	/* OMCC Alloc-ID = 0x100 (live stock value).
-		 * The HSGQ-G008 OLT grants alloc 0x100 for T-CONT 1 (its lineprofile's
-		 * first T-CONT), NOT alloc 0 (the G.984.3 default). Binding T-CONT 16
-		 * to alloc 0x100 makes bwm_acpt>0 (grants accepted). With alloc 0,
-		 * bwm_acpt=0 (no grants) → no US GEM → "Laser out".
-		 *
-		 * NOTE: the OLT's lineprofile uses "tcont 1" so it grants alloc 0x100
-		 * on T-CONT 1. We bind this alloc to T-CONT 16 (our OMCC T-CONT) so
-		 * the OMCC rides the OLT's T-CONT 1 grants. */
+static u16 gpon_omcc_alloc;	/* OMCC Alloc-ID override; 0 (default) = bind the LIVE ONU-ID.
+		 * ★ROOT-CAUSE FIX (2026-07-03, source + live-stock-fresh differential): the OMCC's
+		 * upstream Alloc-ID IS the ONU-ID (G.984.3 implicit default). Stock binds the GTC
+		 * alloc-CAM[T-CONT16] = the live ONU-ID (dal path gpon_dev_onuid_set ->
+		 * gpon_dev_tcont_physical_add(obj, onuid) forces T-CONT16 for alloc<255). The OLT
+		 * grants the ONU on alloc = ONU-ID with NO Assign_Alloc-ID; the CAM resolves that
+		 * grant to T-CONT16 and the framer drains qid64. The OLD 0x100 default was WRONG: the
+		 * CAM then held 0x100 (an alloc the OLT never grants), so every default-alloc grant
+		 * MISSED the CAM, T-CONT16 was unreachable, DBRu reported 0, and the OLT never
+		 * escalated the BWMap flags 0x9(overhead)->0x0(payload) -> gemus64=0, "Laser out".
+		 * The "0x100 makes bwm_acpt>0" note was a RED HERRING: bwm_acpt counts ONU-ID-
+		 * addressed grants, not CAM hits. 0 => auto (bind gpon_fsm_onu_id); nonzero = A/B. */
 #define GPON_OMCC_TCONT_ALT	1	/* Alternative T-CONT for alloc 0x100 (OLT's tcont 1) */
 module_param(gpon_omcc_alloc, ushort, 0644);
 MODULE_PARM_DESC(gpon_omcc_alloc, "OMCC Alloc-ID override (0=auto, 1=ONU-ID+1 for OLTs that grant T-CONT 1 not 0)");
@@ -3059,6 +3062,21 @@ MODULE_PARM_DESC(serdes_recommit, "1=also re-commit SerDes inside the O5 mode_se
 static unsigned int pir_drop;
 module_param(pir_drop, uint, 0644);
 MODULE_PARM_DESC(pir_drop, "PON_GEN_PIR_DROP bit18@0x2194: 0=rev-A erratum clear (default, drains T-CONT16), 1=set");
+
+/* sch_ctrl_stock: write PON_SCH_CTRL (0x2194) to the EXACT value measured on LIVE STOCK
+ * (0x00066000) instead of only field-poking bit18. Live-stock (tier-1) read on Board C's
+ * own NAND firmware, Online+bursting (gemus64 climbing): 0x2194 = 0x00066000 =
+ *   PON_GEN_PIR_DROP(b18)=1 | METER_OP(b17)=1 | PON_WFQ_BURSTSIZE[15:0]=0x6000
+ * (WFQ_MODE b19=0, WFQ_IFG b16=0). Our driver set ONLY bit18 (=0) and left METER_OP=0 and
+ * WFQ_BURSTSIZE=0 at reset — so the scheduler ran with a ZERO burst allowance and the wrong
+ * meter mode. The DSC_PIPE_VLD=0 wall (framer never drains qid64 despite grants) survived
+ * every prior pir_drop A/B because those toggled ONLY bit18, never METER_OP / WFQ_BURSTSIZE.
+ * A zero WFQ_BURSTSIZE plausibly denies the queue any transmit burst -> pipe never arms.
+ * The rev-A "must clear PIR_DROP" note is DISPROVEN by this live read (stock rev-A has it
+ * SET). Default on = match stock; A/B with gpon_rtl9602c.sch_ctrl_stock=0. */
+static bool sch_ctrl_stock = true;
+module_param(sch_ctrl_stock, bool, 0644);
+MODULE_PARM_DESC(sch_ctrl_stock, "1=write PON_SCH_CTRL 0x2194=0x66000 verbatim from live stock (PIR_DROP+METER_OP+WFQ_BURSTSIZE); 0=legacy bit18-only (default on)");
 /* DPRU_RPT_PRD (0x2568): DBA_BLKSIZE=48 (byte->block divisor the HW uses to encode the
  * DBRu queued-occupancy report the OLT reads to size grants). Stock writes 0x3002 once at
  * init; ours had regressed this write out -> the OLT reads 0 queued despite qid64 holding
@@ -3066,6 +3084,85 @@ MODULE_PARM_DESC(pir_drop, "PON_GEN_PIR_DROP bit18@0x2194: 0=rev-A erratum clear
 static bool dbru_blksize = true;
 module_param(dbru_blksize, bool, 0644);
 MODULE_PARM_DESC(dbru_blksize, "1=write DPRU_RPT_PRD 0x2568=0x3002 (DBA_BLKSIZE=48, DBRu report divisor; default on)");
+/* SIDVALID[64] RE-ISSUED after the T-CONT-16 queue-add arm — the "post-arm SID-valid
+ * re-write" our driver had omitted. Stock (dal_rtl9602c_ponmac queue_add tail) writes
+ * SIDVALID[64] at TWO points: once early in the classify triple (SID2QID + SIDVALID +
+ * OMCI_CFG at mode_set — we KEEP this, it matches stock and must not be removed) AND
+ * again at the END of queue_add, after drain + T-CONT-enable + qmap + rates, re-committing
+ * the SID->armed-queue binding to the scheduler. We were missing that second write; this
+ * adds it (gated to the OMCC qid). The load-bearing detail is the ORDERING — SIDVALID
+ * (re)written AFTER the arm — NOT an "over_sts occupancy latch": over_sts (0x256c) is a
+ * near-full PBO backpressure watermark that nothing in the scheduler/DBA reads (the DBRu
+ * reports the raw used_page count 0x2564), so it stays 0 for a small OMCI backlog even
+ * when this works. Judge success by gemus64 climbing + sidpage64 draining + the OLT
+ * resuming grants, NEVER by over_sts64. Default on; A/B via gpon_rtl9602c.sidvalid_last=0. */
+static bool sidvalid_last = true;
+module_param(sidvalid_last, bool, 0644);
+MODULE_PARM_DESC(sidvalid_last, "1=re-issue SIDVALID[64] after the T-CONT-16 arm (stock queue_add tail does this; we had omitted it) (default on)");
+/* Bind the OMCC Alloc-ID to a SECOND T-CONT (GPON_OMCC_TCONT_ALT=1) in addition to
+ * T-CONT 16. This was an early workaround for a "bwm_acpt=0" (no grants) symptom, but it
+ * is NON-STOCK: stock binds exactly ONE T-CONT per Alloc-ID (rt_gpon _AssignNonUsedTcontId
+ * refuses a duplicate). With TWO GTC alloc-CAM entries for alloc 0x100, a BWMAP grant
+ * resolves to the EMPTY T-CONT 1 (qid 0), so the DBRu reports T-CONT 1's occupancy = 0
+ * while qid 64 (T-CONT 16) actually holds the pages -> the OLT reads 0 -> grants once ->
+ * stops -> gemus64=0, no drain, no bank-underflow, then DEACT (the exact observed wall).
+ * Default OFF (match stock: alloc 0x100 -> T-CONT 16 only). A/B via
+ * gpon_rtl9602c.omcc_alt_bind=1. */
+static bool omcc_alt_bind;
+module_param(omcc_alt_bind, bool, 0644);
+MODULE_PARM_DESC(omcc_alt_bind, "1=also bind the OMCC alloc to T-CONT 1 (non-stock double-bind that makes the DBRu report the empty T-CONT; default off = stock one-T-CONT-per-alloc)");
+/* Re-assert AUTO_PROC_SSTART (US_PROC_MODE 0x5200 bit0) at O5. It gates the HW
+ * auto-processing of each grant's SStart to START the US-TX burst. Written once at
+ * init, but the ranging GMAC/SerDes reset (same 0x52xx US region we already re-arm at
+ * O5) can clear it -> on an operational grant the HW never opens the US window -> the
+ * GEM-US framer never fires (idle16=0, gemus64=0, bank_underfl=0, dead air -> OLT
+ * "Laser out"). Re-writing it at O5 entry closes that. Default on; A/B via
+ * gpon_rtl9602c.o5_sstart=0. */
+static bool o5_sstart = true;
+module_param(o5_sstart, bool, 0644);
+MODULE_PARM_DESC(o5_sstart, "1=re-assert AUTO_PROC_SSTART (0x5200 bit0) at O5 so the HW starts the US burst on each grant (default on)");
+/* Re-arm the GEM-US US-feed run-state with the FULL WSDS GPON-datapath reset-B edge
+ * (WSDS_DIG_00 0x22030 bit10) right after the O3 TX-PLL relock — the one edge the
+ * O5-light re-arm omits. The relock (a SerDes reset) re-parks the feed; this un-parks
+ * it. RISK: pulsing the WSDS GPON reset-B may drop the DS framer lock at O3. Default
+ * OFF (try o5_sstart first); A/B via gpon_rtl9602c.o3_feed_reset=1. */
+static bool o3_feed_reset;
+module_param(o3_feed_reset, bool, 0644);
+MODULE_PARM_DESC(o3_feed_reset, "1=pulse WSDS GPON datapath reset-B + light feed re-arm after the O3 TX-PLL relock to un-park the GEM-US framer (default off; risks DS lock)");
+/* Per-tick US-feed re-arm at O5: our one-shot O5-entry feed re-arm gets re-parked by
+ * later SerDes resets / the OMCC-install drain-out BEFORE the OLT's first grant, so
+ * pages stage in PON-IP SRAM (dsc_sts sram_used>0) but are never built into a DRAM
+ * descriptor the GTC framer consumes (dram_used=0) -> framer emits nothing on the grant
+ * (idle16=0, gemus64=0). Re-strobe the feed FIFO each ~10ms poll tick WHILE staged-but-
+ * not-draining, so the feed is live when grants land. Self-terminating (stops the instant
+ * gemus64 advances) -> no steady-state hot-path cost. Default on; A/B gpon_rtl9602c.feed_rekick=0. */
+static bool feed_rekick = true;
+module_param(feed_rekick, bool, 0644);
+MODULE_PARM_DESC(feed_rekick, "1=per-tick self-terminating US-feed FIFO re-arm at O5 while pages staged but not draining (default on)");
+/* DIAGNOSTIC bisection: force the GTC framer to emit idle-GEM on grant windows
+ * (FS_GEM_IDLE 0x6020 bit31=1), independent of the page feed. If idle16 then climbs, the
+ * framer IS receiving T-CONT16 grants (fault is US-feed starvation -> feed_rekick). If
+ * idle16 STAYS 0, grants never reach the framer (scheduling/drain dead). Stock=0; test only. */
+static bool force_idle;
+module_param(force_idle, bool, 0644);
+MODULE_PARM_DESC(force_idle, "1=set FS_GEM_IDLE (0x6020 bit31) to force idle-GEM on grants -- bisection diagnostic (default off, stock=0)");
+
+/* us_intr_svc: service (read-to-clear) the upstream GPON interrupt DELTA latches each O5
+ * tick. The known-good unit is EVENT-DRIVEN: on every GTC_US interrupt it reads
+ * GTC_US_INTR_DLT (0x5000) — a read-to-clear delta register — which acks the latched US
+ * sub-events (captured live: GPON_INTR_STS 0x0044 bit5=GTC_US goes 0x20->0x00 the instant
+ * 0x5000 is read). Our poll-only port never reads 0x5000/0x6000, so the US delta latches
+ * FOREVER. Hypothesis (evidence: overhead/DBRu bursts fire continuously while the payload
+ * framer stays dead with pages staged in SRAM but 0 fetched to DRAM): the descriptor-fetch
+ * FSM back-pressures on the unacked sticky delta and never starts the staging->framing
+ * transfer. Reading the raw delta clears it regardless of the mask, so this is a safe
+ * no-mask, no-IRQ-handler service — just the read-to-clear the known-good unit does. If
+ * gemus64 then climbs, servicing IS the fix; if not, the fetch is autonomous and the stall
+ * is elsewhere. Default off so the first /proc-gpon 'usintr:' read shows the pre-service
+ * latched state (the clean discriminator) before this starts clearing it. */
+static bool us_intr_svc;
+module_param(us_intr_svc, bool, 0644);
+MODULE_PARM_DESC(us_intr_svc, "1=read-to-clear the US GPON interrupt deltas (0x5000/0x5008/0x6000/0x6008) each O5 tick (default off)");
 
 /* swcore TBL_ACCESS engine (L2/VLAN tables) */
 #define TBL_CTRL_OFF	0x12000u
@@ -3224,20 +3321,12 @@ void rtl9602c_full_sdk_datapath_init(void)
 	}
 	pi_field(0x02150, 29, 16, 5);			/* PON_BW_THRES last     */
 	pi_field(0x02150, 13, 0, 5);			/* PON_BW_THRES runt     */
-	pi_field(0x02194, 18, 18, pir_drop ? 1 : 0);	/* PON_GEN_PIR_DROP: rev-A erratum.
-						 * The part powers up with bit18=1; on the GPON rev-A
-						 * mode-set CLEARS it: "rev-A must turn off
-						 * PON_GEN_PIR_DROP, due to the tcont 16"
-						 * With it SET on rev-A the
-						 * scheduler never dequeues T-CONT 16 / qid 64, so qid64
-						 * never drains into the GEM-US TX bank -> BANK_UNDERFL,
-						 * gemus64=0 (PIR=MAX does NOT save it — the erratum is
-						 * per-T-CONT, not a rate limit). The prior "keep it 1"
-						 * guard read the power-up DEFAULT (before the
-						 * rev-A clear) and its "clearing didn't help" test
-						 * ran while the GEM_US_PORT_MAP stride bug masked it.
-						 * Default 0 = the correct rev-A value; A/B with
-						 * gpon_rtl9602c.pir_drop=1. */
+	if (sch_ctrl_stock)
+		/* Match LIVE STOCK exactly: PIR_DROP(b18)=1 | METER_OP(b17)=1 |
+		 * WFQ_BURSTSIZE[15:0]=0x6000. See sch_ctrl_stock param comment. */
+		pi_wr(0x02194, 0x00066000u);
+	else
+		pi_field(0x02194, 18, 18, pir_drop ? 1 : 0);	/* legacy bit18-only A/B */
 	for (idx = 0; idx < 8; idx++) {
 		pi_field(0x023e8, idx, idx, 0);		/* WFQ_TYPE = STRICT     */
 		pi_field(0x02198 + idx * 4, 31, 0, 0);	/* QID_CIR_RATE = 0      */
@@ -3665,6 +3754,7 @@ MODULE_PARM_DESC(o5_feed_rearm,
 	"re-arm the US-feed FIFO at O5 (after OMCC install), softirq-safe (feed FIFO edge only, NO WSDS soft-reset). Needed because our O3 TX-PLL relock (a SerDes reset) re-parks the US-feed AFTER the pre-ranging datapath_rearm, so it underflows on the first grant unless re-armed post-relock");
 
 static u32 gpon_us_feed_rearm_cnt;	/* count of US-feed re-arms (pre-FSM + O5), shown in /proc/gpon */
+static u32 gpon_us_intr_svc_cnt;	/* count of US-intr delta reads that found a latched event (us_intr_svc) */
 
 /*
  * Faithful re-express of the working firmware's GPON datapath soft-reset — run as the
@@ -3926,6 +4016,31 @@ static u32 gpon_alloc_cam_read(u8 tcont)
 	return ((ind & BIT(13)) ? BIT(16) : 0) | (gpon_rd(0x10cc) & 0xfff);
 }
 
+/* Set every GTC alloc-CAM entry EXCEPT `keep` to 0xFFF (a reserved Alloc-ID the OLT
+ * never grants). The CAM is content-addressable: the HW resolves a BWMap grant's
+ * Alloc-ID by SEARCHING all 32 T-CONT entries. When the OMCC alloc = ONU-ID = 0 and
+ * the unwritten/other entries also read 0, that search is AMBIGUOUS and can resolve a
+ * grant to the wrong (empty) T-CONT instead of T-CONT16 — the residual that made a
+ * correct CAM[16]=0 bind still not drain. Parking the others at 0xFFF makes the
+ * ONU-ID entry the unique match. Bounded poll; runs once per (re-)activation. Any real
+ * data T-CONT is re-bound afterwards by gpon_install_data_gem, so this is safe. */
+static void __maybe_unused gpon_alloc_cam_clear_others(u8 keep)
+{
+	u8 t;
+
+	for (t = 0; t < 32; t++) {
+		int i;
+
+		if (t == keep)
+			continue;
+		gpon_wr(0x10c0, (1u << 8) | (t & 0x1f));		/* OP_MODE=WRITE, REQ=0 */
+		gpon_wr(0x10c4, 0xfff);					/* alloc = 0xFFF (reserved, never granted) */
+		gpon_wr(0x10c0, (1u << 8) | (t & 0x1f) | BIT(15));	/* REQ=1 -> trigger */
+		for (i = 0; i < 1000 && !(gpon_rd(0x10c0) & BIT(14)); i++)
+			udelay(1);				/* poll OP_COMPL */
+	}
+}
+
 /* DS-PIPELINE STAGE-A: per-flow de-encapsulated GEM frame count (indirect):
  * GPON_GTC_DS_PORT_CNTR_IND(0x1140) IDX[6:0]=flow|RSEL[8]=0(pkt)/1(byte), poll
  * R_ACK(bit15), read GPON_GTC_DS_PORT_CNTR_STAT(0x1144). Unlike gem_ds_rx_cnt
@@ -4131,6 +4246,71 @@ static int gpon_proc_show(struct seq_file *s, void *v)
 			   pi_rd(0x4058), pi_rd(0x5434), gpon_rd(0x6500 /* GEM_US_PORT_MAP[flow 64] = 0x6400+64*4; macros defined later in file */),
 			   pi_rd(0x2144), pi_rd(0x2138), pi_rd(0x2130),
 			   pi_rd(0x2138) & 0x7fUL, pi_rd(0x2154));
+		/* sched64: US queue-64 (OMCI T-CONT 16) drain-side witnesses on one line.
+		 *   total_pg   = PONIP_TOTAL_PAGE_CNT_US[12:0] (0x2560) = US pages staged in
+		 *                on-chip SRAM. This IS the raw occupancy the DBRu reports to
+		 *                the OLT (per-SID 0x2564); the "~70" wedge = pages queued but
+		 *                not draining. ON SUCCESS it should DRAIN toward 0.
+		 *   bank_underfl = GPON_GEM_US_INTR_STS BANK_UNDERFL_IND (GTC 0x6008 bit0) =
+		 *                the GEM-US framer fired on an empty TX bank (the drain-wall
+		 *                signature). Should stay 0 once the queue drains cleanly.
+		 *   over_sts64 = PONIP_SID_OVER_STS bit for SID 64 (0x256c bitmap: SID n ->
+		 *                word 0x256c+4*(n>>5), bit n&31; SID64 -> word 0x2574 bit0).
+		 *                ⚠ This is a near-FULL PBO backpressure watermark (~2000-7904
+		 *                pages), NOT a DBRu/grant trigger and NOT read by the
+		 *                scheduler/DBA (verified vs stock chipdef+ponmac). It STAYS 0
+		 *                for a small OMCI backlog EVEN ON SUCCESS — do NOT use it as
+		 *                the pass/fail signal; it is a congestion indicator only.
+		 *                over_latch64 = latched twin (0x2578, SID64 -> 0x2580 bit0).
+		 *                dis_dbru_latch = PON_SCH_OPT bit19 (0x25d8; must be 0).
+		 * PASS/FAIL = gemus64 climbing + total_pg draining + the OLT resuming grants,
+		 * NEVER over_sts64. All direct reads (no DBG_CTRL_US strobe -> no 0x86000
+		 * encap hazard); raw words included to disambiguate the bitmap packing on HW. */
+		seq_printf(s, "sched64: total_pg=%u over_sts64=%u over_latch64=%u bank_underfl=%u dis_dbru_latch=%u [over 0x256c/70/74=%08x/%08x/%08x latch80=%08x schopt=%08x gemintr=%08x]\n",
+			   pi_rd(0x2560) & 0x1fffu,
+			   pi_rd(0x2574) & 1u,
+			   pi_rd(0x2580) & 1u,
+			   gpon_rd(0x6008) & 1u,
+			   (pi_rd(0x25d8) >> 19) & 1u,
+			   pi_rd(0x256c), pi_rd(0x2570), pi_rd(0x2574),
+			   pi_rd(0x2580), pi_rd(0x25d8), gpon_rd(0x6008));
+		/* feed64: the US-feed / framer witnesses (drain-path stage 3/4).
+		 * dsc_sts = PON_DSC_STS_US (0x2158): SRAM_USED[12:0] pages staged in on-chip
+		 * SRAM, DRAM_USED[28:16] pages the PON-IP has handed toward the GTC US path.
+		 * sstart = AUTO_PROC_SSTART (0x5200 bit0): the per-grant burst-start gate
+		 * (must read 1 for the framer to fire; verifies the o5_sstart re-assert took).
+		 * feed_cnt = US-feed re-arm count (pre-FSM + O5 + any O3). If pages are staged
+		 * (total_pg>0) but the framer emits nothing (gemus64=0, bank_underfl=0), check
+		 * whether sstart=1 and whether dram_used advances (feed handing pages to GTC). */
+		seq_printf(s, "feed64: dsc_sts(0x2158)=0x%08x[sram_used=%u dram_used=%u] sstart(0x5200)=%u feed_cnt=%u\n",
+			   pi_rd(0x2158), pi_rd(0x2158) & 0x1fffu, (pi_rd(0x2158) >> 16) & 0x1fffu,
+			   gpon_rd(0x5200) & 1u, gpon_us_feed_rearm_cnt);
+		/* usdram: the AUTHORITATIVE US SRAM->DRAM staging state (tier-3: the drain is HW-
+		 * autonomous, so a stalled staging = a DRAM-config fault, not a missing kick). The
+		 * real used-page counter is PON_DSC_USAGE_US(0x20ec) [read by usUsedPageCount_get],
+		 * NOT the 0x2158 above; DSC_PIPE_VLD(bit31)=0 => the descriptor pipe is idle.
+		 * mstbase(0x20e8)=US DRAM ring base (stock=0x07eff000; ours=virt_to_phys of a 1MB
+		 * __get_free_pages pool — if 0/unreachable the DMA has no target => SRAM fills, DRAM
+		 * stays 0). dsccfg(0x215c): [12:0]SRAM_NO [28:16]RAM_NO. runout(0x20e0): [12:0]SRAM
+		 * [28:16]DRAM_RUNOUT (0 while DRAM reserved => engine sees DRAM permanently run-out).
+		 * ponipctl(0x20d8) bit0=CFG_PBUF_EN (US packet-buffer 'go'). */
+		seq_printf(s, "usdram: usage(0x20ec)=0x%08x[pipe_vld=%u] mstbase(0x20e8)=0x%08x dsccfg(0x215c)=0x%08x runout(0x20e0)=0x%08x ponipctl(0x20d8)=0x%08x[pbuf_en=%u]\n",
+			   pi_rd(0x20ec), (pi_rd(0x20ec) >> 31) & 1u,
+			   pi_rd(0x20e8), pi_rd(0x215c), pi_rd(0x20e0),
+			   pi_rd(0x20d8), pi_rd(0x20d8) & 1u);
+		/* usintr: the GPON interrupt latch state — Fable-5 discriminator for "HW-event-latched
+		 * FSM state a write-diff can't see". Stock's RESTING GPON_INTR_MASK(0x0040)=0x22
+		 * (GTC_DS|GTC_US enabled) and its US events fire as GPON_INTR_STS(0x0044) bit5=GTC_US_INTR;
+		 * GTC_US_INTR_DLT(0x5000) latches the sub-events (stock live=0x8420). Our poll-only driver
+		 * never enables the masks nor clears the latched STS/DLT. If a US event sits LATCHED-and-
+		 * unserviced here (sts/dlt non-zero, mask=0) while the framer is stalled, that is the wall:
+		 * the US transmit FSM waits on a CPU ack our poll never gives. top_mask/top_sts = 0x0040/44;
+		 * gtcus dlt/mask/sts = 0x5000/04/08; gemus dlt/mask/sts = 0x6000/04/08. */
+		seq_printf(s, "usintr: top[mask0x40=0x%08x sts0x44=0x%08x] gtcus[dlt=0x%08x mask=0x%08x sts=0x%08x] gemus[dlt=0x%08x mask=0x%08x sts=0x%08x] svc_cnt=%u\n",
+			   gpon_rd(0x0040), gpon_rd(0x0044),
+			   gpon_rd(0x5000), gpon_rd(0x5004), gpon_rd(0x5008),
+			   gpon_rd(0x6000), gpon_rd(0x6004), gpon_rd(0x6008),
+			   gpon_us_intr_svc_cnt);
 		/* PON-IP OMCI packet counters (from the chip's register map, SoC base 0x1b000000 ->
 		 * swcore offsets): OMCI_RX_PKT_CNT 0x329c0 (DS OMCI de-encapsulated by the
 		 * PON-IP, DISTINCT from my GTC 0x4064 idx6), DROP 0x329b8, CRC_ERR 0x329cc,
@@ -4154,6 +4334,20 @@ static int gpon_proc_show(struct seq_file *s, void *v)
 			u32 a16 = gpon_alloc_cam_read(16);
 
 			seq_printf(s, "us_alloc: tc16=alloc0x%x hit%u\n", a16 & 0xfff, !!(a16 & BIT(16)));
+		}
+		/* bwmap: THE decisive alloc-match witness — the Alloc-IDs the OLT is ACTUALLY
+		 * granting this ONU, read from the GTC BWMAP capture engine (GPON_BWMAP_CTRL
+		 * 0x200c CAP_EN bit15 arms it; captured allocation words at GPON_BWMAP_DATA
+		 * 0x2400+; status 0x2010). Each captured allocation carries a granted 12-bit
+		 * Alloc-ID. Cross vs us_alloc tc16 (=0x100): if NO captured Alloc-ID equals the
+		 * CAM's alloc, every operational grant is a CAM MISS -> bwm_acpt=0 (silent
+		 * drop, no fail/inv). Raw words shown; read /proc twice for a fresh capture. */
+		{
+			gpon_wr(0x0200c, gpon_rd(0x0200c) | (1u << 15));	/* CAP_EN arm */
+			seq_printf(s, "bwmap: ctrl(0x200c)=0x%08x sts(0x2010)=0x%08x d[0..5]=%08x %08x %08x %08x %08x %08x\n",
+				   gpon_rd(0x0200c), gpon_rd(0x02010),
+				   gpon_rd(0x02400), gpon_rd(0x02404), gpon_rd(0x02408),
+				   gpon_rd(0x0240c), gpon_rd(0x02410), gpon_rd(0x02414));
 		}
 		/* US GTC emission breakdown: PLOAM (idx2 cpu / idx3 auto) vs GEM (idx4 byte /
 		 * idx1 dbru) + per-T-CONT-16 idle-GEM (TCONT_IDLE_BYTE_STAT[16] = 0x6c00+16*64
@@ -4969,6 +5163,18 @@ static int gpon_install_omcc(u16 gem)
 	if (o5_feed_rearm)
 		gpon_us_feed_rearm_light();
 
+	/* Re-assert AUTO_PROC_SSTART at O5 (see o5_sstart): the HW's per-grant
+	 * SStart auto-processing that STARTS the US burst. Written once at init but the
+	 * ranging reset can clear this 0x52xx US-side reg (the same region we re-arm),
+	 * leaving the framer parked on operational grants (idle16=0, gemus64=0). */
+	if (o5_sstart) {
+		gpon_wr(GPON_GTC_US_WRITE_PROTECT, GPON_US_WP_UNLOCK);
+		gpon_field(0x5200, 0, 0, 1);	/* US_PROC_MODE.AUTO_PROC_SSTART = 1 */
+		gpon_wr(GPON_GTC_US_WRITE_PROTECT, GPON_US_WP_LOCK);
+		pr_info("rtl9602c-gpon: O5 re-asserted AUTO_PROC_SSTART (0x5200 bit0=%u)\n",
+			gpon_rd(0x5200) & 1u);
+	}
+
 	pr_info("rtl9602c-gpon: OMCC installed gem=%u flow=%u (compl %d)\n",
 		gem, GPON_OMCC_FLOW, i);
 	return 0;
@@ -5222,6 +5428,48 @@ static int gpon_install_tcont(u8 tcont, u16 alloc)
 		 * stock writes weight 1 even for a STRICT queue ("for safe") — a zero-weight
 		 * queue is skipped by the WFQ round. */
 		pi_field(0x023f8 + (qid / 3) * 4, (qid % 3) * 10 + 9, (qid % 3) * 10, 1);
+		/* SIDVALID[SID 64] RE-ISSUE — re-write the OMCC classifier's SID-valid bit
+		 * NOW, after the queue is fully armed (drained, T-CONT-enabled, in the
+		 * schedule mask, rated). Stock's ponmac queue_add tail does exactly this:
+		 * it re-issues SIDVALID for every SID mapping into the just-armed queue, so
+		 * the SID->queue binding is (re)committed to the scheduler AFTER the arm.
+		 * Our driver had only the early classify-triple write and omitted this
+		 * post-arm re-write. We re-issue with a PLAIN set(1) — matching stock's
+		 * queue_add tail, a same-value RMW that still lands as a real register strobe
+		 * (the HW re-commits on the write ORDER, not a 0->1 edge). We do NOT
+		 * clear-then-set: the momentary SIDVALID=0 glitched an in-flight US burst and
+		 * the OLT latched "Laser out" -> deactivate/churn. This is an ORDER fix, not
+		 * an "over_sts latch" fix (over_sts is a near-full PBO watermark nothing reads).
+		 * SCOPE: fires only for the OMCC qid. In the default config (data_tcont=0)
+		 * the WAN data flow SHARES qid 64, so it is re-committed here too. If
+		 * data_tcont=1 (multi-alloc OLT) is ever enabled, the data flow gets its
+		 * OWN physical qid and would need the same post-arm re-issue — extend this
+		 * gate to also match the data qid and re-issue SIDVALID[GPON_DATA_FLOW]. */
+		if (sidvalid_last && qid == GPON_OMCC_PHYS_QID) {
+			/* arm_ctx witness: sample the queue's arm state at the instant we
+			 * re-issue SIDVALID. In the correct order all three are set here. If
+			 * any is missing, a future regression moved SIDVALID before the arm
+			 * again — warn on the console so it is caught on boot #1, not weeks
+			 * later. */
+			u32 en   = (pi_rd(0x023e4 + (tcont / 32) * 4) >> (tcont % 32)) & 1u;
+			u32 qmap = pi_rd(0x023a0 + tcont * 4) & 0x3u;
+			u32 pir  = pi_rd(0x0229c + qid * 4) & 0x3ffffu;
+
+			if (en && qmap && pir)
+				pr_info("rtl9602c-gpon: SIDVALID[%u] arm_ctx OK (tcont_en=1 sch_qmap=%u pir=0x%x) -> re-issuing on armed queue\n",
+					GPON_OMCC_FLOW, qmap, pir);
+			else
+				pr_warn("rtl9602c-gpon: SIDVALID[%u] re-issued with arm INCOMPLETE (tcont_en=%u sch_qmap=%u pir=0x%x) -> binding committed against un-armed queue\n",
+					GPON_OMCC_FLOW, en, qmap, pir);
+
+			/* Plain re-issue SIDVALID[64]=1 — matches stock's queue_add tail (a
+			 * same-value RMW that IS a real register strobe; the HW re-commits the
+			 * SID->queue binding on the write ORDER, not on a 0->1 edge). NO clear:
+			 * a momentary SIDVALID[64]=0 can drop an in-flight US burst -> the OLT
+			 * latches "Laser out" -> deactivate/churn (observed on the clear-then-set
+			 * boot: OLT went Online -> Inactive/Laser-out). */
+			pi_packed_set(PI_PON_SIDVALID, GPON_OMCC_FLOW, 1, 1);	/* re-issue = 1 (RMW strobe) */
+		}
 		/* PON_SCH_CTRL (0x2194) is NOT written here — PIR_DROP (bit18) is cleared
 		 * for rev-A in rtl9602c_full_sdk_datapath_init() (pir_drop param). Board C's
 		 * own stock k0 binary confirms rev-A clears PIR_DROP "due to the tcont 16"
@@ -5538,6 +5786,16 @@ static void gpon_fsm_handle(const u8 *m)
 			gpon_fsm_set_state(2);
 			gpon_fsm_set_state(3);
 			gpon_txpll_relock();	/* re-lock TX CMU PLL now DS optics are stable, before US burst */
+			if (o3_feed_reset) {
+				/* The relock (SerDes reset) re-parks the GEM-US US-feed run-state.
+				 * Un-park it with the FULL WSDS GPON-datapath reset-B edge (the one
+				 * the O5-light re-arm omits), here at O3 while DS is not yet locked
+				 * (see o3_feed_reset; risks the DS lock). */
+				sw_field(WSDS_DIG_00, 10, 10, 0);
+				sw_field(WSDS_DIG_00, 10, 10, 1);
+				gpon_us_feed_rearm_light();
+				pr_info("rtl9602c-gpon: O3 post-relock WSDS feed-reset edge (un-park GEM-US framer)\n");
+			}
 			gpon_send_sn();		/* first SN immediately */
 		}
 		break;
@@ -5574,15 +5832,23 @@ static void gpon_fsm_handle(const u8 *m)
 			 * captures the real alloc into gpon_omcc_alloc for subsequent re-ranges. */
 			/* Use the override alloc if set (module_param), otherwise the
 			 * known alloc from a prior activation, otherwise the placeholder. */
-			if (gpon_omcc_alloc != 0)
-				tcont16_alloc = gpon_omcc_alloc;
-			else
-				tcont16_alloc = gpon_fsm_onu_id;
+			/* The OMCC US alloc IS the live ONU-ID (G.984.3 default; stock
+			 * gpon_dev_tcont_physical_add(obj, onuid)). Override only for A/B. */
+			tcont16_alloc = gpon_omcc_alloc ? gpon_omcc_alloc : gpon_fsm_onu_id;
 			gpon_install_tcont(GPON_OMCC_TCONT, tcont16_alloc);
-			/* Also bind T-CONT 1 to the same alloc — the OLT's lineprofile
-			 * uses "tcont 1" so it grants on T-CONT 1. Without this, the
-			 * BWMAP grant for alloc 0x100 has no T-CONT to drive → bwm_acpt=0. */
-			if (tcont16_alloc != gpon_fsm_onu_id)
+			{
+				u32 rb = gpon_alloc_cam_read(GPON_OMCC_TCONT);
+
+				pr_info("rtl9602c-gpon: CAM[16] readback alloc=0x%x hit=%u (want 0x%x)\n",
+					rb & 0xfff, !!(rb & BIT(16)), tcont16_alloc);
+			}
+			/* NON-STOCK double-bind (default OFF, see omcc_alt_bind): binding
+			 * alloc 0x100 ALSO to T-CONT 1 makes the GTC alloc-CAM resolve a BWMAP
+			 * grant to the EMPTY T-CONT 1 (qid 0), so the DBRu reports 0 occupancy
+			 * for it while qid 64 (T-CONT 16) holds the pages -> the OLT grants once
+			 * then stops -> gemus64=0. Stock binds alloc 0x100 to T-CONT 16 ONLY;
+			 * leave this off so grants drive T-CONT 16 / qid 64. */
+			if (omcc_alt_bind && tcont16_alloc != gpon_fsm_onu_id)
 				gpon_install_tcont(GPON_OMCC_TCONT_ALT, tcont16_alloc);
 			pr_info("rtl9602c-gpon: OLT assigned ONU-ID %u (T-CONT 16 <- alloc 0x%x, %s)\n",
 				gpon_fsm_onu_id, tcont16_alloc,
@@ -5736,17 +6002,16 @@ static void gpon_fsm_handle(const u8 *m)
 			 * saw the OMCC upstream operate, kept re-Configure_Port-ID and withheld OMCI.
 			 * On stock this same alloc is bound to T-CONT 16 and its OMCC emits (~10M). */
 			if (d[2] == 0x01) {
-				if (!gpon_tcont_installed) {
-					/* first Alloc-ID = the OMCC mgmt alloc -> T-CONT 16 */
-					if (!gpon_install_tcont(GPON_OMCC_TCONT, alloc)) {
-						gpon_tcont_installed = true;
-						gpon_omcc_alloc = alloc;
-					}
-				} else if (data_tcont && alloc != gpon_omcc_alloc &&
-					   !gpon_data_tcont_installed) {
-					/* the OLT's separate DATA Alloc-ID -> its OWN T-CONT 8, so the
-					 * OLT's DBA sees a live reporting T-CONT and does not reclaim/
-					 * deactivate it (see data_tcont). */
+				/* ★ROOT-CAUSE FIX (2026-07-03): Assign_Alloc-ID carries a DATA
+				 * Alloc-ID (the HSGQ OLT sends 0x100, >=255 = a data alloc per
+				 * G.984.3/SDK: alloc>=255 -> a non-16 T-CONT; alloc<255 = OMCC-implicit).
+				 * The OMCC (T-CONT16) rides the LIVE ONU-ID, bound at Assign_ONU-ID, and
+				 * is NEVER reassigned here. The OLD code bound this alloc to T-CONT16,
+				 * OVERWRITING the ONU-ID so the OLT's default-alloc(=ONU-ID) grants
+				 * missed the alloc-CAM -> T-CONT16 unreachable -> gemus64=0 (the
+				 * months-long wall). Bind it to the DATA T-CONT (8); T-CONT16 stays
+				 * = ONU-ID. gpon_omcc_alloc is left 0 (ONU-ID) — never set from here. */
+				if (alloc != gpon_fsm_onu_id && !gpon_data_tcont_installed) {
 					if (!gpon_install_tcont(GPON_DATA_TCONT, alloc)) {
 						gpon_data_tcont_installed = true;
 						gpon_data_alloc = alloc;
@@ -5754,17 +6019,7 @@ static void gpon_fsm_handle(const u8 *m)
 							alloc, GPON_DATA_TCONT, GPON_DATA_PHYS_QID);
 					}
 				}
-			} else if (d[2] == 0xff && gpon_tcont_installed &&
-				   alloc == gpon_omcc_alloc) {
-				/* OLT revoked the OMCC/active alloc (this single-alloc OLT reuses one
-				 * Alloc-ID for OMCC + data). Don't fall through to a bare ack and loop a
-				 * full re-range: clear the bind so the next op=0x1 for this alloc re-binds
-				 * T-CONT 16 cleanly (idempotent CAM) and re-arm the operational report.
-				 * Self-heal in place -- never a reboot. */
-				gpon_tcont_installed = false;
-				gpon_avc_sent = 0;
-				pr_info("rtl9602c-gpon: OMCC alloc 0x%x revoked -> re-bind on next allocate\n", alloc);
-			} else if (d[2] == 0xff && data_tcont &&
+			} else if (d[2] == 0xff &&
 				   gpon_data_tcont_installed && alloc == gpon_data_alloc) {
 				/* OLT deallocated the data Alloc-ID: allow a clean re-bind on the next
 				 * allocate (the alloc CAM binding is idempotent; no HW teardown needed). */
@@ -5928,6 +6183,34 @@ static void gpon_fsm_poll(struct timer_list *t)
 	    ((gpon_fsm_ticks - gpon_o5_entry_tick) % 150) == 0) {
 		rtl9602c_eth_omci_report_oper_up();
 		gpon_avc_sent++;
+	}
+
+	/* feed_rekick: per-tick self-terminating US-feed FIFO re-arm (see param comment).
+	 * The one-shot O5-entry feed re-arm is re-parked by our later SerDes resets /
+	 * OMCC-install drain-out BEFORE the OLT's first grant, so pages stage in PON-IP SRAM
+	 * (PON_DSC_STS_US sram_used>0) but never build a DRAM descriptor (dram_used==0) and
+	 * the framer emits nothing on the grant. Re-strobe the feed each tick while staged-
+	 * but-not-draining so it is live when grants land; auto-stops once gemus64 advances. */
+	if (feed_rekick && gpon_fsm_state == 5 && gpon_omcc_installed) {
+		u32 dsc = pi_rd(0x02158);
+
+		if ((dsc & 0x1fffu) > 0 && ((dsc >> 16) & 0x1fffu) == 0 &&
+		    gpon_rd(0x06a00) == 0)
+			gpon_us_feed_rearm_light();
+	}
+
+	/* us_intr_svc: ack the upstream GPON interrupt deltas the known-good unit services on
+	 * every GTC_US event (read-to-clear GTC_US_INTR_DLT 0x5000 + GEM_US_INTR_DLT 0x6000, and
+	 * their STS twins). The reads themselves clear the sticky latch; if the fetch FSM was
+	 * back-pressuring on it, the payload framer unstalls and gemus64 begins to climb. */
+	if (us_intr_svc && gpon_fsm_state == 5 && gpon_omcc_installed) {
+		u32 gtcus_dlt = gpon_rd(0x5000);	/* read-to-clear GTC_US delta */
+		u32 gemus_dlt = gpon_rd(0x6000);	/* read-to-clear GEM_US delta */
+
+		(void)gpon_rd(0x5008);			/* GTC_US_INTR_STS */
+		(void)gpon_rd(0x6008);			/* GEM_US_INTR_STS */
+		if (gtcus_dlt || gemus_dlt)
+			gpon_us_intr_svc_cnt++;
 	}
 
 	/* O5 provisioning watchdog (see o5_provision_watchdog_ticks). A boot that
@@ -6584,7 +6867,7 @@ skip_bosa_init:
 	 * is 0, so every US GEM frame (incl OMCC OMCI responses) carries PTI=000 even on
 	 * end-of-fragment; some OLTs (e.g. ALU) only accept OMCI with
 	 * NON_END_FRAG=0 and END_FRAG=1. Set it so the upstream GEM/OMCC is well-formed. */
-	gpon_wr(0x6020, 0x00001010);
+	gpon_wr(0x6020, force_idle ? 0x80001010u : 0x00001010u);	/* FS_GEM_IDLE(bit31)=force_idle: bisection diag (stock=0) */
 	gpon_wr_us_protected(GPON_GTC_US_LASER, GPON_US_LASER_VAL);
 
 	/*
