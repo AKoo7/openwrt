@@ -3974,6 +3974,13 @@ static int rtl9602c_eth_probe(struct platform_device *pdev)
 	}
 
 	ndev->netdev_ops = &rtl9602c_eth_netdev_ops;
+	/* Permit a LIVE MAC change (no iface down/up): the per-board MAC is applied
+	 * by the gpon_provision boot script after probe. eth0 is the shared GMAC that
+	 * also carries the GPON upstream OMCI TX; a down/up to change the MAC tears
+	 * down the GMAC rings + the once-at-probe GPON TX setup and permanently kills
+	 * the US-OMCI path (OLT Deactivate/"Laser out" churn). A live set only
+	 * reprograms the RX-filter IDR via ndo_set_mac_address, leaving TX intact. */
+	ndev->priv_flags |= IFF_LIVE_ADDR_CHANGE;
 	netif_carrier_off(ndev);
 
 	/* INTC input 26 (GMAC0). <=0 -> no DT mapping: open() runs pure-poll. */

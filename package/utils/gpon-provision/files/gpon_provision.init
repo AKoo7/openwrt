@@ -32,9 +32,13 @@ apply_mac() {
 	fi
 	# Idempotent: skip if already set.
 	[ "$(cat /sys/class/net/$ifname/address 2>/dev/null)" = "$mac" ] && return 0
-	ip link set dev "$ifname" down 2>/dev/null
-	ip link set dev "$ifname" address "$mac" && log "set $ifname MAC $mac"
-	ip link set dev "$ifname" up 2>/dev/null
+	# Set the MAC LIVE, without a down/up: eth0 is the SHARED GMAC that carries the
+	# GPON upstream OMCI TX. Bringing it down tears down the GMAC rings and the
+	# GPON-specific TX setup (done once at driver probe, not re-done on ndo_open),
+	# permanently killing the US-OMCI path -> the OLT keeps issuing Deactivate /
+	# "Laser out" and the ONU churns O5<->O1. The driver sets IFF_LIVE_ADDR_CHANGE
+	# so a live address write just reprograms the RX-filter IDR (TX untouched).
+	ip link set dev "$ifname" address "$mac" && log "set $ifname MAC $mac (live)"
 }
 
 provision() {
