@@ -38,9 +38,10 @@ define Package/luci-app-gpon/install
 	$(INSTALL_DIR) $(1)/www/luci-static/resources/view/status/include
 	$(INSTALL_DATA) ./htdocs/luci-static/resources/view/status/include/35_gpon.js \
 		$(1)/www/luci-static/resources/view/status/include/35_gpon.js
-	$(INSTALL_DIR) $(1)/usr/libexec/rpcd
-	$(INSTALL_BIN) ./root/usr/libexec/rpcd/gpon \
-		$(1)/usr/libexec/rpcd/gpon
+	# The rpcd 'gpon' status backend (usr/libexec/rpcd/gpon) is shipped by the
+	# target base-files (its actively-maintained copy), so it is NOT installed
+	# here -- doing so collided with base-files. This app provides the UI, menu
+	# and ACL only; the ACL references the ubus 'gpon' object base-files provides.
 	$(INSTALL_DIR) $(1)/usr/share/luci/menu.d
 	$(INSTALL_DATA) ./root/usr/share/luci/menu.d/luci-app-gpon.json \
 		$(1)/usr/share/luci/menu.d/luci-app-gpon.json
