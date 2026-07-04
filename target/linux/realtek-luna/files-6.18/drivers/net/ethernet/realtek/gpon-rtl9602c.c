@@ -5301,6 +5301,13 @@ int gpon_install_data_gem(void)
 				      GPON_OMCC_PHYS_QID & 0x7f);
 			pi_packed_set(PI_PON_SIDVALID, GPON_DATA_FLOW, 1, 1);
 
+			/* ★2026-07-04: re-force the US-NIC<->GMAC0 internal-MII link UP
+			 * (0x4058, golden 0x106e8400) BEFORE the commit edge — the symmetric
+			 * twin of the DS re-force below. The ifup GMAC0 power-cycle can drop
+			 * this US link, so the flow-1 classify edge latched only ~50/50 (that
+			 * is the real "~50% flow-1 US half-boot": DISCOVER egresses only when
+			 * the link happened to be up). boot2's lucky .247 was a coin-flip win. */
+			pi_wr(PI_MEDIA_STS_US, 0x106e8400u);
 			/* commit edge: GMII_RX_EN OFF -> ON latches the classify table */
 			pi_wr(PI_IO_CMD_0_US, 0x90101050u);	/* GMII RX OFF */
 			udelay(50);
