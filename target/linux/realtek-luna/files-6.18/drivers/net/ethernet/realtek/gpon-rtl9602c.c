@@ -657,6 +657,22 @@ MODULE_PARM_DESC(usnic_initrdy_repulse, "on PONIC_INITRDY timeout, re-pulse CDR 
 static bool cdr_stuck_recover = true;
 module_param(cdr_stuck_recover, bool, 0644);
 MODULE_PARM_DESC(cdr_stuck_recover, "recover a wedged DS CDR (GTC_DS_STS==0xca0eca0f) by toggling SP_SDS_EN_RX, like stock (default on)");
+
+/* Periodic DS multiframe/BWmap ESD-recover (stock gpon_esdRecover). The DS framer can
+ * byte-lock (LOF clear, gtc_ds_sts=0x04, OMCI/GEM fine) yet come up with the multiframe/
+ * PLEND word phase mis-latched -- a 1-of-4 power-on roll of the GTC->US-scheduler grant
+ * handoff. The BWmap can then not be located, no US alloc grants match (bwm_acpt stays 0),
+ * no upstream burst egresses, and the OLT deacts (~1/4 cold boots; re-range keeps the bad
+ * phase). Watch the cumulative PLEND/LOM fail counter (a static gtc_ds_sts snapshot hides
+ * it) while byte-locked; when it climbs past the stock threshold, pulse the RX-CDR reset
+ * (gpon_cdr_reset_worker, 0x225b0 bit15) to re-roll the DS word phase into a good one. */
+#define GPON_GTC_DS_MISC_CNTR_LOM 0x1198	/* [31:16]=PLEND_FAIL [15:0]=SUPERFRAME_LOS(LOM); clear-on-read */
+#define GTC_DS_STS_LOF		BIT(1)		/* loss-of-frame; clear = framer byte-locked */
+#define GPON_ESD_INTERVAL_MS	5000		/* stock gpon_esdRecover_interval */
+#define GPON_ESD_THRESHOLD	20		/* stock gpon_esdRecover_threshold */
+static bool gpon_esd_recover = true;
+module_param(gpon_esd_recover, bool, 0644);
+MODULE_PARM_DESC(gpon_esd_recover, "periodic RX-CDR re-lock when the DS PLEND/LOM parse fails while byte-locked (stock gpon_esdRecover; fixes the ~1/4 grant-deaf churn; default on)");
 #define GPON_CDR_STUCK_MAX	8	/* bounded re-acquire attempts per range cycle */
 static unsigned int gpon_cdr_stuck_count;	/* diag: total wedges detected */
 static unsigned int gpon_cdr_stuck_fixed;	/* diag: wedges cleared by the toggle */
@@ -6457,6 +6473,39 @@ static void gpon_fsm_poll(struct timer_list *t)
 			}
 		} else {
 			cdr_tries = 0;	/* healthy -> reset the consecutive-attempt cap */
+		}
+	}
+
+	/* Periodic DS multiframe/BWmap ESD-recover (stock gpon_esdRecover_expire, ~5s): re-roll
+	 * the DS word phase when the framer is byte-locked but the PLEND/LOM parse is failing
+	 * (BWmap unlocatable -> bwm_acpt=0 -> grant-deaf deact loop, ~1/4 cold boots). See the
+	 * gpon_esd_recover comment for the mechanism. Read the fail counter only while LOF is
+	 * clear; gpon_rd is FSM-softirq-safe (unlike pi_rd). The CDR pulse itself runs in the
+	 * gpon_cdr_reset_work workqueue, so its 10ms wait stays off this softirq. */
+	if (gpon_esd_recover && gpon_fsm_state >= 3) {
+		static unsigned long esd_last_j;
+		static bool esd_init;
+		static u32 esd_relocks;
+
+		if (!esd_init) {
+			esd_last_j = jiffies;
+			esd_init = true;
+		} else if (time_after(jiffies,
+				      esd_last_j + msecs_to_jiffies(GPON_ESD_INTERVAL_MS))) {
+			u32 sts = gpon_rd(GPON_GTC_DS_INTR_STS);
+
+			esd_last_j = jiffies;
+			if (!(sts & GTC_DS_STS_LOF)) {		/* framer byte-locked */
+				u32 v = gpon_rd(GPON_GTC_DS_MISC_CNTR_LOM);
+				u32 fail = ((v >> 16) & 0xffff) + (v & 0xffff);
+
+				if (fail > GPON_ESD_THRESHOLD) {
+					esd_relocks++;
+					pr_warn_ratelimited("rtl9602c-gpon: ESD-recover: DS PLEND/LOM fail=%u byte-locked at O%u (BWmap mis-phased) -> RX-CDR re-lock #%u\n",
+							    fail, gpon_fsm_state, esd_relocks);
+					schedule_work(&gpon_cdr_reset_work);
+				}
+			}
 		}
 	}
 
