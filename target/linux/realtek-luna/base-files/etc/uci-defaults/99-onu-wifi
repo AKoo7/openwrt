@@ -22,6 +22,10 @@ PSK=$(printf '%s' "${MAC}${SN}" | sha256sum 2>/dev/null | cut -c1-12)
 
 uci -q batch <<EOF
 set wireless.default_radio0.ssid='$SSID'
+# WPA2-PSK for now. WPA2/WPA3-mixed (sae-mixed) needs 802.11w/PMF, which the rtl8192fe
+# AP driver does not yet support -- with sae-mixed a WPA3-first phone fails SAE and may
+# not fall back, giving zero association. WPA2-only is deterministic (all clients use the
+# WPA2 path). Re-enable sae-mixed once PMF is added to the driver.
 set wireless.default_radio0.encryption='psk2'
 set wireless.default_radio0.key='12345678'
 set wireless.radio0.country='BO'

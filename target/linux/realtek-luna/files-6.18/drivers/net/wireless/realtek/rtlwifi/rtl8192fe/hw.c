@@ -830,7 +830,18 @@ static bool _rtl92fe_init_mac(struct ieee80211_hw *hw)
 
 	/* Set RCR register */
 	rtl_write_dword(rtlpriv, REG_RCR, rtlpci->receive_config);
-	rtl_write_word(rtlpriv, REG_RXFLTMAP2, 0xffff);
+	/* Per-frame-type RX subtype filter maps. Only RXFLTMAP2 (management) was
+	 * programmed before; RXFLTMAP0 (data) + RXFLTMAP1 (control) were left at the
+	 * chip reset default, which drops the client's DATA frames. ★2026-07-05: this
+	 * is the WiFi ASSOCIATION bug: the WPA 4-way-handshake EAPOL messages (M2/M4)
+	 * are DATA frames — with RXFLTMAP0 unset the AP admits the auth/assoc (mgmt via
+	 * RXFLTMAP2) but never receives the client's EAPOL replies, so the 4-way handshake
+	 * times out and hostapd deauthenticates the STA ("local deauth request"). Program
+	 * the full triple to the values this driver's DESIGN.md specifies: data=accept-all,
+	 * control=PS-Poll only (so AP power-save clients work), management=accept-all. */
+	rtl_write_word(rtlpriv, REG_RXFLTMAP0, 0xffff);	/* data: accept all subtypes (incl. EAPOL) */
+	rtl_write_word(rtlpriv, REG_RXFLTMAP1, 0x0400);	/* control: admit PS-Poll (subtype 10) */
+	rtl_write_word(rtlpriv, REG_RXFLTMAP2, 0xffff);	/* management: accept all subtypes */
 
 	/* Set TCR register */
 	rtl_write_dword(rtlpriv, REG_TCR, rtlpci->transmit_config);
