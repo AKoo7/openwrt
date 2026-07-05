@@ -578,6 +578,17 @@ module_param(los_rerange_ticks, uint, 0644);
 MODULE_PARM_DESC(los_rerange_ticks, "drop to O1 + re-range after a REAL downstream LOS (optic_los AND no SerDes sig-detect) persists this many ~10ms ticks (fiber-pull recovery; 0=off, default 30 ~300ms ~= stock TO2)");
 static u32 gpon_los_run;			/* consecutive real-LOS (optic_los & !sds_sdet) tick count */
 
+/* Fiber-pull / re-range diagnostic (event-driven, NO per-tick logging -- the feed_rekick flood
+ * lesson). gpon_rerange_cnt = completed O5->..->O5 recoveries (LOS/deact); gpon_last_outage_ms =
+ * wall time from the drop below O5 to the O5 re-entry of the most recent one. Shown on-demand in
+ * the /proc/gpon "fiber:" summary; the completion is logged once per event, flap-damped so a
+ * marginal/flapping link cannot storm the log (counters still count -- only log lines throttle).
+ * Declared here (before the /proc show handler that reads them) so the summary line compiles. */
+static u32 gpon_rerange_cnt;
+static u32 gpon_last_outage_ms;
+static unsigned long gpon_rerange_start_j;
+static unsigned long gpon_rerange_last_log_j;
+
 /* last DS PLOAM type drained this cycle, surfaced on the periodic O5 line */
 static u8 gpon_last_ds_type;
 /* DIAGNOSTIC: force the upstream laser continuously on (US_CFG.FS_LON). Tests
@@ -3145,16 +3156,24 @@ MODULE_PARM_DESC(o5_sstart, "1=re-assert AUTO_PROC_SSTART (0x5200 bit0) at O5 so
 static bool o3_feed_reset;
 module_param(o3_feed_reset, bool, 0644);
 MODULE_PARM_DESC(o3_feed_reset, "1=pulse WSDS GPON datapath reset-B + light feed re-arm after the O3 TX-PLL relock to un-park the GEM-US framer (default off; risks DS lock)");
-/* Per-tick US-feed re-arm at O5: our one-shot O5-entry feed re-arm gets re-parked by
- * later SerDes resets / the OMCC-install drain-out BEFORE the OLT's first grant, so
- * pages stage in PON-IP SRAM (dsc_sts sram_used>0) but are never built into a DRAM
- * descriptor the GTC framer consumes (dram_used=0) -> framer emits nothing on the grant
- * (idle16=0, gemus64=0). Re-strobe the feed FIFO each ~10ms poll tick WHILE staged-but-
- * not-draining, so the feed is live when grants land. Self-terminating (stops the instant
- * gemus64 advances) -> no steady-state hot-path cost. Default on; A/B gpon_rtl9602c.feed_rekick=0. */
-static bool feed_rekick = true;
+/* Per-tick US-feed re-arm at O5. ★DEFAULT OFF 2026-07-04 — this keeper was the SUSTAINED-WAN-DATA
+ * KILLER. It was meant to re-strobe the US-feed FIFO only until the OLT's first grant lands, then
+ * self-terminate "the instant gemus64 advances". But gemus64 (GEM_US_BYTE_STAT[64] @0x6a00) and the
+ * dram_used field it keys on NEVER advance on this datapath (the real US data does NOT flow through the
+ * SRAM->DRAM staging these counters track — proven: DHCP/DNS/NTP-to-internet all worked with gemus64,
+ * sidpage64, dram_used ALL reading 0). So the self-terminate condition is permanently false and the
+ * keeper fires FOREVER, ~60x/second. gpon_us_feed_rearm_light() pulses PI_IO_CMD_0_US 0x...50->0x...70
+ * = a GMII_RX_EN OFF->ON edge every ~16ms, which TRUNCATES any in-flight US ingest. The result: US TX
+ * dies after a few minutes (variance) while DS survives + O5 holds, AND the ~10s-after-O5 US-OMCI
+ * exchange gets truncated -> the OLT deactivates (the intermittent early churn). A/B (feed_rekick=0)
+ * boot: 231/231 DNS round-trips over 228s + ZERO DEACT churn, vs baseline dying at ~100-156s + an early
+ * DEACT. The one-shot O5-entry feed re-arm (gpon_us_feed_rearm_light @ O5 entry) is sufficient for the
+ * cold-start feed-park it was meant to fix (DHCP still succeeds). Kept as an opt-in diagnostic param;
+ * do NOT default it on again without a self-terminate that keys on a RELIABLE progress signal (a per-
+ * tick GMII edge is toxic to sustained US either way). A/B via gpon_rtl9602c.feed_rekick=1. */
+static bool feed_rekick;
 module_param(feed_rekick, bool, 0644);
-MODULE_PARM_DESC(feed_rekick, "1=per-tick self-terminating US-feed FIFO re-arm at O5 while pages staged but not draining (default on)");
+MODULE_PARM_DESC(feed_rekick, "1=per-tick US-feed FIFO re-arm at O5 (DEFAULT OFF: the per-tick GMII edge truncates in-flight US bursts + kills sustained WAN data; opt-in diagnostic only)");
 /* DIAGNOSTIC bisection: force the GTC framer to emit idle-GEM on grant windows
  * (FS_GEM_IDLE 0x6020 bit31=1), independent of the page feed. If idle16 then climbs, the
  * framer IS receiving T-CONT16 grants (fault is US-feed starvation -> feed_rekick). If
@@ -3810,8 +3829,12 @@ static void gpon_us_feed_rearm_light(void)
 	pi_field(PI_PONIP_CTL_US, 0, 0, 1);	/* PBUF_EN = 1                   */
 	pi_wr(PI_IO_CMD_0_US, 0x90101070u);	/* GMII latch -> re-arm the feed */
 	gpon_us_feed_rearm_cnt++;
-	pr_info("rtl9602c-gpon: US-feed FIFO re-armed at O5 (feed edge, no reset, cnt=%u)\n",
-		gpon_us_feed_rearm_cnt);
+	/* Heartbeat only: this fires every FSM tick, so logging each one floods the console
+	 * and drowns serial diagnostics. The count is the useful signal -- log it periodically
+	 * (still readable, no flood). */
+	if (!(gpon_us_feed_rearm_cnt % 1000))
+		pr_info("rtl9602c-gpon: US-feed FIFO re-armed at O5 (feed edge, no reset, cnt=%u)\n",
+			gpon_us_feed_rearm_cnt);
 }
 
 /* Full BOSA page2 (slave 0x54) + page3 (slave 0x55) register dump for diagnostics.
@@ -4090,6 +4113,25 @@ static int gpon_proc_show(struct seq_file *s, void *v)
 	seq_printf(s, "onu_state:   O%u (%s)\n", state,
 		   state < ARRAY_SIZE(gpon_onu_state_name) &&
 		   gpon_onu_state_name[state] ? gpon_onu_state_name[state] : "?");
+	/* ★ fiber: one-glance fiber-pull / optical recovery verdict (on-demand snapshot; the DDM
+	 * i2c read is process-context here, safe). rerange = LOS/deact recoveries since boot +
+	 * the last outage duration; the DATA-PLANE VERDICT (omcc + DATA GEM installed) answers the
+	 * exact question when internet does NOT return after a fiber reconnect: "the link re-ranged
+	 * to O5, but did the WAN data path actually rebuild?" DATA_GEM_inst=0 at a held O5 => the
+	 * data GEM never re-installed (the bug class this session's fiber fix addresses). RX dBm
+	 * near sensitivity (~-28 Class B+) or a big drop vs a good boot => a marginal/dirty link. */
+	{
+		u32 los = gpon_rd(GPON_GTC_DS_LOS_CFG_STS);
+		int rxc = bosa_read_reg(0x311) & 0xff;
+		int rx_cdbm = (rxc * 2513) / 100 - 4100;
+
+		seq_printf(s, "fiber:       rerange=%u last_outage=%ums | optic_los=%d sdet=%d rx=%d.%02ddBm | omcc_inst=%d DATA_GEM_inst=%d solicited=%d\n",
+			   gpon_rerange_cnt, gpon_last_outage_ms,
+			   !!(los & GPON_OPTIC_LOS_SIG),
+			   !!(sw_rd(SDS_FIB_STATUS) & SDS_FIB_SDS_SDET),
+			   rx_cdbm / 100, (rx_cdbm < 0 ? -rx_cdbm : rx_cdbm) % 100,
+			   gpon_omcc_installed, gpon_data_installed, gpon_data_gem_solicited);
+	}
 	seq_printf(s, "onu_id:      %u\n",
 		   (status >> GPON_ONU_ID_SHIFT) & GPON_ONU_ID_MASK);
 	seq_printf(s, "eqd:         inframe=%u multiframe=%u\n",
@@ -4425,6 +4467,28 @@ static int gpon_proc_show(struct seq_file *s, void *v)
 			pc = pi_rd(0x2564);
 			seq_printf(s, "sidpage64: used=%u max=%u (max>0 = OMCI ENQUEUED to queue 64) [r255c=0x%08x r2564=0x%08x poll=%u]\n",
 				   pc & 0x1fff, (pc >> 16) & 0x1fff, pi_rd(0x255c), pc, n);
+		}
+		/* ★2026-07-04 flow-1 (WAN data) US datapath witness — the sustained-data-US dig.
+		 * The data flow (SID GPON_DATA_FLOW=1, gem 193) rides qid 64's grants but keeps its
+		 * OWN classify entry (SID2QID[1]/SIDVALID[1]) + US gem-map + per-SID page bank,
+		 * DISTINCT from the OMCC's SID-64. Symptom: data US works at DHCP then stops while the
+		 * lease is held stale. If gpon0 TX climbs but pgbank1_max stays flat, data frames are
+		 * dropped at the US-NIC classify/ingest BEFORE the queue. s2q[1] must read 64 (rides
+		 * T-CONT 16) and sidvld[1]=1; usmap1 must read 0xc1(193); the SID-1 page-bank read uses
+		 * the same 0x255c strobe as sidpage64 (OR 0x86000 to keep DBG_IGNORE_TAG). All PI reads
+		 * — /proc context, safe (this handler already does pi_rd here). */
+		{
+			u32 n1, pc1;
+			u32 s2q1 = (pi_rd(0x20f8) >> ((GPON_DATA_FLOW % 4) * 7)) & 0x7fu;
+			u32 svl1 = (pi_rd(0x213c) >> GPON_DATA_FLOW) & 1u;
+
+			pi_wr(0x255c, 0x00086000u | (GPON_DATA_FLOW & 0x7fu) | (1u << 7));
+			for (n1 = 0; n1 < 2000 && (pi_rd(0x255c) & (1u << 9)); n1++)
+				udelay(1);
+			pc1 = pi_rd(0x2564);
+			seq_printf(s, "data1: s2q[1]=%u sidvld[1]=%u usmap1(0x6404)=0x%x usbyte1(0x6808)=%u pgbank1_used=%u max=%u q32_idle(0x6c40)=%u\n",
+				   s2q1, svl1, gpon_rd(0x6404), gpon_rd(0x6808),
+				   pc1 & 0x1fff, (pc1 >> 16) & 0x1fff, gpon_rd(0x6c40));
 		}
 		/* CAM read-back: does the DS GEM CAM actually map gem->flow 64 at runtime?
 		 * e64 should read gem=2 (the OMCC) HIT=1; traffic_cfg[64] should be 0x4. */
@@ -5696,6 +5760,22 @@ static void gpon_fsm_set_state(u8 st)
 	/* Hybrid LAN/VLAN bookkeeping: mark O5 entry; on any drop below O5, re-arm VLAN
 	 * filtering for the next config and reset the LAN-open timer. */
 	if (st == 5 && prev != 5) {
+		/* Re-range completion diagnostic: if we had dropped below O5 (fiber LOS,
+		 * deact, watchdog), this O5 re-entry closes the outage. Count it + record the
+		 * duration + log ONE flap-damped summary line (the fiber-pull "did it recover"
+		 * witness the operator asked for). The data GEM re-installs a moment later via
+		 * the FSM poll (gpon_data_gem_solicited kept across LOS) -> its own log line. */
+		if (gpon_rerange_start_j) {
+			gpon_rerange_cnt++;
+			gpon_last_outage_ms = jiffies_to_msecs(jiffies - gpon_rerange_start_j);
+			gpon_rerange_start_j = 0;
+			if (!gpon_rerange_last_log_j ||
+			    time_after(jiffies, gpon_rerange_last_log_j + msecs_to_jiffies(2000))) {
+				pr_info("rtl9602c-gpon: re-range #%u -> O5 (outage ~%u ms); data-GEM re-install pending\n",
+					gpon_rerange_cnt, gpon_last_outage_ms);
+				gpon_rerange_last_log_j = jiffies;
+			}
+		}
 		gpon_o5_entry_tick = gpon_fsm_ticks ? gpon_fsm_ticks : 1;
 		gpon_avc_sent = 0;	/* re-report oper-up to the OLT each online */
 		/* Re-apply the O5 packed-burst gate cluster + re-arm the HW auto-
@@ -5717,6 +5797,7 @@ static void gpon_fsm_set_state(u8 st)
 			gpon_send_cpu_ploam(PLM_US_QUEUE_NOMSG, nomsg);
 		}
 	} else if (st < 5 && prev >= 5) {
+		gpon_rerange_start_j = jiffies ? jiffies : 1;	/* start the outage timer (O5 dropped) */
 		gpon_o5_entry_tick = 0;
 		if (gpon_vlan_lan_open && !lan_keep_open) {
 			sw_field(0x13008, 0, 0, 1);	/* re-assert VLAN_FILTER for re-config */
@@ -6290,7 +6371,18 @@ static void gpon_fsm_poll(struct timer_list *t)
 				gpon_omcc_installed = false;
 				gpon_tcont_installed = false;
 				gpon_data_installed = false;
-				gpon_data_gem_solicited = false;	/* re-wait for the OLT's fresh ME268 on re-admit */
+				/* ★2026-07-05: do NOT reset gpon_data_gem_solicited on a fiber-LOS re-range.
+				 * A downstream-LOS re-range is ONU-initiated: the OLT never Deactivated us, so
+				 * it KEEPS our OMCI/GEM provisioning across the brief outage and does NOT
+				 * re-send the ME268 GEM-create on re-admit. Resetting solicited=false made the
+				 * data GEM wait forever for a fresh ME268 that never arrives -> the ONU re-
+				 * acquired O5 but never re-installed the WAN data GEM = "internet doesn't come
+				 * back after I reconnect the fiber". Keeping solicited true re-installs the data
+				 * GEM (which the OLT still holds) as soon as O5 is re-reached. This does NOT
+				 * re-introduce the 2nd-admit churn: that was a FRESH/2nd admit where the OLT had
+				 * not yet created the GEM; here the OLT already has it. A true deprovision path
+				 * (OLT Deactivate) still resets solicited in the Deactivate handler, and a
+				 * genuine fresh ME268 re-sets it anyway. */
 				gpon_aes_switch_time = 0xffffffff;
 				gpon_key_staged = false;
 				gpon_field(GPON_GTC_DS_ONU_STATUS, 15, 8, 0xff);
