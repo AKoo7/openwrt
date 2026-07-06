@@ -628,7 +628,7 @@ void rtl92fe_set_hw_reg(struct ieee80211_hw *hw, u8 variable, u8 *val)
 			rtlpriv->cfg->ops->set_hw_reg(hw, HW_VAR_AID, NULL);
 			_rtl92fe_download_rsvd_page(hw);
 		}
-		rtl92fe_set_fw_media_status_rpt_cmd(hw, mstatus);
+		rtl92fe_set_fw_media_status_rpt_cmd(hw, mstatus, 0);
 		}
 		break;
 	case HW_VAR_H2C_FW_P2P_PS_OFFLOAD:
@@ -816,15 +816,16 @@ static bool _rtl92fe_init_mac(struct ieee80211_hw *hw)
 	rtl_write_dword(rtlpriv, REG_HISR, 0xffffffff);
 	rtl_write_dword(rtlpriv, REG_HISRE, 0xffffffff);
 
-	/* TRXDMA_CTRL is a 32-bit, 3-bit-field-per-queue priority map on
-	 * the RTL8192F: VOQ=4, VIQ=7, BEQ=10, BKQ=13, MGQ=16, HIQ=19, with
-	 * LOW=1/NORMAL=2/HIGH=3. Program all queues with sane priorities
-	 * while preserving the engine-enable nibble in bits[3:0].
+	/* TRXDMA_CTRL (REG_TXDMA_PQ_MAP) is a 16-bit, 2-bit-field-per-queue
+	 * priority map on the RTL8192F (vendor HAL == 8192ee): VOQ=4, VIQ=6,
+	 * BEQ=8, BKQ=10, MGQ=12, HIQ=14, with LOW=1/NORMAL=2/HIGH=3. Program all
+	 * queues while preserving the RX-DMA nibble in bits[3:0]. MUST be a WORD
+	 * access -- a 32-bit write spills the high half into 0x010E.
 	 */
-	dwordtmp = rtl_read_dword(rtlpriv, REG_TRXDMA_CTRL);
+	dwordtmp = rtl_read_word(rtlpriv, REG_TRXDMA_CTRL);
 	dwordtmp &= 0xf;
 	dwordtmp |= TRXDMA_CTRL_QMAP_VALUE;
-	rtl_write_dword(rtlpriv, REG_TRXDMA_CTRL, dwordtmp);
+	rtl_write_word(rtlpriv, REG_TRXDMA_CTRL, dwordtmp);
 	/* Reported Tx status from HW for rate adaptive. */
 	rtl_write_byte(rtlpriv, REG_FWHW_TXQ_CTRL + 1, 0x1F);
 
@@ -914,6 +915,42 @@ dma64_end:
 	rtl_write_dword(rtlpriv, REG_INT_MIG, 0);
 
 	rtl_write_dword(rtlpriv, REG_MCUTST_1, 0x0);
+
+	/* Ring SW/HW-depth invariants (build-time, chip-agnostic).
+	 *
+	 * The depth we program into the HW BD-ring registers below MUST equal
+	 * the SW ring depth the shared rtlwifi PCI core actually allocates for
+	 * this chip; if they diverge, the HW read pointer wraps at a different
+	 * modulus than the SW write pointer (cur_tx_wp), TX-reclaim's
+	 * is_tx_desc_closed() latches false, and every AC stop-queues forever
+	 * (the 512-vs-128 association/DHCP/hang regression).
+	 *
+	 * TX: PCI id 0x818c is unknown to _rtl_pci_find_adapter(), so hw_type
+	 * falls back to the non-8192EE default and _rtl_pci_init_trx_var()
+	 * sizes every TX ring to RT_TXDESC_NUM -- NOT TX_DESC_NUM_92E. So the
+	 * per-queue HW TXBD depth (TX_DESC_NUM_92F) must equal RT_TXDESC_NUM.
+	 * (A sibling chip that _is_ mapped to HARDWARE_TYPE_RTL8192EE would
+	 * instead assert its own TX_DESC_NUM_xx == TX_DESC_NUM_92E: same rule,
+	 * the SW sizer for that chip's resolved hw_type.)
+	 * RX: rxringcount is always RTL_PCI_MAX_RX_COUNT, independent of
+	 * hw_type, so the HW RXBD depth (RX_DESC_NUM_92F) must equal it.
+	 *
+	 * Derived from the driver's own constants (never a hand-copied literal)
+	 * so each family member is checked against ITS own ring size at build.
+	 * Inert while correct (128==128 / 512==512); fires only on a real drift
+	 * -- a copy-paste to a new model that keeps a stale depth, or a core
+	 * change to the SW sizer.
+	 */
+	BUILD_BUG_ON(TX_DESC_NUM_92F != RT_TXDESC_NUM);
+	BUILD_BUG_ON(RX_DESC_NUM_92F != RTL_PCI_MAX_RX_COUNT);
+	/* ...and each depth must fit its register's depth field without
+	 * corrupting the adjacent segment-count/enable bits: TXBD_NUM packs
+	 * depth in [11:0] | seg in [13:12]; RXBD_NUM packs depth in [12:0] |
+	 * seg in [14:13] | enable BIT(15).  (Both true today; guards a future
+	 * model that bumps a ring past the field width.)
+	 */
+	BUILD_BUG_ON(TX_DESC_NUM_92F & ~0xFFFU);
+	BUILD_BUG_ON(RX_DESC_NUM_92F & ~0x1FFFU);
 
 	/* Program the per-queue TXBD ring depth + segment count. */
 	rtl_write_word(rtlpriv, REG_MGQ_TXBD_NUM,
@@ -1282,6 +1319,31 @@ static void _rtl92fe_reset_pcie_interface_dma(struct rtl_priv *rtlpriv,
  * spur calibration, dynamic energy-TH and MP-mode branches are intentionally
  * omitted (not used for a fixed-mode AP).
  */
+/* RFE (RF front-end) pinmux for the external-PA/FEM board variant.
+ *
+ * The WiFi efuse on this board is blank, so rfe_type can't be auto-read. GPON
+ * ONUs use an external PA/FEM (SKY85201-class = the vendor's DSL-PON rfe_type 7).
+ * Without this the T/R-switch + PA-enable + RX-LNA control pins stay at their BB
+ * table defaults, so TX radiates ~40dB down AND the RX is deaf (a close peer is
+ * heard at ~-100dBm). These are the vendor phydm 8192F rfe_type-7 RFE-pinmux
+ * writes (0x940 control word, 0x930/0x938 T/R-switch invert/sel, 0x944, 0x934/
+ * 0x93c, 0x92c/0x920 PAPE, 0x968, plus the 0x103c/0x04c/0x064/0x1038 seeds). */
+static void _rtl92fe_config_rfe(struct ieee80211_hw *hw)
+{
+	rtl_set_bbreg(hw, 0x103c, 0x70000, 0x7);
+	rtl_set_bbreg(hw, 0x04c, 0x6c00000, 0x0);
+	rtl_set_bbreg(hw, 0x064, BIT(29) | BIT(28), 0x3);
+	rtl_set_bbreg(hw, 0x1038, 0x600010, 0x0);
+	rtl_set_bbreg(hw, 0x944, 0xfff, 0x081f);
+	rtl_set_bbreg(hw, 0x930, 0xfffff, 0x23200);
+	rtl_set_bbreg(hw, 0x938, 0xfffff, 0x23200);
+	rtl_set_bbreg(hw, 0x934, 0xf000, 0x3);
+	rtl_set_bbreg(hw, 0x93c, 0xf000, 0x3);
+	rtl_set_bbreg(hw, 0x968, BIT(2), 0x0);
+	rtl_set_bbreg(hw, 0x920, 0xffffffff, 0x03000003);
+	rtl_set_bbreg(hw, 0x940, 0xffffffff, 0x004007ae);
+}
+
 static void _rtl92fe_config_trx_mode_ab(struct ieee80211_hw *hw)
 {
 	/* ==== [RF Mode Table] (tx_path_en == BB_PATH_AB) ==== */
@@ -1314,6 +1376,9 @@ static void _rtl92fe_config_trx_mode_ab(struct ieee80211_hw *hw)
 	rtl_set_bbreg(hw, 0xa04, 0xf0000000, 0xc);
 	/* OFDM TX path (tx_path_en == AB -> ofdm_tx_path(BB_PATH_AB)) */
 	rtl_set_bbreg(hw, 0x90c, 0xffffffff, 0x83321333);
+
+	/* External-PA/FEM front-end pinmux (T/R switch + PA-enable + RX-LNA). */
+	_rtl92fe_config_rfe(hw);
 }
 
 int rtl92fe_hw_init(struct ieee80211_hw *hw)
@@ -1578,7 +1643,14 @@ static enum version_8192f _rtl92fe_read_chip_version(struct ieee80211_hw *hw)
 	enum version_8192f version;
 	u32 value32;
 
-	/* The RTL8192F is a 2T2R part. */
+	/* The RTL8192F silicon is a 2-chain (2T2R) RECEIVER, and rf_type gates the RX
+	 * chain enable, path-B PA-bias and dual-path IQK/AGC (hw.c:1552/1562, dm.c) --
+	 * so it MUST track the silicon or the AP goes deaf and never hears the client's
+	 * 4-way M2 (setting RF_1T1R here disabled path-B RX and stalled association).
+	 * The MCS15 seen in the TX spy is only the PRE-override negotiated rate; AP
+	 * unicast DATA is already force-pinned to legacy DESC_RATE54M in tx_fill_desc,
+	 * so the on-air data rate is single-stream regardless. The single-stream cap
+	 * belongs in the rate path, NOT in a lie about the receiver's chain count. */
 	rtlphy->rf_type = RF_2T2R;
 
 	value32 = rtl_read_dword(rtlpriv, REG_SYS_CFG1);
@@ -1686,13 +1758,20 @@ int rtl92fe_set_network_type(struct ieee80211_hw *hw, enum nl80211_iftype type)
 	if (_rtl92fe_set_media_status(hw, type))
 		return -EOPNOTSUPP;
 
-	if (rtlpriv->mac80211.link_state == MAC80211_LINKED) {
-		if (type != NL80211_IFTYPE_AP &&
-		    type != NL80211_IFTYPE_MESH_POINT)
-			rtl92fe_set_check_bssid(hw, true);
-	} else {
+	/* check-BSSID (drop RX not matching our BSSID) is wanted ONLY for an
+	 * infrastructure STA that is LINKED. AP/mesh must NEVER check-BSSID: it has
+	 * to receive frames from unassociated peers -- crucially a phone's wildcard
+	 * PROBE REQUEST during a scan. The old code left AP-while-LINKED falling
+	 * through BOTH branches, so stale CBSSID bits from a prior state survived
+	 * and the HW silently dropped probe requests -> hostapd never answered ->
+	 * the phone never listed the AP (worked only from a fresh, non-LINKED
+	 * bring-up). Force it explicitly for every case. */
+	if (rtlpriv->mac80211.link_state == MAC80211_LINKED &&
+	    type != NL80211_IFTYPE_AP &&
+	    type != NL80211_IFTYPE_MESH_POINT)
+		rtl92fe_set_check_bssid(hw, true);
+	else
 		rtl92fe_set_check_bssid(hw, false);
-	}
 
 	return 0;
 }
@@ -1805,9 +1884,13 @@ void rtl92fe_card_disable(struct ieee80211_hw *hw)
 
 	_rtl92fe_poweroff_adapter(hw);
 
-	/* after power off we should do iqk again */
-	if (!rtlpriv->cfg->ops->get_btc_status())
-		rtlpriv->phy.iqk_initialized = false;
+	/* P3: after power off we must redo IQK. Clear iqk_initialized
+	 * UNCONDITIONALLY -- get_btc_status() returns true for this chip, so the
+	 * old btc gate skipped the clear, and every post-reload hw_init then took
+	 * the "restore from backup" IQK path, re-imposing the FIRST boot's result
+	 * (which can settle to identity) on a freshly reset baseband. Only a reboot
+	 * re-ran a real IQK. Clearing here makes a reload recalibrate for real. */
+	rtlpriv->phy.iqk_initialized = false;
 }
 
 void rtl92fe_interrupt_recognized(struct ieee80211_hw *hw,
@@ -1841,6 +1924,20 @@ void rtl92fe_set_beacon_related_registers(struct ieee80211_hw *hw)
 	rtl_write_byte(rtlpriv, REG_RXTSF_OFFSET_OFDM - 2, 0x30);
 	rtlpci->reg_bcn_ctrl_val |= BIT(3);
 	rtl_write_byte(rtlpriv, REG_BCN_CTRL, (u8)rtlpci->reg_bcn_ctrl_val);
+	/* NB: do NOT set ENSWBCN (REG_CR bit8) here to force a live-TIM SW beacon --
+	 * the rtl8192fe SW-beacon path (BEACON_QUEUE) has no DWBCN commit/beacon-valid
+	 * handshake, so the tasklet-filled beacon misses TBTT on the slow MIPS core
+	 * and the AP goes intermittently/fully SILENT (clients can't even scan it).
+	 * Keep the reliable FW-auto reserved-page beacon. Delivering buffered
+	 * downstream to a legacy-PS STA needs the reserved-page beacon rebuilt with a
+	 * live TIM -- a separate, carefully-soaked project. */
+	/* P4: this function disabled interrupts above (to program beacon regs
+	 * atomically) but the stock code never re-enabled them, so on the FIRST
+	 * AP bring-up beacon/TX/RX IRQs stay masked until some later path happens
+	 * to call update_interrupt_mask -- until then beacon DMA is never serviced
+	 * and the AP is enabled but silent (the "not on-air until wifi reload"
+	 * quirk). Re-enable here so the beacon starts on the first bring-up. */
+	rtl92fe_enable_interrupt(hw);
 }
 
 void rtl92fe_set_beacon_interval(struct ieee80211_hw *hw)
@@ -2294,15 +2391,18 @@ static void _rtl92fe_apply_board_cal(struct ieee80211_hw *hw,
 	efu->crystalcap = cal->crystalcap & 0x3f;
 	efu->eeprom_crystalcap = cal->crystalcap & 0x3f;
 
-	/* Front-end / regulatory.  pa_type 0 == internal PA/LNA -> board_type
-	 * 0, external_pa 0.  rfe_type 3 matches the working stock unit (the
-	 * per-rfe-type hw-info init has no case for 3, so it is a no-op for this
-	 * value; the TRX-mode init above does the real path setup).
+	/* Front-end / regulatory.  The WiFi efuse is blank, so rfe_type cannot be
+	 * auto-read.  This board is a GPON ONU = external-PA/FEM (SKY85201-class,
+	 * the vendor's DSL-PON rfe_type 7).  _rtl92fe_config_rfe() (called from
+	 * _rtl92fe_config_trx_mode_ab) programs the matching RFE pinmux, and setting
+	 * external_pa here also selects the external-PA IQK PAD_TXG.  Previously
+	 * hardcoded 3/internal, which left the T/R-switch + PA-enable + RX-LNA pins
+	 * at BB-table defaults -> TX ~40dB down + deaf RX (peer heard at -100dBm).
 	 */
-	rtl_hal(rtlpriv)->rfe_type = 3;
+	rtl_hal(rtlpriv)->rfe_type = 7;
 	efu->board_type = 0;
 	rtl_hal(rtlpriv)->board_type = 0;
-	efu->external_pa = 0;
+	efu->external_pa = 1;
 	efu->eeprom_regulatory = cal->reg_domain & 0x07;
 
 	/* Channel plan: 2.4 GHz world-wide 13 (+ ch14 handled per-channel). */
@@ -2428,8 +2528,21 @@ static void rtl92fe_update_hal_rate_mask(struct ieee80211_hw *hw,
 	    mac->opmode == NL80211_IFTYPE_MESH_POINT)
 		curtxbw_40mhz = mac->bw_40;
 	else if (mac->opmode == NL80211_IFTYPE_AP ||
-		 mac->opmode == NL80211_IFTYPE_ADHOC)
+		 mac->opmode == NL80211_IFTYPE_ADHOC) {
 		macid = sta->aid + 1;
+		/* This board's 8192FR has a single usable TX chain, so 2-spatial-
+		 * stream rates (MCS8-15) are un-transmittable: an AP unicast DATA
+		 * frame emitted at MCS15 reaches the air as a broken 2SS PPDU no
+		 * client can decode -- the real "Obtaining IP" root cause (the frame
+		 * IS transmitted, the ring drains, but the client rx-decodes nothing).
+		 * Cap the peer to single-stream AT THE SOURCE: with rx_mask[1]=0,
+		 * _rtl_get_highest_n_rate() returns MCS7 and the ratr_bitmap below
+		 * excludes MCS8-15, so every data rate the driver/FW can pick is
+		 * deliverable -- WITHOUT touching rf_type (the silicon is a 2-chain
+		 * RECEIVER; leaving RF_2T2R keeps RX diversity, which is what lets the
+		 * WPA2 4-way complete). Idempotent across rate refreshes. */
+		sta->deflink.ht_cap.mcs.rx_mask[1] = 0;
+	}
 
 	ratr_bitmap = sta->deflink.supp_rates[0];
 	if (mac->opmode == NL80211_IFTYPE_ADHOC)
@@ -2532,6 +2645,17 @@ static void rtl92fe_update_hal_rate_mask(struct ieee80211_hw *hw,
 		ratr_index, ratr_bitmap, rate_mask[0], rate_mask[1],
 		rate_mask[2], rate_mask[3], rate_mask[4],
 		rate_mask[5], rate_mask[6]);
+	/* AP/ADHOC peer: the FW rate/security context for this macid (aid+1) is only
+	 * usable after the macid is reported CONNECTED. The infra-STA path
+	 * (JOINBSSRPT, hw.c:631) only ever registers macid 0, so without this a
+	 * use_rate=0 unicast DATA frame addressed to an aid+1 macid is HELD by the FW
+	 * (no DOK -> the BE ring fills -> stop-queue latch) -- which is why the DHCP
+	 * OFFER and all post-association unicast data never reach the client. Register
+	 * the peer macid here, right before its RA-mask, so CONNECT and the rate table
+	 * land together (order matters: allocate the FW slot, then populate it). */
+	if (macid)		/* != 0 => an AP/ADHOC peer, not the STA-self (macid 0) */
+		rtl92fe_set_fw_media_status_rpt_cmd(hw, RT_MEDIA_CONNECT, macid);
+
 	rtl92fe_fill_h2c_cmd(hw, H2C_92F_RA_MASK, 7, rate_mask);
 	_rtl92fe_set_bcn_ctrl_reg(hw, BIT(3), 0);
 }
@@ -2668,6 +2792,15 @@ void rtl92fe_set_key(struct ieee80211_hw *hw, u32 key_index,
 		} else {
 			rtl_dbg(rtlpriv, COMP_SEC, DBG_DMESG,
 				"add one entry\n");
+			/* KEY spy: prove the PTK/GTK actually reach the HW CAM.
+			 * A missing/mis-slotted GROUP key = downstream broadcast
+			 * (e.g. a DHCP OFFER) can't be encrypted -> a client that
+			 * finished the 4-way still never gets an IP. alg: 1=WEP40
+			 * 2=TKIP 4=AES 5=WEP104. */
+			pr_info("92f-spy KEY add entry=%u kidx=%u %s %pM alg=%u\n",
+				entry_id, key_index,
+				is_pairwise ? "PAIRWISE" : (is_group ? "GROUP" : "def"),
+				macaddr, enc_algo);
 			if (is_pairwise) {
 				rtl_dbg(rtlpriv, COMP_SEC, DBG_DMESG,
 					"set Pairwise key\n");

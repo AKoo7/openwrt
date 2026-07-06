@@ -29,6 +29,13 @@ set wireless.default_radio0.ssid='$SSID'
 set wireless.default_radio0.encryption='psk2'
 set wireless.default_radio0.key='12345678'
 set wireless.radio0.country='BO'
+# Enable 802.11b/CCK legacy rates (1/2/5.5/11) so the beacon is a standard 2.4GHz
+# beacon transmitted at 1 Mbit CCK. Without this (OpenWrt default legacy_rates=0)
+# the AP is OFDM-only and beacons at 6 Mbit; some phones will NOT list a 2.4GHz AP
+# that has no CCK basic rates -- confirmed: with legacy_rates the phone sees the AP
+# where before it was invisible. (An mt7921e/Linux client is lenient and saw it either
+# way; strict phone scan firmware requires the CCK-rate beacon.)
+set wireless.radio0.legacy_rates='1'
 commit wireless
 EOF
 

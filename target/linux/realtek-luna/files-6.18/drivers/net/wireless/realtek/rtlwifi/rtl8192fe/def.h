@@ -10,11 +10,24 @@
  */
 #define RX_DESC_NUM_92F					512
 
-/* TX DMA ring depth (descriptors).  Matches the shared TX_DESC_NUM_92E ring
- * depth in the rtlwifi PCI core (pci.h) and the TXBD ring depth hw.c programs
- * into REG_*Q_TXBD_NUM.
+/* TX DMA ring depth (descriptors).  MUST equal the SW ring size the rtlwifi
+ * PCI core actually allocates for this chip, i.e. rtlpci->txringcount[] ==
+ * RT_TXDESC_NUM == 128 (pci.h).  It is NOT 512: the 512-deep TX_DESC_NUM_92E
+ * ring is only taken when hw_type == HARDWARE_TYPE_RTL8192EE, but this chip's
+ * PCI id (0x818c) is unknown to _rtl_pci_find_adapter(), so hw_type falls back
+ * to the RTL8192CE default and _rtl_pci_init_trx_var() sizes every TX ring to
+ * RT_TXDESC_NUM (128).  (use_new_trx_flow is true here, so the BE_QUEUE 256
+ * override is skipped and every data/mgmt ring is 128; the beacon queue is a
+ * separate 2-desc ring with cur_tx_wp pinned to 0.)  This constant is
+ * programmed into the HW TXBD depth registers (REG_*Q_TXBD_NUM, hw.c) and used
+ * by rtl92fe_get_available_desc() (trx.c); set_desc wraps cur_tx_wp at
+ * ring->entries (128).  If HW depth (this) > SW depth (128), cur_tx_wp wraps
+ * at 128 while the HW read pointer wraps at 512 -> at the 128th frame the
+ * pointers desync, the HW DMA-fetches phantom BDs past the allocation,
+ * is_tx_desc_closed() goes permanently false, TX-reclaim stops, and
+ * _rtl_pci_tx() stop-queues every AC forever (beacon exempt).  Keep == 128.
  */
-#define TX_DESC_NUM_92F					512
+#define TX_DESC_NUM_92F					128
 
 /* Buffer-descriptor segment count for this chip's PCIe BD ring.
  * 0: 2 seg, 1: 4 seg, 2: 8 seg.  The RTL8192F uses the 4-segment layout

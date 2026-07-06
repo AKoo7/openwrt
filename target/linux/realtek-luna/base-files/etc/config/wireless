@@ -11,6 +11,13 @@ config wifi-iface 'default_radio0'
 	option device 'radio0'
 	option network 'lan'
 	option mode 'ap'
+	# Convert broadcast/multicast (ARP, the DHCP OFFER, IPv6 ND) to per-STA
+	# unicast so they reach power-saving clients. rtlwifi never services the DTIM
+	# broadcast-buffer path (it never calls ieee80211_get_buffered_bc), so
+	# without this a sleeping phone's DHCP OFFER is buffered forever and the phone
+	# hangs at "Obtaining IP". Converted to unicast, the OFFER rides the uAPSD
+	# path the driver's WIPHY_FLAG_AP_UAPSD advertisement enables.
+	option multicast_to_unicast '1'
 	# ssid + key are overwritten per-board at boot by /etc/uci-defaults/99-onu-wifi
 	# (SSID derived from the board MAC to avoid collisions; PSK from provisioning).
 	# These remain only as a never-open fallback if that script can't read the MAC.

@@ -1041,29 +1041,29 @@
 #define HQSEL_HIQ				BIT(5)
 
 /*
- * REG_TRXDMA_CTRL (0x010C) queue->DMA-engine map.
+ * REG_TRXDMA_CTRL / REG_TXDMA_PQ_MAP (0x010C) queue->DMA-engine map.
  *
- * 8192F-specific: this is a 32-bit register whose per-queue selector is a
- * THREE-bit field (vs. the 8192ee two-bit fields), shifted VOQ=4, VIQ=7,
- * BEQ=10, BKQ=13, MGQ=16, HIQ=19. Engine codes are QUEUE_LOW/NORMAL/HIGH
- * below.
+ * TWO-bit field per queue in a 16-bit register (vendor HAL: BIT_MASK_TXDMA_*=0x3;
+ * identical to 8192ee), shifted VOQ=4, VIQ=6, BEQ=8, BKQ=10, MGQ=12, HIQ=14.
+ * bits[3:0] are RX-DMA control (RXDMA_ARBBW_EN/RXSHFT_EN/RXDMA_AGG_EN), preserved.
+ * Engine codes are QUEUE_LOW/NORMAL/HIGH below.
  */
-#define _TXDMA_HIQ_MAP(x)			(((x) & 0x7) << 19)
-#define _TXDMA_MGQ_MAP(x)			(((x) & 0x7) << 16)
-#define _TXDMA_BKQ_MAP(x)			(((x) & 0x7) << 13)
-#define _TXDMA_BEQ_MAP(x)			(((x) & 0x7) << 10)
-#define _TXDMA_VIQ_MAP(x)			(((x) & 0x7) << 7)
-#define _TXDMA_VOQ_MAP(x)			(((x) & 0x7) << 4)
+#define _TXDMA_HIQ_MAP(x)			(((x) & 0x3) << 14)
+#define _TXDMA_MGQ_MAP(x)			(((x) & 0x3) << 12)
+#define _TXDMA_BKQ_MAP(x)			(((x) & 0x3) << 10)
+#define _TXDMA_BEQ_MAP(x)			(((x) & 0x3) << 8)
+#define _TXDMA_VIQ_MAP(x)			(((x) & 0x3) << 6)
+#define _TXDMA_VOQ_MAP(x)			(((x) & 0x3) << 4)
 
 #define QUEUE_LOW				1
 #define QUEUE_NORMAL				2
 #define QUEUE_HIGH				3
 
-/* Composite queue->engine priority map written to REG_TRXDMA_CTRL during MAC
- * init (8192F single-trx / AP-capable assignment): BE/BK -> LOW, VI ->
- * NORMAL, VO/MGNT/HI -> HIGH.  hw.c preserves the engine-enable nibble
- * (bits[3:0]) and ORs this value in; none of these fields touch bits[3:0].
- *	(3<<4)|(2<<7)|(1<<10)|(1<<13)|(3<<16)|(3<<19) = 0x001B2530
+/* Composite queue->engine priority map written (as a 16-bit word) to
+ * REG_TRXDMA_CTRL during MAC init: BE/BK -> LOW, VI -> NORMAL, VO/MGNT/HI ->
+ * HIGH.  hw.c preserves the RX-DMA nibble (bits[3:0]) and ORs this value in;
+ * none of these fields touch bits[3:0].  Equals the mainline 8192ee 0xF5B0.
+ *	(3<<4)|(2<<6)|(1<<8)|(1<<10)|(3<<12)|(3<<14) = 0xF5B0
  */
 #define TRXDMA_CTRL_QMAP_VALUE			\
 	(_TXDMA_VOQ_MAP(QUEUE_HIGH)   | _TXDMA_VIQ_MAP(QUEUE_NORMAL) |	\

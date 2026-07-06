@@ -322,6 +322,116 @@ static void _rtl92fe_insert_emcontent(struct rtl_tcb_desc *ptcb_desc,
 	set_earlymode_len4(virtualaddress, dwtmp);
 }
 
+/* ---- handshake spy: a permanent, always-on in-tree instrument (project
+ * "spy built-in from day one" rule) so a WPA2 auth/assoc/4-way is VISIBLE in
+ * the driver log without a sniffer. Logs mgmt (auth/assoc/deauth/action) and
+ * EAPOL (M1..M4/group) frames on BOTH rx and tx, with rate/crc/icv/PM. mgmt +
+ * EAPOL are rare, so this is off the per-packet forwarding hot path (two
+ * predictable branches on a data frame). Endianness-agnostic explicit byte
+ * math over the wire bytes (BE MIPS + LE ARM). Runtime kill switch:
+ * /sys/module/rtl8192fe/parameters/spy. */
+static bool rtl92f_spy_on = true;
+module_param_named(spy, rtl92f_spy_on, bool, 0644);
+MODULE_PARM_DESC(spy, "1=log mgmt+EAPOL frames rx/tx to dmesg for 4-way debug (default on)");
+
+/* When on, also log EVERY unicast DATA frame (encrypted or not) at rx/tx -- the
+ * definitive "does unicast downstream data reach tx_fill_desc" probe (run an
+ * ONU->client unicast ICMP flood). Default off: too chatty for normal traffic. */
+static bool rtl92f_spy_data;
+module_param_named(spy_data, rtl92f_spy_data, bool, 0644);
+MODULE_PARM_DESC(spy_data, "1=also log every unicast DATA frame rx/tx (default off)");
+
+static const char *rtl92f_eapol_msg(u16 ki)
+{
+	if (!(ki & BIT(3)))			return (ki & BIT(7)) ? "G1" : "G2";
+	if ((ki & BIT(7)) && !(ki & BIT(8)))	return "M1";
+	if ((ki & BIT(7)) &&  (ki & BIT(8)))	return "M3";
+	return (ki & BIT(9)) ? "M4" : "M2";	/* M4 = MIC set, no Ack */
+}
+
+static void rtl92f_spy(const char *dir, struct ieee80211_hdr *hdr, u32 len,
+		       u8 rate, u16 crc, u16 icv)
+{
+	__le16 fc = hdr->frame_control;
+	const u8 *p = (const u8 *)hdr;
+	u32 hlen;
+
+	if (!rtl92f_spy_on)
+		return;
+	if (ieee80211_is_mgmt(fc)) {
+		u16 reason = 0;
+
+		if (!(ieee80211_is_auth(fc) || ieee80211_is_assoc_req(fc) ||
+		      ieee80211_is_assoc_resp(fc) || ieee80211_is_reassoc_req(fc) ||
+		      ieee80211_is_deauth(fc) || ieee80211_is_disassoc(fc) ||
+		      ieee80211_is_action(fc)))
+			return;			/* beacons/probes: too chatty */
+		if (crc)
+			return;			/* skip neighbours' bad-CRC mgmt flood
+						 * (check-BSSID is off for probe-req RX,
+						 * so the AP now hears every nearby net;
+						 * our own client is close = crc=0). The
+						 * EAPOL 4-way is DATA below, unfiltered,
+						 * so a genuinely-broken M2 still shows. */
+		if (ieee80211_is_auth(fc) && len >= 30) {
+			/* auth body: alg(0=open,2=shared,3=SAE), seq, status.
+			 * alg=3 => phone trying WPA3/SAE against our WPA2-only AP.
+			 * status!=0 in our TX => we rejected the phone's auth. */
+			pr_info("92f-spy %s AUTH alg=%u seq=%u status=%u %pM->%pM rate=0x%02x crc=%u\n",
+				dir, p[24] | (p[25] << 8), p[26] | (p[27] << 8),
+				p[28] | (p[29] << 8), hdr->addr2, hdr->addr1, rate, crc);
+			return;
+		}
+		if (ieee80211_is_assoc_resp(fc) && len >= 28)
+			reason = p[26] | (p[27] << 8);	/* assoc status code */
+		else if ((ieee80211_is_deauth(fc) || ieee80211_is_disassoc(fc)) &&
+			 len >= 26)
+			reason = p[24] | (p[25] << 8);
+		pr_info("92f-spy %s mgmt st=%u %pM->%pM rate=0x%02x crc=%u icv=%u rsn=%u\n",
+			dir, (le16_to_cpu(fc) >> 4) & 0xf, hdr->addr2, hdr->addr1,
+			rate, crc, icv, reason);
+		return;
+	}
+	if (!ieee80211_is_data(fc))
+		return;
+	/* Unicast DATA probe: log every unicast data frame BEFORE parsing the
+	 * (maybe-encrypted) payload, so an ONU->client unicast test -- ICMP flood or
+	 * the unicast DHCP OFFER -- shows whether unicast downstream data reaches
+	 * tx_fill_desc at all (the data-queue TX-ring stall check). */
+	if (rtl92f_spy_data && !is_multicast_ether_addr(hdr->addr1))
+		pr_info_ratelimited("92f-spy %s DATA-UC %pM->%pM prot=%u rate=0x%02x len=%u\n",
+				    dir, hdr->addr2, hdr->addr1,
+				    !!ieee80211_has_protected(fc), rate, len);
+	hlen = ieee80211_hdrlen(fc);
+	if (ieee80211_has_protected(fc))
+		hlen += 8;			/* CCMP/TKIP IV sits before the LLC/SNAP */
+	if (len < hlen + 8 + 17)		/* need up to the replay-ctr byte */
+		return;
+	p += hlen;				/* LLC/SNAP header (past the IV if encrypted) */
+	if (p[0] != 0xaa || p[1] != 0xaa)
+		return;				/* not LLC/SNAP encapsulated */
+	if (p[6] == 0x88 && p[7] == 0x8e) {	/* EAPOL (the 4-way) */
+		pr_info("92f-spy %s EAPOL %s ki=0x%04x rc=%u %pM->%pM rate=0x%02x crc=%u icv=%u pm=%u\n",
+			dir, rtl92f_eapol_msg((p[13] << 8) | p[14]),
+			(u16)((p[13] << 8) | p[14]), p[24],
+			hdr->addr2, hdr->addr1, rate, crc, icv,
+			!!ieee80211_has_pm(fc));
+		return;
+	}
+	/* DHCP (IPv4 0x0800 / UDP 17 / port 67|68): shows whether the AP actually
+	 * TXes the OFFER downstream, to broadcast or unicast, at what rate -- the
+	 * "4-way done but no IP" case. bcast=1 + not delivered => group-key/PS. */
+	if (p[6] == 0x08 && p[7] == 0x00 && len >= hlen + 8 + 32 && p[17] == 17) {
+		u16 dport = (p[30] << 8) | p[31];
+
+		if (dport == 67 || dport == 68)
+			pr_info("92f-spy %s DHCP dport=%u %pM->%pM rate=0x%02x crc=%u bcast=%d pm=%u\n",
+				dir, dport, hdr->addr2, hdr->addr1, rate, crc,
+				is_multicast_ether_addr(hdr->addr1),
+				!!ieee80211_has_pm(fc));
+	}
+}
+
 bool rtl92fe_rx_query_desc(struct ieee80211_hw *hw,
 			   struct rtl_stats *status,
 			   struct ieee80211_rx_status *rx_status,
@@ -374,6 +484,9 @@ bool rtl92fe_rx_query_desc(struct ieee80211_hw *hw,
 	hdr = (struct ieee80211_hdr *)(skb->data + status->rx_drvinfo_size +
 				       status->rx_bufshift + 24);
 
+	rtl92f_spy("RX", hdr, status->length, status->rate,
+		   status->crc, status->icv);
+
 	if (status->crc)
 		rx_status->flag |= RX_FLAG_FAILED_FCS_CRC;
 
@@ -385,16 +498,25 @@ bool rtl92fe_rx_query_desc(struct ieee80211_hw *hw,
 
 	rx_status->flag |= RX_FLAG_MACTIME_START;
 
-	/* The hardware marks open data/management frames as decrypted even
-	 * when it does not actually decrypt robust management frames for
-	 * IEEE 802.11w; clear the flag back so mac80211 can decrypt them.
+	/* The RTL8192F reports HW-decrypted frames with the 802.11 Protected bit
+	 * CLEARED (prot=0), unlike most rtlwifi parts which preserve it. Keying the
+	 * "decrypted vs open" decision off ieee80211_has_protected() (the mainline
+	 * gate) therefore mis-classifies every HW-decrypted DATA frame as open, so
+	 * mac80211's ieee80211_rx_h_decrypt drops it (unprotected data from a keyed
+	 * STA) and the station's upstream never reaches the bridge -- the bridge
+	 * never learns the STA, and ONU-sourced downstream unicast (e.g. the DHCP
+	 * OFFER) is then flooded rather than STA-resolved, egresses without the PTK,
+	 * and the client discards it. status->decrypted (= !swdec) already means the
+	 * HW handled decryption, so trust it: set RX_FLAG_DECRYPTED, and only CLEAR
+	 * the flag for an UNPROTECTED robust management frame (IEEE 802.11w / MFP),
+	 * which mac80211 must still decrypt/verify in software.
 	 */
 	if (status->decrypted) {
-		if ((!_ieee80211_is_robust_mgmt_frame(hdr)) &&
-		    (ieee80211_has_protected(hdr->frame_control)))
-			rx_status->flag |= RX_FLAG_DECRYPTED;
-		else
+		if (_ieee80211_is_robust_mgmt_frame(hdr) &&
+		    !ieee80211_has_protected(hdr->frame_control))
 			rx_status->flag &= ~RX_FLAG_DECRYPTED;
+		else
+			rx_status->flag |= RX_FLAG_DECRYPTED;
 	}
 
 	rx_status->rate_idx = rtlwifi_rate_mapping(hw, status->is_ht,
@@ -664,6 +786,9 @@ void rtl92fe_tx_fill_desc(struct ieee80211_hw *hw,
 	}
 	seq_number = (le16_to_cpu(hdr->seq_ctrl) & IEEE80211_SCTL_SEQ) >> 4;
 	rtl_get_tcb_desc(hw, info, sta, skb, ptcb_desc);
+	/* spy: the resolved HW rate is now in ptcb_desc -- log our mgmt/EAPOL TX
+	 * (M1/M3 out) so we can see the AP's side of the 4-way. */
+	rtl92f_spy("TX", hdr, skb->len, ptcb_desc->hw_rate, 0, 0);
 	/* reserve 8 bytes for AMPDU early mode */
 	if (rtlhal->earlymode_enable) {
 		skb_push(skb, EM_HDR_LEN);
@@ -709,7 +834,39 @@ void rtl92fe_tx_fill_desc(struct ieee80211_hw *hw,
 				ptcb_desc->use_driver_rate = true;
 				set_tx_desc_tx_rate(pdesc, DESC_RATE11M);
 			} else {
-				ptcb_desc->use_driver_rate = false;
+				/* AP mode: the firmware rate-adaptation engine has no live
+				 * context for the per-STA macid (aid+1) -- the only
+				 * media-status/join H2C the driver sends hardcodes macid 0
+				 * (STA-join), and the DM RA refresh is gated to STATION mode.
+				 * So a use_rate=0 (FW-controlled) unicast DATA frame hands rate
+				 * control to an unpopulated FW-RA slot -> the FW never resolves
+				 * a rate -> the HW holds the descriptor -> hw_idx freezes -> the
+				 * BE queue stop-latches after the first few frames (mgmt/EAPOL
+				 * are unaffected -- they already use driver rate above).
+				 * Drive the rate from the driver instead: the descriptor carries
+				 * the STA's negotiated hw_rate (highest negotiated MCS, set in
+				 * rtl_get_tcb_desc) and HW ARFR fallback downshifts on retries --
+				 * the SAME no-FW-RA mechanism the working mgmt/EAPOL frames use.
+				 * Correct + permanent for a 1x1 11n AP (loses only upward FW
+				 * rate-climb; keeps initial-high + HW downshift).
+				 * ALSO pin a fixed LEGACY OFDM rate: HT-MCS TX descriptors do
+				 * not complete on this bring-up (the HW holds them -> no DOK ->
+				 * ring fills -> stop-queue latch). EVERY frame that ever TXes
+				 * here is legacy (beacon 1M CCK, mgmt/EAPOL at legacy hw_rate);
+				 * data's hw_rate is the highest negotiated HT-MCS, which wedges.
+				 * Force data onto the same legacy TX path; HW ARFR fallback
+				 * still degrades on retries. (Real HT-MCS TX is a separate PHY/
+				 * rate-power bring-up, not the datapath.) */
+				ptcb_desc->use_driver_rate = true;
+				/* Pin legacy CCK 11M for data. With the RF front-end enabled
+				 * (rfe_type 7 RFE pinmux in _rtl92fe_config_rfe) legacy OFDM
+				 * (54M) now radiates too -- but on this hardware 54M is marginal:
+				 * it degrades to heavy loss under sustained traffic (4->2->0->0)
+				 * even at a strong -7dBm, while CCK 11M holds a rock-solid link
+				 * (24/24). So keep the reliable CCK rate. OFDM/HT-rate stability
+				 * (OFDM EVM / PA-linearity / ARFR) and the HT-MCS TX-descriptor
+				 * wedge (no DOK) are a separate PHY/rate bring-up. */
+				set_tx_desc_tx_rate(pdesc, DESC_RATE11M);
 			}
 		}
 
@@ -807,6 +964,22 @@ void rtl92fe_tx_fill_desc(struct ieee80211_hw *hw,
 	if (is_multicast_ether_addr(ieee80211_get_DA(hdr)) ||
 	    is_broadcast_ether_addr(ieee80211_get_DA(hdr)))
 		set_tx_desc_bmc(pdesc, 1);
+
+	/* TX-FINAL probe (spy_data): read back the FINAL descriptor after every field
+	 * is set, for a unicast data frame. Resolves whether AP unicast DATA leaves
+	 * ENCRYPTED (sec=3) or plaintext-with-Protected (sec=0 => the client's CCMP RX
+	 * drops it), at LEGACY vs HT (tx_rate 0x0b=54M vs 0x13=MCS7), driver- vs
+	 * FW-rated (use_rate), and aggregated (agg=1 => HW uses the aggregate MCS and
+	 * ignores a legacy tx_rate). One line answers the crypto-vs-HT-reception fork. */
+	if (rtl92f_spy_data && ieee80211_is_data(hdr->frame_control) &&
+	    !is_multicast_ether_addr(hdr->addr1))
+		pr_info("92f-spy TX-FINAL %pM sta=%s hw_key=%s tx_rate=0x%02x agg=%u sec=%u\n",
+			hdr->addr1,
+			sta ? "SET" : "NULL",
+			info->control.hw_key ? "SET" : "NULL",
+			(u32)le32_get_bits(*(pdesc + 4), GENMASK(6, 0)),
+			(u32)le32_get_bits(*(pdesc + 2), BIT(12)),
+			(u32)le32_get_bits(*(pdesc + 1), GENMASK(23, 22)));
 
 	rtl_dbg(rtlpriv, COMP_SEND, DBG_TRACE, "\n");
 }

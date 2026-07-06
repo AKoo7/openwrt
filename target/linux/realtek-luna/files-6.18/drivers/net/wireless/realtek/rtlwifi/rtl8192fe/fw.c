@@ -549,16 +549,18 @@ void rtl92fe_set_fw_pwrmode_cmd(struct ieee80211_hw *hw, u8 mode)
 			       u1_h2c_set_pwrmode);
 }
 
-void rtl92fe_set_fw_media_status_rpt_cmd(struct ieee80211_hw *hw, u8 mstatus)
+void rtl92fe_set_fw_media_status_rpt_cmd(struct ieee80211_hw *hw, u8 mstatus,
+					 u8 macid)
 {
 	u8 parm[3] = { 0, 0, 0 };
 	/* parm[0]: bit0=0 disconnect / 1 connect
 	 *          bit1=0 update one MACID / 1 update a MACID..MACID_End range
-	 * parm[1]: MACID (INFRA_STA -> 0)
+	 * parm[1]: MACID (infra-STA self = 0; AP/ADHOC peer = aid+1)
 	 * parm[2]: MACID_End
 	 */
 	SET_H2CCMD_MSRRPT_PARM_OPMODE(parm, mstatus);
 	SET_H2CCMD_MSRRPT_PARM_MACID_IND(parm, 0);
+	SET_H2CCMD_MSRRPT_PARM_MACID(parm, macid);
 
 	rtl92fe_fill_h2c_cmd(hw, H2C_92F_MSRRPT, 3, parm);
 }

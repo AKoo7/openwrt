@@ -162,7 +162,8 @@ void rtl92fe_fill_h2c_cmd(struct ieee80211_hw *hw, u8 element_id,
 			    u32 cmd_len, u8 *cmdbuffer);
 void rtl92fe_firmware_selfreset(struct ieee80211_hw *hw);
 void rtl92fe_set_fw_pwrmode_cmd(struct ieee80211_hw *hw, u8 mode);
-void rtl92fe_set_fw_media_status_rpt_cmd(struct ieee80211_hw *hw, u8 mstatus);
+void rtl92fe_set_fw_media_status_rpt_cmd(struct ieee80211_hw *hw, u8 mstatus,
+					 u8 macid);
 void rtl92fe_set_fw_rsvdpagepkt(struct ieee80211_hw *hw, bool b_dl_finished);
 void rtl92fe_set_p2p_ps_offload_cmd(struct ieee80211_hw *hw,
 				      u8 p2p_ps_state);

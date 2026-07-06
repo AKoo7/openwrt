@@ -233,10 +233,23 @@ static const struct rtl_hal_ops rtl8192fe_hal_ops = {
 };
 
 static struct rtl_mod_params rtl92fe_mod_params = {
+	/* HW CCMP: the 8192F HW TX-encrypt is fixed by the cam.c CAM-fill ORDER
+	 * (Entry1-after-Entry0, see rtl_cam_program_entry) -- previously the generic
+	 * word0-last order latched a stale TX key so the peer couldn't decode. With
+	 * the correct order the HW engine does line-rate CCMP. (SW crypto,
+	 * .sw_crypto=true, is the fallback stopgap if the HW path ever regresses.) */
 	.sw_crypto = false,
-	.inactiveps = true,
+	/* This is an AP product: firmware/inactive power-save must be OFF.
+	 * These defaults are inherited from the STA-mode template, but the
+	 * framework's rtl_lps_enter_core has no AP guard, so ~10s after AP
+	 * bring-up with little traffic the FW dozes the radio -> beacons stop
+	 * (hostapd still reports AP-ENABLED), the AP goes deaf to auth/assoc,
+	 * and only a re-kick (wifi reload) wakes it for another ~10s. That is
+	 * the "AP not on-air / first assoc works then later ones time out" bug.
+	 * An AP must never sleep its radio; keep LPS/IPS disabled. */
+	.inactiveps = false,
 	.swctrl_lps = false,
-	.fwctrl_lps = true,
+	.fwctrl_lps = false,
 	.msi_support = true,
 	.dma64 = false,
 	.aspm_support = 1,
