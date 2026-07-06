@@ -2392,12 +2392,20 @@ static void _rtl92fe_apply_board_cal(struct ieee80211_hw *hw,
 	efu->eeprom_crystalcap = cal->crystalcap & 0x3f;
 
 	/* Front-end / regulatory.  The WiFi efuse is blank, so rfe_type cannot be
-	 * auto-read.  This board is a GPON ONU = external-PA/FEM (SKY85201-class,
-	 * the vendor's DSL-PON rfe_type 7).  _rtl92fe_config_rfe() (called from
-	 * _rtl92fe_config_trx_mode_ab) programs the matching RFE pinmux, and setting
-	 * external_pa here also selects the external-PA IQK PAD_TXG.  Previously
-	 * hardcoded 3/internal, which left the T/R-switch + PA-enable + RX-LNA pins
-	 * at BB-table defaults -> TX ~40dB down + deaf RX (peer heard at -100dBm).
+	 * auto-read.  The board WiFi chip is an RTL8192FR (integrated PA/LNA -- no
+	 * external FEM on the PCB), so the PA is physically internal.  Two settings
+	 * are decoupled here, both tuned empirically on this board:
+	 *  - RFE control pins (T/R switch + RX-LNA routing) MUST be programmed: the
+	 *    no-op rfe_type 3 left them at BB-table defaults -> deaf RX (peer heard
+	 *    at -100dBm).  _rtl92fe_config_rfe() (from _rtl92fe_config_trx_mode_ab)
+	 *    writes the rfe_type-7 RFE-pinmux pattern -- the only PCIe 8192F RFE init
+	 *    that enables the T/R switch here; its ext-PA-enable half is inert with
+	 *    no external PA fitted.  RX recovers ~68dB.
+	 *  - external_pa: despite the integrated (internal) PA, external_pa=1 is
+	 *    EMPIRICALLY better -- it selects the ext-PA IQK TX-gain (PAD_TXG 0x30),
+	 *    which drives this PA cleanly (~96% link).  external_pa=0 (internal
+	 *    PAD_TXG 0xe9) REGRESSED to ~40% with assoc timeouts (the DM under-drives
+	 *    the TX), so keep external_pa=1.
 	 */
 	rtl_hal(rtlpriv)->rfe_type = 7;
 	efu->board_type = 0;
