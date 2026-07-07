@@ -1681,6 +1681,213 @@ static int bosa_poll_bit(u16 reg, u8 bit, int want, unsigned int us, int cap)
 	return 0;
 }
 
+/* ===================================================================
+ * RTL8290B optical DDM: raw ADC -> calibrated dBm / temp / Vcc / bias.
+ *
+ * Re-expressed from the stock RTL8290B RX-power path (sigma-delta ADC read ->
+ * ratiometric RSSI voltage -> endpoint/threshold scale -> per-board polynomial
+ * -> log). Two independent mistakes made the naive readout (one 8-bit tap at
+ * 0x311 + a linear fit) wrong by ~10 dB:
+ *   1. RX power in dBm is LOGARITHMIC in a linear 0.1uW "code"
+ *      (dBm = 10*log10(code) - 40); a straight-line fit cannot track it, so the
+ *      error grows toward the tails (a decade of optical power ~= 10 dB).
+ *   2. The live RX signal is a 24-bit ratiometric sigma-delta ADC
+ *      (regs 0x30E/0x30F/0x310) normalised against the on-die reference taps,
+ *      not one byte of one gain range of it.
+ * Computed ON DEMAND at the /proc/ubus read: the stock periodic DDMI kthread
+ * only warms a cache and drives alarm thresholds; nothing external needs a
+ * periodic write, and a new periodic I2C poll would risk the ~10ms laser-servo
+ * timing. The raw 0x311 read and the optic_dbg tap dump are kept as permanent
+ * instruments. All fixed-point (no kernel FPU); explicit byte math.
+ * =================================================================== */
+
+/* Per-board optical calibration. Stock loads this from rtl8290b.data into its
+ * europa_param struct; the compiled defaults are Board-C's confirmed values
+ * (rtl8290b.data BE fields @0x546/0x54a/0x54e). bosa_optical_cal_load() can
+ * override them from /lib/firmware for a mixed fleet. */
+struct bosa_optical_cal {
+	/* Faithful RTL8290B RX-power chain (re-expressed from europa_drv.ko
+	 * rtl8290b_rxPower_get + _rtl8290b_rx_power_cal; reproduces the reference to
+	 * the centi-dBm across 5 samples). The dark term (rx_vthr) makes it AFFINE,
+	 * not proportional -- a through-origin fraction fit is wrong off-anchor:
+	 *   V     = (rssi - tap_lo)*3.3Vuv/(tap_hi - tap_lo)     (ratiometric, uV)
+	 *   irssi = 1000*(V - rx_vthr)*(r1+r2)/(r1*r2)           (rx_vthr = dark level)
+	 *   code  = ((b*(irssi/s1)/8192)*s1 + 1000*c/4096)/100,  s1 = irssi<65536?10:100
+	 *   dBm   = 1000*log10(code) - 4000  (centi-dBm; bosa_code_to_cdbm)
+	 * Per-board constants from rtl8290b.data (europa_param). */
+	u32 rx_vthr;		/* RSSI detection threshold / dark level, uV (data @0x552) */
+	u32 rx_r1, rx_r2;	/* RSSI load resistors, ohm (data @0x5df, @0x5e1, x10) */
+	s32 rx_poly_b, rx_poly_c;	/* code poly, a=0 on this board (data @0x54a, @0x54e) */
+	s16 temp_off;		/* temperature offset, degC (data @0x568) */
+};
+static struct bosa_optical_cal bosa_cal = {
+	.rx_vthr = 521509, .rx_r1 = 33000, .rx_r2 = 6200,
+	.rx_poly_b = 8374, .rx_poly_c = 265, .temp_off = 20,
+};
+
+#define BOSA_ADC_VREF_UV	3300000		/* stock 3.3V ADC full-scale (0x325aa0) */
+
+/* 24-bit big-endian read of three consecutive BOSA analog-page registers. */
+static u32 bosa_read24(u16 reg_hi)
+{
+	int a = bosa_read_reg(reg_hi);
+	int b = bosa_read_reg(reg_hi + 1);
+	int c = bosa_read_reg(reg_hi + 2);
+
+	if (a < 0 || b < 0 || c < 0)
+		return 0;
+	return ((u32)(a & 0xff) << 16) | ((u32)(b & 0xff) << 8) | (u32)(c & 0xff);
+}
+
+/* Sample the sigma-delta ADC at a mux/gain byte: select the channel on reg
+ * 0x212, kick the conversion, settle, then return the 24-bit code from
+ * 0x30E-0x310 (stock rtl8290b_sdadc_code_get; RSSI uses gain bytes 0x82/0xC2). */
+static u32 bosa_sdadc_read(u8 mux)
+{
+	u32 v;
+
+	bosa_write_reg(0x212, mux);	/* channel/gain select, latch (bit3) clear */
+	msleep(10);			/* ADC settle (stock: schedule_timeout(1)) */
+	bosa_set_bit(0x212, 3, 1);	/* latch/convert trigger */
+	v = bosa_read24(0x30E);
+	bosa_set_bit(0x212, 3, 0);	/* ALWAYS release: a stuck bit3 freezes the
+					 * result bank (0x302-0x316, temperature too) */
+	return v;
+}
+
+/* Ratiometric RSSI voltage (micro-volts), re-expressed from rtl8290b_rssiVoltage_get:
+ * normalise the RSSI ADC against the on-die reference taps and scale to the 3.3 V
+ * full-scale, averaging the two gain ranges. The reference normalisation cancels
+ * the ADC gain/offset drift that a single raw tap (0x311) cannot -- this is the
+ * load-bearing correctness step. The exact ref-tap roles (which of 0x305-0x307 /
+ * 0x314-0x316 is the low anchor vs the span endpoint) are transcribed from a
+ * partial disasm; optic_dbg dumps all taps so the first HW read at a known
+ * attenuation confirms/corrects the mapping and pins rx_thr against the anchor. */
+static u32 bosa_rssi_uv(void)
+{
+	u32 rssi   = bosa_sdadc_read(0xC2);	/* single in-range gain (0xC2) */
+	u32 ref_lo = bosa_read24(0x314);	/* low reference tap (HW: 2.9M < RSSI) */
+	u32 ref_hi = bosa_read24(0x305);	/* high reference tap (HW: 13.8M > RSSI) */
+	u32 span   = (ref_hi > ref_lo) ? (ref_hi - ref_lo) : 1;
+	u32 da     = (rssi > ref_lo) ? rssi - ref_lo : 0;
+
+	/* ratiometric fraction in 1/10000 (0.221 -> 2210). The reference taps track
+	 * the ADC gain/offset drift, so this is bench-stable where a raw single tap
+	 * (0x311) is not. Averaging the two gain ranges was WRONG (they scale
+	 * differently); one in-range gain is stable. */
+	return (u32)div64_u64((u64)da * 10000, span);
+}
+
+/* Faithful RX power code (0.1uW) from the raw ratiometric ADC (europa_drv.ko
+ * rtl8290b_rxPower_get + _rtl8290b_rx_power_cal). All 64-bit divides go through
+ * the kernel helpers (no __divdi3 on MIPS32); /8192 and /4096 are shifts. */
+static u32 bosa_rx_code(void)
+{
+	u32 rssi   = bosa_sdadc_read(0xC2);	/* single in-range gain */
+	u32 tap_lo = bosa_read24(0x314);
+	u32 tap_hi = bosa_read24(0x305);
+	u32 span   = (tap_hi > tap_lo) ? (tap_hi - tap_lo) : 1;
+	u64 v_uv, irssi, code;
+	u32 s1, q;
+
+	if (rssi <= tap_lo)
+		return 11;
+	v_uv = div64_u64((u64)(rssi - tap_lo) * BOSA_ADC_VREF_UV, span);
+	if (v_uv <= bosa_cal.rx_vthr)		/* at/below the dark level -> no light */
+		return 11;
+	irssi = div64_u64((u64)(v_uv - bosa_cal.rx_vthr) * 1000 * (bosa_cal.rx_r1 + bosa_cal.rx_r2),
+			  (u64)bosa_cal.rx_r1 * bosa_cal.rx_r2);
+	s1 = (irssi < 65536) ? 10 : 100;
+	q  = (u32)div64_u64(irssi, s1);
+	code = (((u64)bosa_cal.rx_poly_b * q) >> 13) * s1 + ((1000u * (u32)bosa_cal.rx_poly_c) >> 12);
+	code = div64_u64(code, 100);
+	return code < 11 ? 11 : (u32)code;
+}
+
+/* Linear power code (0.1uW) -> centi-dBm (0.01 dBm).
+ *   cdBm = 1000*log10(code) - 4000 = (log2(code) * 1000*log10(2)) - 4000.
+ * Same fixed-point log2 (fls integer part + Q16 linear-interp mantissa,
+ * ~0.25 dB worst-case) as ddm_word_to_level -- exact enough for a diagnostic;
+ * this is stock's pow2dbm1[] table computed instead of embedding 2 KB. Works
+ * for TX power too (positive dBm). Floor -40.00 dBm for a dark/"n/a" read. */
+static s32 bosa_code_to_cdbm(u32 code)
+{
+	int e;
+	u32 frac;
+	s64 log2_q16, cdbm;
+
+	if (code < 1)
+		return -4000;
+	e = fls(code) - 1;
+	frac = e ? (((u64)(code - (1u << e)) << 16) >> e) : 0;
+	log2_q16 = ((s64)e << 16) | frac;
+	cdbm = ((log2_q16 * 301) >> 16) - 4000;		/* 301 = round(1000*log10(2)) */
+	return cdbm < -4000 ? -4000 : (s32)cdbm;
+}
+
+/* Median of 3 RX code reads -- de-noises the read-to-read variation (stock
+ * medians 60; 3 is enough for a diagnostic and keeps the /proc read cheap). */
+static u32 bosa_rx_code_median(void)
+{
+	u32 a = bosa_rx_code(), b = bosa_rx_code(), c = bosa_rx_code();
+	u32 lo = min(a, min(b, c)), hi = max(a, max(b, c));
+
+	return a + b + c - lo - hi;
+}
+
+/* Public on-demand RX optical power in centi-dBm (for /proc + ubus + ANI-G). */
+static s32 bosa_rx_power_cdbm(void)
+{
+	return bosa_code_to_cdbm(bosa_rx_code_median());
+}
+
+/* Module temperature in deci-degC. Kelvin code from the temp ADC
+ * (0x302[7:0]<<1 | 0x303[2:0], 233..383 K = -40..+110 C) minus the per-board
+ * Kelvin trim (stock rtl8290b_temperature_get; stock stores SFF-8472 1/256 C). */
+static s32 bosa_temp_dc(void)
+{
+	u16 s[14];
+	u32 sum = 0;
+	int i, j;
+
+	/* 14 back-to-back samples of the free-running Kelvin ADC (stock
+	 * rtl8290b_temperature_get); coarse LSB is bit7 of 0x303. Clamp each to
+	 * [233,383] K (catches torn/glitch reads, e.g. -292 C), sort, drop 2 low +
+	 * 2 high, mean the middle 10. Requires the SD-ADC latch released (0x212
+	 * bit3=0) -- bosa_sdadc_read always clears it, else this bank stays frozen. */
+	for (i = 0; i < 14; i++) {
+		int a = bosa_read_reg(0x302), b = bosa_read_reg(0x303);
+		u16 code;
+
+		if (a < 0 || b < 0)
+			return INT_MIN;
+		code = ((u16)(a & 0xff) << 1) | ((b >> 7) & 1);
+		if (code < 233) code = 233;
+		if (code > 383) code = 383;
+		s[i] = code;
+	}
+	for (i = 0; i < 13; i++)
+		for (j = 0; j < 13 - i; j++)
+			if (s[j + 1] < s[j]) { u16 t = s[j]; s[j] = s[j + 1]; s[j + 1] = t; }
+	for (i = 2; i < 12; i++)
+		sum += s[i];
+	sum /= 10;
+	return ((int)sum - bosa_cal.temp_off - 273) * 10;
+}
+
+/* Laser bias current in micro-amps. 12-bit monitor code (0x321[7:0]<<4 |
+ * 0x322[3:0]), full-scale ~100 mA at code 8192 (stock A2 word is 2 uA/LSB). */
+static u32 bosa_bias_ua(void)
+{
+	int h = bosa_read_reg(0x321), l = bosa_read_reg(0x322);
+	u32 code12;
+
+	if (h < 0 || l < 0)
+		return 0;
+	code12 = ((u32)(h & 0xff) << 4) | (u32)(l & 0x0f);
+	return (u32)div_u64((u64)code12 * 100000, 8192) * 2;
+}
+
 /*
  * Power up the RTL8290B optical receiver so its signal-detect asserts. On a
  * fresh boot the BOSA leaves the RX amplifier powered down (W41.RXI_PWDN_L=1),
@@ -4122,8 +4329,7 @@ static int gpon_proc_show(struct seq_file *s, void *v)
 	 * near sensitivity (~-28 Class B+) or a big drop vs a good boot => a marginal/dirty link. */
 	{
 		u32 los = gpon_rd(GPON_GTC_DS_LOS_CFG_STS);
-		int rxc = bosa_read_reg(0x311) & 0xff;
-		int rx_cdbm = (rxc * 2513) / 100 - 4100;
+		s32 rx_cdbm = bosa_rx_power_cdbm();	/* calibrated ratiometric RX (was a linear 0x311 fit) */
 
 		seq_printf(s, "fiber:       rerange=%u last_outage=%ums | optic_los=%d sdet=%d rx=%d.%02ddBm | omcc_inst=%d DATA_GEM_inst=%d solicited=%d\n",
 			   gpon_rerange_cnt, gpon_last_outage_ms,
@@ -4581,12 +4787,19 @@ static int gpon_proc_show(struct seq_file *s, void *v)
 		 * (attenuator in) -> 0x8c @ ~-5.8 dBm (attenuator out). The 0x30e/0x30f word is
 		 * a constant/cycling mux channel, NOT RX. 2-point linear-in-dB fit, integer/no
 		 * FPU: centi-dBm = code*2513/100 - 4100 (refine vs the rtl8290b.data table). */
-		int rxc = bosa_read_reg(0x311) & 0xff;
-		int rx_cdbm = (rxc * 2513) / 100 - 4100;
+		int rxc = bosa_read_reg(0x311) & 0xff;	/* raw 8-bit RSSI tap: kept as instrument */
+		u32 rx_code = bosa_rx_code();
+		s32 rx_cdbm = bosa_code_to_cdbm(rx_code);	/* faithful RX chain -> centi-dBm */
+		u32 rssi_uv = bosa_rssi_uv();			/* ratiometric fraction*10000, info */
 		int txw = bosa_read16_median(0x166);
 
 		seq_printf(s, "optic_rx_raw: 0x%02x optic_rx_cdbm: %d optic_tx_raw: 0x%04x\n",
 			   rxc, rx_cdbm, txw & 0xffff);
+		seq_printf(s, "optic_env:   temp_dc=%d bias_ua=%u\n", bosa_temp_dc(), bosa_bias_ua());
+		/* Full RX chain intermediates: a HW read at a known attenuation pins the exact
+		 * ref-tap roles + rx_thr against the -14 dBm anchor (code 398 = 0.1uW at -14 dBm). */
+		seq_printf(s, "optic_rxchain: rssi_uv=%u code=%u cdbm=%d | adcA=%06x ref305=%06x ref314=%06x\n",
+			   rssi_uv, rx_code, rx_cdbm, bosa_read24(0x30e), bosa_read24(0x305), bosa_read24(0x314));
 		seq_printf(s, "optic_dbg: 30c=%02x 30d=%02x 30e=%02x 30f=%02x 310=%02x 311=%02x 312=%02x | 166=%02x 167=%02x 168=%02x 169=%02x\n",
 			   bosa_read_reg(0x30c) & 0xff, bosa_read_reg(0x30d) & 0xff,
 			   bosa_read_reg(0x30e) & 0xff, bosa_read_reg(0x30f) & 0xff,
