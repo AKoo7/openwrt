@@ -1719,10 +1719,12 @@ struct bosa_optical_cal {
 	u32 rx_r1, rx_r2;	/* RSSI load resistors, ohm (data @0x5df, @0x5e1, x10) */
 	s32 rx_poly_b, rx_poly_c;	/* code poly, a=0 on this board (data @0x54a, @0x54e) */
 	s16 temp_off;		/* temperature offset, degC (data @0x568) */
+	s32 tx_slope, tx_offset;	/* TX word = (mpd*slope*10)>>8 + (offset*10>>5) (data @0x55c/0x560) */
 };
 static struct bosa_optical_cal bosa_cal = {
 	.rx_vthr = 521509, .rx_r1 = 33000, .rx_r2 = 6200,
 	.rx_poly_b = 8374, .rx_poly_c = 265, .temp_off = 20,
+	.tx_slope = 2022, .tx_offset = 0,
 };
 
 #define BOSA_ADC_VREF_UV	3300000		/* stock 3.3V ADC full-scale (0x325aa0) */
@@ -1842,7 +1844,7 @@ static s32 bosa_rx_power_cdbm(void)
 }
 
 /* Module temperature in deci-degC. Kelvin code from the temp ADC
- * (0x302[7:0]<<1 | 0x303[2:0], 233..383 K = -40..+110 C) minus the per-board
+ * (0x302[7:0]<<1 | 0x303[7], 233..383 K = -40..+110 C) minus the per-board
  * Kelvin trim (stock rtl8290b_temperature_get; stock stores SFF-8472 1/256 C). */
 static s32 bosa_temp_dc(void)
 {
@@ -1886,6 +1888,105 @@ static u32 bosa_bias_ua(void)
 		return 0;
 	code12 = ((u32)(h & 0xff) << 4) | (u32)(l & 0x0f);
 	return (u32)div_u64((u64)code12 * 100000, 8192) * 2;
+}
+
+/* ===== Live TX optical power (europa_drv update_ddmi_tx_power chain) =====
+ * The laser monitor-photodiode (MPD) on SD-ADC channel 2, ratiometric against the
+ * on-die reference taps, minus a dark reference measured once at init with the
+ * laser off; per-board slope; then the same log as RX. Reaches +2.458 dBm at
+ * nominal. Stock's TXSD-FSU errata (data[0x5DC]=0, inactive here) and impedance
+ * compensation (a no-op at the operating point) are dropped as proven-inactive. */
+
+static s32 bosa_vmpd_dark = INT_MIN;	/* MPD dark reference (mV); INT_MIN = not calibrated */
+static u32 bosa_tx_dbg_code;		/* last MPD raw code + taps (optic_txchain diag) */
+static s32 bosa_tx_dbg_hi, bosa_tx_dbg_zero;
+
+/* One MPD voltage (mV) via SD-ADC ch2, ratiometric vs the reference taps.
+ * tap_hi = 0x3B3 (live read) or 0x30B (dark cal). INT_MIN on ADC/tap error.
+ * Reads code + taps while the latch (0x212 bit3) is held, then releases it. */
+static s32 bosa_vmpd_mv(u16 tap_hi)
+{
+	u32 code;
+	s32 hi, zero;
+
+	bosa_set_bit(0x24A, 1, 0);		/* power up the ch2 (MPD) ADC */
+	bosa_write_reg(0x212, 0x62);		/* ch2 select, latch (bit3) clear */
+	msleep(10);				/* settle (stock: 1 jiffy @ HZ=100) */
+	bosa_set_bit(0x212, 3, 1);		/* convert trigger */
+	code = bosa_read24(0x30E) >> 2;
+	bosa_set_bit(0x24A, 1, 1);		/* power down the ch2 ADC */
+	hi   = (s32)(bosa_read24(tap_hi) >> 2);	/* ref tap (latched); positive 24-bit, plain >>2 */
+	zero = (s32)(bosa_read24(0x314) >> 2);	/* zero tap */
+	bosa_set_bit(0x212, 3, 0);		/* release the latch (after the taps) */
+	bosa_tx_dbg_code = code;
+	bosa_tx_dbg_hi = hi;
+	bosa_tx_dbg_zero = zero;
+	if (hi == 0 || (s32)code <= zero)
+		return INT_MIN;
+	return (s32)div_u64((u64)(u32)(hi - zero) * 1200, (u32)((s32)code - zero));
+}
+
+/* One-time dark (laser-off) MPD calibration. MUST run at BOSA init BEFORE the
+ * laser is enabled (forces TX off for ~200 ms); never at O5. */
+static void bosa_vmpd_dark_calibrate(void)
+{
+	int save = bosa_read_reg(0x230), i, n = 0;
+	s32 sum = 0, v;
+
+	if (save < 0)
+		return;
+	bosa_write_reg(0x230, (save | 0xc0) & 0xff);	/* force TX off (bits 7:6) */
+	bosa_set_field(0x24B, 0x0c, 3);			/* MPD mux = 3 (dark-cal path); set_field shifts by __ffs */
+	for (i = 0; i < 20; i++) {
+		v = bosa_vmpd_mv(0x30B);		/* dark-cal reference tap */
+		if (v != INT_MIN) {
+			sum += v;
+			n++;
+		}
+	}
+	bosa_set_field(0x24B, 0x0c, 2);			/* MPD mux = 2 (live) */
+	bosa_write_reg(0x230, save);			/* restore TX state */
+	bosa_set_bit(0x24A, 1, 1);
+	if (n)
+		bosa_vmpd_dark = sum / n;
+	pr_info("rtl9602c-gpon: BOSA MPD dark cal = %d mV (%d/20 samples)\n",
+		bosa_vmpd_dark, n);
+}
+
+/* Live TX optical power in centi-dBm. 10-sample mean of the range/bias-classified
+ * MPD power code -> per-board 0.1uW word -> log. INT_MIN until the dark cal ran. */
+static s32 bosa_tx_power_cdbm(void)
+{
+	u64 sum = 0;
+	u32 word;
+	int i, n = 0;
+
+	if (bosa_vmpd_dark == INT_MIN)
+		return INT_MIN;
+	for (i = 0; i < 10; i++) {
+		s32 vmpd, c;
+		int cls, shift, iavg, range;
+
+		bosa_set_field(0x24B, 0x0c, 2);		/* MPD mux = 2 (live/operational node) */
+		vmpd = bosa_vmpd_mv(0x3B3);
+		if (vmpd == INT_MIN)
+			continue;
+		c = (((vmpd - bosa_vmpd_dark) * 1000 / 1374) >> 4) + 50;
+		if (c < 0)
+			c = 0;
+		iavg  = bosa_read_reg(0x23A) & 0xff;
+		range = (bosa_read_reg(0x246) >> 6) & 3;
+		cls   = iavg < 64 ? 0 : iavg < 96 ? 1 : iavg < 128 ? 2 : iavg < 160 ? 3 : 4;
+		shift = cls - (range == 1 ? 1 : range == 2 ? 2 : 0);
+		sum  += shift >= 0 ? (u32)c << shift : (u32)c >> -shift;
+		n++;
+	}
+	if (!n)
+		return INT_MIN;
+	/* word(0.1uW) = (avg*slope*10)>>8 + (offset*10>>5); slope=2022, offset=0 here. */
+	word = (u32)((((u64)div_u64(sum, n) * bosa_cal.tx_slope * 10) >> 8) +
+		     ((bosa_cal.tx_offset * 10) >> 5));
+	return bosa_code_to_cdbm(word);
 }
 
 /*
@@ -4795,7 +4896,16 @@ static int gpon_proc_show(struct seq_file *s, void *v)
 
 		seq_printf(s, "optic_rx_raw: 0x%02x optic_rx_cdbm: %d optic_tx_raw: 0x%04x\n",
 			   rxc, rx_cdbm, txw & 0xffff);
-		seq_printf(s, "optic_env:   temp_dc=%d bias_ua=%u\n", bosa_temp_dc(), bosa_bias_ua());
+		seq_printf(s, "optic_env:   temp_dc=%d bias_ua=%u tx_cdbm=%d\n",
+			   bosa_temp_dc(), bosa_bias_ua(), bosa_tx_power_cdbm());
+		{
+			s32 v = bosa_vmpd_mv(0x3B3);	/* one live MPD sample -> latch its taps */
+
+			seq_printf(s, "optic_txchain: dark=%d vmpd=%d code=%u hi=%d zero=%d iavg=%02x range=%d\n",
+				   bosa_vmpd_dark, v, bosa_tx_dbg_code, bosa_tx_dbg_hi,
+				   bosa_tx_dbg_zero, bosa_read_reg(0x23A) & 0xff,
+				   (bosa_read_reg(0x246) >> 6) & 3);
+		}
 		/* Full RX chain intermediates: a HW read at a known attenuation pins the exact
 		 * ref-tap roles + rx_thr against the -14 dBm anchor (code 398 = 0.1uW at -14 dBm). */
 		seq_printf(s, "optic_rxchain: rssi_uv=%u code=%u cdbm=%d | adcA=%06x ref305=%06x ref314=%06x\n",
@@ -7117,6 +7227,12 @@ static int __init rtl9602c_gpon_init(void)
 	 */
 	if (!bosa_before_serdes)		/* else already RX-enabled before the SerDes */
 		bosa_rx_enable();
+
+	/* Measure the MPD dark reference while the laser is still off, for the live
+	 * TX-power DDM (bosa_tx_power_cdbm). Forces TX off ~200ms; must precede
+	 * bosa_tx_enable and never run at O5. */
+	if (!laser_off)
+		bosa_vmpd_dark_calibrate();
 
 	/* Power on the BOSA optical transmitter (laser bias/modulation/APC) so the
 	 * ONU can send upstream PLOAM bursts during activation. The APC offset
