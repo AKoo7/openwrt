@@ -19,6 +19,12 @@ endef
 
 include $(INCLUDE_DIR)/target.mk
 
+# No urngd: the jitter-entropy daemon burned ~60s of CPU at every boot on the
+# 624-BogoMIPS RLX core (measured on the X111W, 2026-07-08) while the kernel
+# crng already seeds itself from interrupt entropy by ~6s. (A "-urngd" negation
+# in DEVICE_PACKAGES is NOT honored by the rootfs assembly - filter it here.)
+DEFAULT_PACKAGES := $(filter-out urngd,$(DEFAULT_PACKAGES))
+
 DEFAULT_PACKAGES += \
 	kmod-gpio-button-hotplug \
 	uboot-envtools \

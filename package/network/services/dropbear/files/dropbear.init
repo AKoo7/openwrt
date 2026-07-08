@@ -79,7 +79,9 @@ hk_config()
 # $1 - host key file name
 hk_config__keyfile() { hk_config keyfile "$1" ; }
 
-ktype_all='ed25519 ecdsa rsa'
+# ed25519 only: host keys regenerate at EVERY boot on the read-only-overlay
+# RTL960x images, and RSA keygen takes tens of seconds on the RLX core.
+ktype_all='ed25519'
 
 hk_generate_as_needed()
 {
