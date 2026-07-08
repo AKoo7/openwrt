@@ -61,6 +61,12 @@
 		partition@380000 {
 			label = "r0";
 			reg = <0x380000 0x4c0000>;	/* 4864K rootfs bank 0 */
+			/* Mark r0 as the squashfs root: MTD_SPLIT_SQUASHFS_ROOT +
+			 * MTD_ROOTFS_ROOT_DEV then set ROOT_DEV (no root= needed from
+			 * U-Boot) and carve the rootfs_data overlay child -- without this
+			 * the kernel has no root device and VFS panics at mount. Bank 0 is
+			 * the flash target (inactive; active bank 1 keeps the live stock). */
+			linux,rootfs;
 		};
 		partition@840000 {
 			label = "k1";

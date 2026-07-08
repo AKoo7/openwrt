@@ -12,6 +12,17 @@ start_service() {
 
 	procd_open_instance
 	procd_set_param command "$PROG" ${socket:+-s "$socket"} ${timeout:+-t "$timeout"}
+	# RTL9602C Lexra RLX MDU erratum workaround: on this core a memory load issued
+	# in the shadow of a div/mult silently corrupts HI/LO, so musl's runtime dlopen
+	# of a PT_TLS shared library mis-computes its TLS size -> calloc(~4GB) -> ENOMEM.
+	# rpcd would then fail to dlopen /usr/lib/rpcd/ucode.so ("libucode.so: Out of
+	# memory") and never register the "luci" ubus object -> the LuCI web UI errors on
+	# every page. It only bit from flash (squashfs demand-paging = cache-miss loads
+	# that trip the hazard; the initramfs build kept libs cached, masking it).
+	# Initial-loading libucode here dodges the runtime-dlopen path. The real fix is a
+	# Lexra MDU workaround in the mips_mips32 toolchain (no mem op between div/mult
+	# and mflo/mfhi); until then this keeps LuCI usable on the RTL9602C.
+	procd_set_param env LD_PRELOAD="$(ls /usr/lib/libucode.so.* 2>/dev/null | head -n1)"
 	procd_set_param respawn
 	procd_close_instance
 }
