@@ -934,14 +934,20 @@ MODULE_PARM_DESC(wan_mac_offset, "WAN (gpon0) MAC = board/LAN MAC + this offset 
  * A clean-room ONU reports mds=0 at that pre-config GET -> rsync=0 != lsync -> Match State
  * stays "Initial" and no DS is forwarded (stock persists its mds so rsync matches). Seed the
  * counter so the pre-config GET/Upload reports a value equal to the OLT's post-config lsync. */
-static unsigned int omci_mds_seed = 125;	/* MIB-Data-Sync seed = stock's live ME2 value (omcicli mib get 2
-					 * = 125). The OLT has a persistent per-SN lsync for this ONU; reporting
-					 * the matching value makes the OLT treat us as in-sync and proceed. MDS=0
-					 * (factory-fresh) makes the OLT stuck in a GET audit loop (it expects the
-					 * already-provisioned ONU's lsync). The OLT re-provisions from scratch
-					 * after a MIB-Reset, and the per-applied-op increment rebuilds lsync. */
+static unsigned int omci_mds_seed = 200;	/* MIB-Data-Sync boot seed: a POISON value that fails the OLT's
+					 * ME2 audit on purpose (must be nonzero and != any plausible stored
+					 * lsync; observed lsync land ~42-126, MDS=0 wedges this OLT in a GET
+					 * poll loop). WHY mismatch: we hold no persistent MIB, so we must
+					 * NEVER pass the audit as "in sync". On a short-outage re-admit
+					 * (warm reboot / firmware-swap; capture 2026-07-08) the OLT decides
+					 * from this audit alone - a matching value (the old seed 125) made
+					 * it skip MIB-Reset + all Creates -> no data GEM -> no WAN until a
+					 * long power-cycle. A mismatch triggers its MIB-Reset -> mds_reset0
+					 * zeroes us -> full re-provision -> per-applied-op increments
+					 * converge with the OLT's lsync -> stable (capture-proven). Fresh
+					 * sessions MIB-Reset unconditionally, so the seed is moot there. */
 module_param(omci_mds_seed, uint, 0644);
-MODULE_PARM_DESC(omci_mds_seed, "OMCI ME2 MIB-Data-Sync seed (must equal the OLT's applied-op count for Match)");
+MODULE_PARM_DESC(omci_mds_seed, "OMCI ME2 MIB-Data-Sync boot seed (poison: must NOT match the OLT's stored lsync, forces re-provision)");
 /* mds_reset0: on an on-wire MIB-Reset (MT 0x4f), zero the MIB-Data-Sync counter per G.988 (and
  * stock omci_app OMCI_ResetMib @0x41057c) instead of re-seeding 125. CAPTURE-PROVEN (2026-06-18):
  * the OLT, after IT issues MIB-Reset, recounts its lsync from 0 and re-Creates the MEs; if we keep
@@ -4023,8 +4029,8 @@ static int rtl9602c_eth_probe(struct platform_device *pdev)
 	}
 
 	g_ep = ep;
-	ep->omci_mds = (u8)omci_mds_seed;	/* seed so the OLT's pre-config ME2 GET reads a value
-						 * matching its post-config lsync (DS-forwarding gate) */
+	ep->omci_mds = (u8)omci_mds_seed;	/* poison seed: fail the OLT's ME2 audit so a warm
+						 * re-admit re-provisions (we hold no persistent MIB) */
 	omci_build_mib();	/* populate the static MIB-Upload row table once */
 	proc_create_single("rtl9602c_diag", 0444, NULL, rtl9602c_diag_show);
 	proc_create("rtl9602c_omci_test", 0200, NULL, &rtl9602c_omci_test_pops);
