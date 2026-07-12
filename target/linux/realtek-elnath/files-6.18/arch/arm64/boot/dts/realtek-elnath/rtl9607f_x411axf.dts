@@ -1,0 +1,175 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+/*
+ * HSGQ X411AXF — Realtek RTL9607F "Elnath" GPON ONU.
+ *
+ * The RTL9607F is a Cortina-Access "Venus"-family SoC (dual Cortex-A55,
+ * GICv3) that Realtek productized after acquiring Cortina Access. This is a
+ * minimal M1 device tree: enough to reach a serial console + initramfs shell
+ * when the image is TFTP'd into RAM and booted by the vendor U-Boot. The
+ * switch/GPON/WiFi nodes are added as their clean-room drivers land.
+ *
+ * Hardware facts (base MMIO 0xf43xxxxx; GIC lives above 4 GB at 0x4_f80xxxxx):
+ *   - 2x Cortex-A55 @ up to 1.2 GHz, PSCI (SMC) secondary bring-up
+ *   - DDR3, 512 MiB at physical 0x0
+ *   - Console = Cortina custom-register UART at 0xf43291c0, GIC SPI 4,
+ *     clocked by an always-on 125 MHz fixed clock (no PLL driver needed)
+ */
+
+/dts-v1/;
+
+/ {
+	model = "HSGQ X411AXF (Realtek RTL9607F Elnath)";
+	compatible = "hsgq,x411axf", "realtek,rtl9607f";
+	#address-cells = <0x02>;
+	#size-cells = <0x02>;
+	interrupt-parent = <&gic>;
+
+	aliases {
+		serial0 = &uart0;
+	};
+
+	chosen {
+		stdout-path = "serial0:115200n8";
+		bootargs = "earlycon console=ttyS0,115200 rootfstype=squashfs";
+	};
+
+	memory@0 {
+		device_type = "memory";
+		/* 512 MiB at 0x0 */
+		reg = <0x00 0x00 0x00 0x20000000>;
+	};
+
+	/*
+	 * The Cortina NI packet engine's two DMA pools live inside our DRAM and
+	 * must be carved out: a small coherent descriptor buffer and the large
+	 * non-cached packet-buffer pool. Both are below the TFTP load addr
+	 * (0x05000000) region we boot from, so no collision.
+	 */
+	reserved-memory {
+		#address-cells = <0x02>;
+		#size-cells = <0x02>;
+		ranges;
+
+		/* ★★ build79: no-map so the CPU-EPP ring region is carved OUT of the RAM
+		 * linear map -> memremap(MEMREMAP_WC) SUCCEEDS on it (build78's WC was
+		 * REJECTED because a mapped System-RAM region can't be remapped WC).  The
+		 * NE DMA is non-coherent, so the ring MUST be uncached; WC on a no-map
+		 * carveout gives an uncached CPU view without touching NAPI/dma_sync. */
+		ddr_cache_buffer: buf@bc48000 {
+			no-map;
+			reg = <0x00 0x0bc48000 0x00 0x20000>;
+		};
+
+		ddr_noncache_buffer: buf@9000000 {
+			no-map;
+			reg = <0x00 0x09000000 0x00 0x1628800>;
+		};
+	};
+
+	psci {
+		compatible = "arm,psci-0.2";
+		method = "smc";
+	};
+
+	cpus {
+		#address-cells = <0x02>;
+		#size-cells = <0x00>;
+
+		cpu0: cpu@0 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a55";
+			reg = <0x00 0x00>;
+			enable-method = "psci";
+		};
+
+		cpu1: cpu@100 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a55";
+			reg = <0x00 0x100>;
+			enable-method = "psci";
+		};
+	};
+
+	timer {
+		compatible = "arm,armv8-timer";
+		/* secure, non-secure, virtual, hypervisor PPIs (13/14/11/10) */
+		interrupts = <0x01 0x0d 0xff08>,
+			     <0x01 0x0e 0xff08>,
+			     <0x01 0x0b 0xff08>,
+			     <0x01 0x0a 0xff08>;
+	};
+
+	gic: interrupt-controller@4f8000000 {
+		compatible = "arm,gic-v3";
+		#interrupt-cells = <0x03>;
+		#redistributor-regions = <0x01>;
+		interrupt-controller;
+		/* GICD @ 0x4_f8000000 (64 KiB), GICR @ 0x4_f8040000 (512 KiB) */
+		reg = <0x04 0xf8000000 0x00 0x10000>,
+		      <0x04 0xf8040000 0x00 0x80000>;
+		interrupts = <0x01 0x09 0x04>;
+	};
+
+	uart_clk: uart-clk {
+		compatible = "fixed-clock";
+		#clock-cells = <0x00>;
+		clock-frequency = <125000000>;	/* 125 MHz APB */
+	};
+
+	uart0: serial@f43291c0 {
+		compatible = "cortina,serial";
+		reg = <0x00 0xf43291c0 0x00 0x30>;
+		interrupts = <0x00 0x04 0x04>;	/* GIC SPI 4, level-high */
+		clocks = <&uart_clk>;
+		clock-frequency = <125000000>;
+		status = "okay";
+	};
+
+	/*
+	 * Cortina NI (network engine) — the RTL9607F Ethernet packet engine.
+	 * 22 register windows read BY POSITIONAL INDEX (null placeholder slots
+	 * keep their position). resets=/pinctrl-0/nvmem-cells are deliberately
+	 * OMITTED for M2: the bootloader already de-asserted/muxed the NI (it
+	 * TFTPs through it), so of_*_get soft-fails and the driver continues.
+	 */
+	ethernet@f4300000 {
+		compatible = "cortina,ni-interface";
+		reg = <0x04 0xf4300000 0x00 0x10000  0x04 0xf4320194 0x00 0x10
+		       0x04 0xf4329128 0x00 0x48     0x00 0xf4500000 0x00 0x2000
+		       0x04 0xf7001000 0x00 0x1000   0x00 0x80000000 0x00 0x2c000
+		       0x00 0x0bc48000 0x00 0x20000  0x01 0x09000000 0x00 0x1628800
+		       0x04 0xf5500000 0x00 0xc000   0x04 0xf4320000 0x00 0x1000
+		       0x04 0xf432d000 0x00 0x20b8   0x04 0xf4600000 0x00 0x100000
+		       0x04 0x00 0x00 0x00           0x04 0xf4330000 0x00 0x10000
+		       0x04 0xd000 0x00 0x00         0x04 0xf4700000 0x00 0x100
+		       0x00 0x90301000 0x00 0x2000   0x04 0x00 0x00 0x00
+		       0x00 0x90300800 0x00 0xb8     0x00 0x90300900 0x00 0x10
+		       0x00 0x90300a00 0x00 0xec     0x00 0x90300b00 0x00 0x3c4>;
+		interrupt-parent = <&gic>;
+		interrupts = <0x00 0x54 0x04>, <0x00 0x55 0x04>, <0x00 0x56 0x04>, <0x00 0x57 0x04>,
+			     <0x00 0x58 0x04>, <0x00 0x59 0x04>, <0x00 0x5a 0x04>, <0x00 0x5b 0x04>,
+			     <0x00 0x4c 0x04>, <0x00 0x4d 0x04>, <0x00 0x4e 0x04>, <0x00 0x4f 0x04>,
+			     <0x00 0x48 0x04>, <0x00 0x49 0x04>, <0x00 0x4a 0x04>, <0x00 0x4b 0x04>;
+		memory-region = <&ddr_cache_buffer>, <&ddr_noncache_buffer>;
+		/* ★★ build51: the NE is in the coherent (ACE) domain like stock - the CPU-EPP
+		 * descriptor writeback to the ddr_cache_buffer ring uses the COHERENT AXI attr
+		 * (0x12008060); without dma-coherent the interconnect REJECTED that coherent write
+		 * (0x611c bit22) and the ring wptr never advanced.  The pool's non-coherent RMU0
+		 * frame writes (DDR_POOL attr) are unaffected. */
+		dma-coherent;
+
+		ethernet@0 {
+			local-mac-address = [00 00 00 00 00 00];
+		};
+
+		mdio {
+			#address-cells = <0x01>;
+			#size-cells = <0x00>;
+
+			phy1: phy@1 { compatible = "ethernet-phy-ieee802.3-c22"; reg = <0x01>; };
+			phy2: phy@2 { compatible = "ethernet-phy-ieee802.3-c22"; reg = <0x02>; };
+			phy3: phy@3 { compatible = "ethernet-phy-ieee802.3-c22"; reg = <0x03>; };
+			phy4: phy@4 { compatible = "ethernet-phy-ieee802.3-c22"; reg = <0x04>; };
+		};
+	};
+};

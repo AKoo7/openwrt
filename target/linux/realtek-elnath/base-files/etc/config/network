@@ -1,0 +1,14 @@
+config interface 'loopback'
+	option device 'lo'
+	option proto 'static'
+	option ipaddr '127.0.0.1'
+	option netmask '255.0.0.0'
+
+# M2c/M2d: eth0 = the clean-room Cortina-NI port0 (LAN1). Direct static IP
+# (no bridge) so the host can ping/ssh the ONU as soon as RX works, and to
+# avoid the br-lan-route-shadows-eth0 artifact seen during the M2b TX test.
+config interface 'lan'
+	option device 'eth0'
+	option proto 'static'
+	option ipaddr '192.168.1.1'
+	option netmask '255.255.255.0'
