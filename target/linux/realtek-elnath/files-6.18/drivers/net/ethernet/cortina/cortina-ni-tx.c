@@ -161,10 +161,16 @@ static int cortina_ni_tx_engine_init(struct cortina_ni *ni)
 	writel(readl(dma + CA_DMA_AXIM2_CONFIG) | CA_DMA_AXIM2_CONFIG_BITS,
 	       dma + CA_DMA_AXIM2_CONFIG);
 
-	/* coherent (CCI/ACE) read attributes for all VPs */
+	/* ★ 2026-07-15: NON-coherent read attributes for all VPs.  Stock writes the
+	 * coherent/ACE pattern (CA_DMA_LSO_AXI_USER_PAT_VAL) and its fabric snoops;
+	 * on our kernel the ACE path is dead (QM 0x611c bit30 proved it for the EPP
+	 * writeback) and the ACE descriptor fetch never completed - the TXQ rptr sat
+	 * at 0 while the doorbell wptr climbed, so nothing ever transmitted.  The TX
+	 * ring/buffers are cache-maintained by the DMA API instead (no dma-coherent
+	 * on the NE DT node). */
 	writel(CA_DMA_LSO_AXI_USER_SEL0_VAL, dma + CA_DMA_LSO_AXI_USER_SEL0);
 	for (i = 0; i < 4; i++)
-		writel(CA_DMA_LSO_AXI_USER_PAT_VAL,
+		writel(CA_DMA_LSO_AXI_USER_PAT_NOCOH,
 		       dma + CA_DMA_LSO_AXI_USER_PAT0 + i * 4);
 
 	/* scheduler/shaper global TX enable */

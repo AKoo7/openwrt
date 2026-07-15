@@ -80,9 +80,10 @@ struct cortina_ni_rx {
 	__le64			*ring;		/* coherent EPP descriptor ring (8 voqs) */
 	dma_addr_t		ring_dma;
 	u32			rptr[CA_NI_RX_VOQ_COUNT];	/* SW read ptr per voq, byte offset */
-	/* CPU-pool DRAM region (EQ13+EQ14, cpu_eq=0, HW auto-populated): the RMU0
+	/* CPU-pool DRAM region (EQ5+EQ6, cpu_eq=0, HW self-populating): the RMU0
 	 * admits a CPU-dest frame into a buffer here; NAPI reads it via the phys
-	 * offset (bufPA - cpu_dram_dma).  Coherent, so no per-frame map/sync. */
+	 * offset (bufPA - cpu_dram_dma) and the HW recycles the bid on the EPP
+	 * read-pointer advance.  Mapped WC, so no per-frame map/sync. */
 	void			*cpu_dram;
 	dma_addr_t		cpu_dram_dma;
 	/* legacy CPU-push bookkeeping (unused now the CPU pools are DRAM auto-
@@ -110,8 +111,7 @@ struct cortina_ni_rx {
 	u64			drop_badpa;	/* PA not in our map */
 	u64			drop_len;	/* bad frame length */
 	u64			drop_nobuf;	/* refill alloc failed */
-	u64			slot_dead;	/* buffer lost (remap/push failed) */
-	u64			push_timeo;	/* pushes that timed out on ready */
+	u64			slot_dead;	/* buffer lost (remap failed) */
 	u64			last_desc;	/* last non-empty descriptor */
 	u64			last_hdra;	/* last HEADER_A (host order) */
 };

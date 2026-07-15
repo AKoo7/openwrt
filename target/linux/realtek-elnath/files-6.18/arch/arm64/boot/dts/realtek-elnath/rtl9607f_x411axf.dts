@@ -151,12 +151,18 @@
 			     <0x00 0x4c 0x04>, <0x00 0x4d 0x04>, <0x00 0x4e 0x04>, <0x00 0x4f 0x04>,
 			     <0x00 0x48 0x04>, <0x00 0x49 0x04>, <0x00 0x4a 0x04>, <0x00 0x4b 0x04>;
 		memory-region = <&ddr_cache_buffer>, <&ddr_noncache_buffer>;
-		/* ★★ build51: the NE is in the coherent (ACE) domain like stock - the CPU-EPP
-		 * descriptor writeback to the ddr_cache_buffer ring uses the COHERENT AXI attr
-		 * (0x12008060); without dma-coherent the interconnect REJECTED that coherent write
-		 * (0x611c bit22) and the ring wptr never advanced.  The pool's non-coherent RMU0
-		 * frame writes (DDR_POOL attr) are unaffected. */
-		dma-coherent;
+		/* ★★ 2026-07-15: NO dma-coherent - the NE runs FULLY NON-COHERENT on our
+		 * kernel.  The ACE/coherent fabric path does not work here even though it
+		 * does on stock: the CPU-EPP descriptor writeback with the stock coherent
+		 * attr 0x12008060 raised QM_INT_SRC bit30 (axim_cpuepp_resp_error) per frame
+		 * and never reached DRAM, and the DMA-LSO ACE descriptor fetch (usr_pat
+		 * ace_cmd) never completed (TXQ rptr pinned 0).  Every DMA path is therefore
+		 * explicitly non-coherent now: RX ring + RX pool are memremap-WC with the
+		 * non-coherent QM AXI attrs, and the TX rings/buffers rely on the DMA API's
+		 * cache maintenance - which dma-coherent would silently DISABLE (it makes
+		 * dma_alloc_coherent return cached memory and dma_map_single skip the cache
+		 * clean).  (The old build51 note claimed dma-coherent made the coherent
+		 * writeback work; live 0x611c bit30 + poison descriptors disproved that.) */
 
 		ethernet@0 {
 			local-mac-address = [00 00 00 00 00 00];

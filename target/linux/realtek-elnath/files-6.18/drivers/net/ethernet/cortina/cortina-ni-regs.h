@@ -498,14 +498,25 @@ enum cortina_ni_win {
  * aal_l3qm.c:1568,1583).  The REAL bug was ROUTING: our CPU frame resolved to pdpid 0x08 =
  * NI PORT 0 (a PHYSICAL wire egress; NI/phys ports = dest 8-15) with deep_q=1, so it was
  * SWITCHED OUT A WIRE PORT (bm_rx==bm_tx, no drop) and NEVER crossed into L3QM.  CPU ports
- * = dest 0-7; the fix routes the frame to CPU port 0 (pdpid 0x00, deep_q=0).  cpu_eq=0/eqid
- * 8-9 deep-queue pools are for NI egress ports 8-15, never written to the host - build66's
- * cpu_eq=0 was BACKWARDS.  buffer_size idx (aal_l3qm.c:1097): 1=128B..5=2048B, 0=INVALID.
- * EQ13 128B->idx1 cpu_eq=1 (0xff09); EQ14 2048B->idx5 cpu_eq=1 (0xff0d). */
-#define  CA_NI_QM_EQ13_CFG2		0x0000ff0du	/* build77: EQ5 pool0 - cpu_eq=1 + buffer_size idx5=2048B (stock CPU pool size) + refill_en=0 */
+ * = dest 0-7; the fix routes the frame to CPU port 0 (pdpid 0x00, deep_q=0).
+ *
+ * ★★★★ 2026-07-15 STOCK GOLDEN (tier-1 live devmem, STOCK_cpurx_dynamic_golden.txt)
+ * SUPERSEDES the cpu_eq=1 host-fed model above - stock NEVER CPU-pushes an RX buffer
+ * on this silicon (QM_CPU_PUSH_PADDR0 0x63cc reads 0 since boot):
+ *   - The CPU-class pools EQ12/13/14 are cpu_eq=0 SELF-POPULATING: CFG0.phy_addr_start
+ *     + CFG1.total_buf + CFG2.buffer_size and the QM maps bid n -> base + n*bufsz
+ *     itself, recycling the bid when the CPU advances the EPP read pointer.  Their
+ *     inactive counters stay 0 forever.  (EQ8 is the other stock model: cpu_eq=1
+ *     but FBM-auto-refilled, refill_en=1 - needs the FBM block, not a CPU push.)
+ *   - CFG2 buffer_size[2:0] LIVE decode: idx 128B=0,256=1,512=2,1024=3,2048=4,4096=5
+ *     (live EQ14 c2=0xFF04 with a proven 2048B stride).  The sibling-SDK "1=128B..
+ *     5=2048B" table above was off by one on this chip: our old idx5 = 4096B stride.
+ * => 0x0000ff04 = cpu_eq=0, refill_en=0, refill_ths=0xff (don't-care), size idx4=2048B.
+ *    The old 0x0000ff0d was BOTH cpu_eq=1 host-fed AND a 4096-vs-2048 stride bug. */
+#define  CA_NI_QM_EQ13_CFG2		0x0000ff04u	/* EQ5 pool0 - cpu_eq=0 self-populating, 2048B (idx4) */
 #define  CA_NI_QM_EQ8_CFG2		0x0000ff00u
 #define  CA_NI_QM_EQ14_CFG0		0x09240001u
-#define  CA_NI_QM_EQ14_CFG2		0x0000ff0du	/* build76: cpu_eq=1 + buffer_size idx5=2048B (POOL1 host-fed) */
+#define  CA_NI_QM_EQ14_CFG2		0x0000ff04u	/* EQ6 pool1 - cpu_eq=0 self-populating, 2048B (idx4) */
 /* EQ_CFG_LOAD commit latch: bit31 = load trigger, low 16 bits = the per-EQ
  * "latch this EQ's CFG" set (EQ_CFG_LOAD_ALL 0xffff = every EQ; U-Boot's live
  * value 0x370 = its own set {EQ4,5,6,8,9} by bit position, NOT a count - 0x370
@@ -528,14 +539,14 @@ enum cortina_ni_win {
  * live at 0x09240000 in the same reserve).  The RMU can only DMA a frame into a
  * buffer whose PA falls in the NE's DDR window - a dma_alloc_coherent buffer lands
  * outside it and is never admitted.  Offset 4MB in to clear the low part; our pool is
- * ~1.02MB so [0x09400000, 0x09504000) stays well within the 22MB reserve. */
+ * 2MB so [0x09400000, 0x09600000) stays well within the 22MB reserve. */
 #define CA_NI_RX_CPU_POOL_PHYS		0x09400000u
 
 /* ★ FBM EXSTACK (pointer-spill) region: the FBM DMAs buffer-pointer spills HERE
  * (aal_fbm_init __ca_malloc(depth*4), phys -> POOL+0x04 as (pbase>>12)<<4).  It is
  * SEPARATE from the packet buffers.  Leaving POOL+0x04=0 spilled at phys 0 = kernel
  * slab -> the build24 panic.  Place it high in the same 0x09000000 no-map reserve,
- * clear of the CPU pool (0x09400000..~0x09504000) and the ring (0x0bc48000). */
+ * clear of the CPU pool (0x09400000..0x09600000) and the ring (0x0bc48000). */
 #define CA_NI_RX_FBM_EXSTACK_PHYS	0x0A000000u	/* in the no-map reserve, page-aligned */
 #define CA_NI_RX_FBM_EXSTACK_DEPTH	0x800u		/* spill capacity (>= bufs pushed); *4 = 8KB */
 #define CA_NI_RX_FBM_POOL0_COUNT	512u		/* pool0 buffer count (mult of 64, <=16384) */
@@ -827,10 +838,17 @@ enum cortina_ni_win {
 #define CA_DMA_LSO_AXI_USER_SEL0	0x014
 #define  CA_DMA_LSO_AXI_USER_SEL0_VAL	0x00555555	/* vp0..11 rd_pat=1 */
 #define CA_DMA_LSO_AXI_USER_PAT0	0x018	/* ..PAT3 at 0x1c/0x20/0x24 */
-#define  CA_DMA_LSO_AXI_USER_PAT_VAL	0x02008080	/* ace_cmd=1 (bit25),
+#define  CA_DMA_LSO_AXI_USER_PAT_VAL	0x02008080	/* STOCK: ace_cmd=1 (bit25),
 						 * cache=2 (17:14),
 						 * domain=2 outer-shareable
 						 * (7:6) - coherent CCI path */
+/* ★ 2026-07-15: the coherent/ACE fabric path is DEAD on our kernel (see the
+ * CPU-EPP axim_cpuepp_resp_error root cause) - with the stock ACE pattern the
+ * LSO descriptor fetch never completes and TXQ rptr stays 0 forever.  Use a
+ * non-coherent read pattern (ace=0, cache=2 normal bufferable, domain=0
+ * non-shareable); the TX ring/buffers are cache-maintained by the DMA API
+ * (the NE DT node deliberately has NO dma-coherent property). */
+#define  CA_DMA_LSO_AXI_USER_PAT_NOCOH	0x00008000
 /* 07f-only pair, written unconditionally by stock TX-DMA init (the CA8277B
  * names at these offsets no longer apply - block regenerated) */
 #define CA_DMA_LSO_MISC_C0		0x0c0
@@ -1305,35 +1323,32 @@ enum cortina_ni_win {
 /* buffer-size index (stock aal_l3qm_get_buffer_size_index):
  * 0x80=0 0x100=1 0x200=2 0x400=3 0x800=4 0x1000=5 0x2000=6 */
 #define CA_NI_QM_BUF_SIZE_IDX_2048	4	/* idx 4 -> 0x800 = 2048B stride */
-/* Two CPU empty-buffer pools (stock aal_l3qm_init_empty_buffer_CPU), tier-1
- * devmem values for THIS board:
- *  - EQ13 = pool0/PRIMARY (profile eqp0), NAPI keeps it topped one-for-one;
- *  - EQ14 = pool1/SECONDARY (profile eqp1), overflow reserve.
- * Both are CPU-push pools (refill_en=0): WE push DDR buffer PAs via
- * CPU_PUSH_PADDR - there is no FBM auto-refill.  The seed count into a pool
- * MUST be <= its CFG1 total_buf, and the bid windows must not overlap: stock's
- * EQ13 [0x5b0,0x5b0+383) is contiguous with EQ14 [0x72f,0x72f+561).  These bid
- * windows MUST equal what cortina_ni_rx_eq_cfg_pool writes into CFG1 (it builds
- * CFG1 from these same constants), or the pushed BIDs miss the pool window. */
+/* Two CPU empty-buffer pools (stock aal_l3qm_init_empty_buffer_CPU):
+ *  - EQ5 = pool0/PRIMARY (profile eqp0);
+ *  - EQ6 = pool1/SECONDARY (profile eqp1), overflow reserve.
+ * Both are cpu_eq=0 SELF-POPULATING (refill_en=0, stock model): the QM maps
+ * bid n -> CFG0.phy_addr_start + n * buffer_size over CFG1.total_buf buffers
+ * and recycles a bid when the CPU-EPP read pointer advances past its frame -
+ * no software push, no FBM.  The bid windows must not overlap each other or
+ * any stock-era pool range. */
 #define CA_NI_RX_EQ_ID2			6	/* build77: CPU_0 pool1 = EQ6 (EQ_PROFILE[2].eqp1=6) */
 #define CA_NI_RX_EQ_BID_START		0x1200	/* build77: EQ5 (pool0) bid_start = 4608 (stock CPU pool0) */
-#define CA_NI_RX_EQ_TOTAL_BUF		512	/* EQ5 (pool0) buffers pushed (<= stock 1500; plenty for ARP) */
-#define CA_NI_RX_EQ2_TOTAL_BUF		512	/* EQ6 (pool1) buffers pushed */
+#define CA_NI_RX_EQ_TOTAL_BUF		512	/* EQ5 (pool0) buffer count (CFG1) */
+#define CA_NI_RX_EQ2_TOTAL_BUF		512	/* EQ6 (pool1) buffer count (CFG1) */
 #define CA_NI_RX_EQ2_BID_START		0x17dc	/* build77: EQ6 (pool1) bid_start = 6108 (stock CPU pool1; NOT contiguous - matches stock ranges) */
-/* ★★★ CPU-pool DRAM layout (cpu_eq=0, software-populated).  ONE dma_alloc_coherent
- * region holds both CPU pools back-to-back: EQ13 (pool0, 128B buffers) at offset 0,
- * EQ14 (pool1, 2048B buffers) right after.  CFG0.phy_addr_start of each pool points
- * at its sub-region; cortina_ni_rx_populate pushes each buffer PA.  buffer_size
- * MUST match CFG2 and stock (EQ13=idx0=128B, EQ14=idx4=2048B) - unequal sizes are
- * required for the RMU's eqp0-small/eqp1-large size-select. */
-#define CA_NI_RX_CPU_POOL0_BUFSZ	2048u	/* build77: EQ5 buffer_size idx5 (2048B, stock CPU pool) */
-#define CA_NI_RX_CPU_POOL1_BUFSZ	2048u	/* EQ6 buffer_size idx5 (2048B) */
+/* ★★★ CPU-pool DRAM layout (cpu_eq=0, HW self-populated).  ONE reserved region
+ * holds both CPU pools back-to-back: EQ5 (pool0) at offset 0, EQ6 (pool1) right
+ * after.  CFG0.phy_addr_start of each pool points at its sub-region; the QM walks
+ * it linearly at 2048B (CFG2 idx4) stride.  BUFSZ here MUST match the CFG2
+ * buffer_size index or the NAPI offset->buffer math shears. */
+#define CA_NI_RX_CPU_POOL0_BUFSZ	2048u	/* EQ5 buffer_size idx4 (2048B, stock CPU pool) */
+#define CA_NI_RX_CPU_POOL1_BUFSZ	2048u	/* EQ6 buffer_size idx4 (2048B) */
 #define CA_NI_RX_CPU_POOL0_BYTES \
-	(CA_NI_RX_CPU_POOL0_BUFSZ * CA_NI_RX_EQ_TOTAL_BUF)	/* 128*128 = 16KB */
+	(CA_NI_RX_CPU_POOL0_BUFSZ * CA_NI_RX_EQ_TOTAL_BUF)	/* 512*2048 = 1MB */
 #define CA_NI_RX_CPU_POOL1_BYTES \
 	(CA_NI_RX_CPU_POOL1_BUFSZ * CA_NI_RX_EQ2_TOTAL_BUF)	/* 512*2048 = 1MB */
 #define CA_NI_RX_CPU_DRAM_SIZE \
-	(CA_NI_RX_CPU_POOL0_BYTES + CA_NI_RX_CPU_POOL1_BYTES)	/* ~1.02MB */
+	(CA_NI_RX_CPU_POOL0_BYTES + CA_NI_RX_CPU_POOL1_BYTES)	/* 2MB */
 /* ★ EQ8 = the RMU's empty-buffer ALLOC pool (dest-9->profile-13->EQ13 queue, but
  * the RMU allocates a free buffer from EQ8 to admit a frame).  Brought up as a
  * CPU-PUSH pool - reuse EQ13's CFG0 (enable) + CFG2=0xff00 (refill_en=0, NO FBM,
@@ -1551,14 +1566,23 @@ enum cortina_ni_win {
  *     fallback path).  Entry address = lspid << 2 | type; the ACCESS
  *     register both kicks a read (go) and a write (go|write) of the DATA
  *     register from/to the table; go self-clears. --- */
-/* build68: the DFT_FWD control block regs stock sets but we never did (tier-1
- * stock devmem: 0x1560=0x00000007, 0x156c=0x4000003F).  Without them the PLE
- * default-forward engine stays disabled -> the DLF/BC frame is never redirected
- * to its mcgid, so the CPU flood copy is never produced. */
-#define CA_NI_PLE_DFT_FWD_CTRL		0x1560
-#define  CA_NI_PLE_DFT_FWD_CTRL_VAL	0x00000007u
-#define CA_NI_PLE_DFT_FWD_CFG		0x156c
-#define  CA_NI_PLE_DFT_FWD_CFG_VAL	0x4000003Fu
+/* ★ 2026-07-15: 0x1560 = TX_DOT1P_MAP_DATA, 0x156c = MMSHP_CHK_ID_MAP ACCESS (NOT
+ * a DFT_FWD control block; confirmed vs rtl8277c_registers.h + live stock).  The old
+ * build68 writes (0x1560=0x07, 0x156c=0x4000003F) MISREAD stock's VLAN-init RESIDUE
+ * (0x156c=0x4000003F is just WR|idx63 left by the 64-entry check-id-map loop) as
+ * config.  ★ Corrected 2026-07-15: that 0x156c write was a NO-OP - 0x4000003F has
+ * WR(bit30)+idx63 but NOT the GO/access bit31, so NOTHING was ever committed (it did
+ * NOT write "garbage into entry 63"; the map was simply left unprogrammed).  Removed.
+ * The membership check-id map (lport -> check-id, which gates LAN<->CPU forwarding
+ * via PLE_CTL b0/b1) is now programmed by cortina_ni_rx_port_profiles_init. */
+#define CA_NI_L2FE_CHKID_MAP_ACCESS	0x156c	/* MMSHP_CHK_ID_MAP indirect ACCESS */
+#define CA_NI_L2FE_CHKID_MAP_DATA	0x1570	/* ... DATA = check-id for the lport */
+/* PLE control regs stock programs that ours skipped (golden 2026-07-15) */
+#define CA_NI_L2FE_PLE_TRUNK0		0x1514
+#define CA_NI_L2FE_PLE_TRUNK1		0x1520
+#define  CA_NI_L2FE_PLE_TRUNK_STOCK	0x00000012u
+#define CA_NI_L2FE_PLE_HD_FF_CTL	0x152c
+#define  CA_NI_L2FE_PLE_HD_FF_STOCK	0x00000610u
 #define CA_NI_PLE_DFT_FWD_ACCESS	0x1564
 #define  CA_NI_PLE_ACCESS_GO		BIT(31)
 #define  CA_NI_PLE_ACCESS_WRITE		BIT(30)
@@ -1846,18 +1870,20 @@ enum cortina_ni_win {
 #define  CA_NI_L2FE_ARB_USE_HDR_A_DBUF	BIT(8)		/* 1=take dbuf from Header-A (FIB/L3FE) */
 #define CA_NI_L2FE_ARB_PORT_DBUF_ACCESS	0x1664
 #define CA_NI_L2FE_ARB_PORT_DBUF_DATA	0x1668
-/* ★★ build100: the ARB FLOW_DBUF table.  With ARB_CTRL.dbuf_sel=1 (stock) the HW uses THIS
- * table (per-flow deep-buffer flags), NOT PORT_DBUF, as the deep_q source.  Our driver only
- * programmed PORT_DBUF -> ignored -> the flooded broadcast ARP is never marked deep_q/cpu
- * (bm_word0 cpu=0/deep_q=0) -> no buffer attached -> CPU-EPP descriptor PA=0.  Indirect
- * (GO=bit31/WR=bit30, idx=flow_id/4); DATA bits[3:0]=dbuf_flg_0..3 (one per flow_id%4).
- * ★ Elnath offset UNCERTAIN: ca8277b raw=0x1648/0x164c, but Elnath PORT_DBUF is +0x14 at
- * 0x1664, and ca8277b FLOW_DBUF sits 8 bytes before PORT_DBUF -> best-guess 0x165c/0x1660.
- * The before/after readback log confirms which is right (non-zero after write = correct). */
-#define CA_NI_L2FE_ARB_FLOW_DBUF_ACCESS	0x165c	/* Elnath best-guess (PORT_DBUF-8); ca8277b raw=0x1648 */
-#define CA_NI_L2FE_ARB_FLOW_DBUF_DATA	0x1660	/* ca8277b raw=0x164c */
-#define  CA_NI_L2FE_ARB_FLOW_DBUF_FLG_ALL 0x0000000Fu	/* dbuf_flg_0..3 all set = all 4 flows deep_q */
-#define  CA_NI_L2FE_ARB_FLOW_DBUF_ENTRIES 16u		/* test: mark flows 0..63 deep_q */
+/* ★★ 2026-07-15: the ARB FLOW_DBUF table - STOCK KEEPS IT ALL-ZERO.  With
+ * ARB_CTRL.dbuf_sel=1 (stock) the HW uses THIS table (per-flow deep-buffer flags) as the
+ * deep_q source.  build100's "mark every flow 0x0F" was THE CPU-RX regression: it forced
+ * deep_q=1 on every LAN flow, diverting the frame into the (broken for us) deep-queue path
+ * BEFORE it could enter L3FE (l3fe_rx stayed 0 while stock's climbs).  Stock's CPU
+ * delivery has NO deep-queue marking: DFT_FWD 0x1832 redirect -> mcgid 0x19 (L3_LAN) ->
+ * RMU -> L3FE -> L3-CLS ethertype trap -> CPU_0.  We now write the table to 0 (stock).
+ * Indirect (GO=bit31/WR=bit30, idx=flow_id/4); DATA bits[3:0]=dbuf_flg_0..3 (one per
+ * flow_id%4).  Elnath offsets 0x165c/0x1660 = rtl8277c FLOW_DBUF 0x1644/0x1648 shifted
+ * +0x18 (same shift as PORT_DBUF 0x164c->0x1664 and PDPID_MAP 0x1654->0x166c). */
+#define CA_NI_L2FE_ARB_FLOW_DBUF_ACCESS	0x165c	/* rtl8277c 0x1644 + 0x18 */
+#define CA_NI_L2FE_ARB_FLOW_DBUF_DATA	0x1660	/* rtl8277c 0x1648 + 0x18 */
+#define  CA_NI_L2FE_ARB_FLOW_DBUF_FLG_ALL 0x0000000Fu	/* dbuf_flg_0..3 (build100 regression value; stock=0) */
+#define  CA_NI_L2FE_ARB_FLOW_DBUF_ENTRIES 16u		/* entries 0..15 cover flows 0..63 */
 #define  CA_NI_L2FE_ARB_DBUF_FLG	BIT(0)		/* output: deep-buffer => deep_q */
 #define  CA_NI_L2FE_ARB_DBUF_LDPID_VLD	BIT(1)
 #define  CA_NI_L2FE_ARB_DBUF_LDPID	GENMASK(7, 2)	/* match on resolved dest-ldpid */
@@ -1895,19 +1921,30 @@ enum cortina_ni_win {
  * poll GO clear (MC_FIB/ni_mce_indx were readable earlier, unlike REDIR_LDPID). */
 #define  CA_NI_IND_ACCESS_GO		BIT(31)
 #define  CA_NI_IND_ACCESS_WR		BIT(30)		/* rbw = 1 for a store */
-/* ★★ build70: the REAL RTL9607F stock MC_FIB offsets (tier-1 devmem golden,
- * dev/x411axf/stock_golden_qm.txt).  Fable's "ELNATH shift" to 0x1644/0x1648-58 was
- * WRONG: 0x1644 is a DEAD register (reads empty) - our whole flood config landed
- * there and never took.  The populated stock flood table lives at 0x1634:
- *   ACCESS 0x1634, DATA2 0x1638 (flood member bitmask), DATA1 0x163c, DATA0 0x1640.
- * Stock [0x10..0x1b] D2: 0F 04 0F 09 0F 05 0F 0A 0F 0B 0F 0C ([0x19]=0x0B=CPU flood). */
-#define CA_NI_L2FE_MC_FIB_ACCESS	0x1634		/* real stock (0x1644 = DEAD reg) */
-#define CA_NI_L2FE_MC_FIB_DATA2		0x1638		/* flood member bitmask */
-#define CA_NI_L2FE_MC_FIB_DATA1		0x163c
-#define CA_NI_L2FE_MC_FIB_DATA0		0x1640
-#define CA_NI_L2FE_MC_FIB_DATA3		0x1644
+/* ★★ 2026-07-15 CORRECTED (this fact bounced twice - keep it straight): the REAL
+ * Elnath MC_FIB ACCESS is 0x1644 (rtl8277c 0x1634 + the same +0x10 table shift as
+ * REDIR 0x1614->0x1624); its data words follow at 0x1648..0x1658 (FLOW_DBUF starts
+ * at 0x165c).  ★ STOCK KEEPS THE MC_FIB EMPTY - there is NO L2 flood-to-CPU at all
+ * (MCE mc_vec / MC_FIB / REDIR all empty on stock; the CPU delivery is the DFT_FWD
+ * 0x1832 redirect -> mc_group_id 0x19 = L3_LAN -> RMU -> L3FE -> L3-CLS trap ->
+ * CPU_0).  build70's "MC_FIB@0x1634" was a MISREAD: 0x1634 is a DIFFERENT table
+ * (per the rtl8277c layout +0x10 it is NON_KNOWN_POL_MAP, rtl8277c 0x1624) whose
+ * populated stock content (D2: 0F 04 0F 09 0F 05 0F 0A 0F 0B 0F 0C) was mistaken
+ * for a flood table; build70's writes re-wrote stock's own values into it. */
+#define CA_NI_L2FE_MC_FIB_ACCESS	0x1644		/* real Elnath MC_FIB (stock = EMPTY) */
 #define CA_NI_L2FE_MC_FIB_DATA4		0x1648
-#define  CA_NI_L2FE_MC_FIB_LDPID	GENMASK(29, 24)	/* per-copy dest ldpid (unused in flood-bitmask model) */
+#define CA_NI_L2FE_MC_FIB_DATA3		0x164c
+#define CA_NI_L2FE_MC_FIB_DATA2		0x1650
+#define CA_NI_L2FE_MC_FIB_DATA1		0x1654
+#define CA_NI_L2FE_MC_FIB_DATA0		0x1658
+#define  CA_NI_L2FE_MC_FIB_LDPID	GENMASK(29, 24)	/* per-copy dest ldpid */
+/* the table at 0x1634 build70 populated under the MC_FIB name (likely
+ * NON_KNOWN_POL_MAP per rtl8277c+0x10; the values written are stock's OWN readback
+ * of this table, so the writes are a stock-match of THAT table - kept as-is) */
+#define CA_NI_L2FE_NKPOL_MAP_ACCESS	0x1634		/* rtl8277c NON_KNOWN_POL_MAP 0x1624 + 0x10 */
+#define CA_NI_L2FE_NKPOL_MAP_DATA	0x1638
+#define CA_NI_L2FE_DSCP_TE_ACCESS	0x163c		/* rtl8277c DSCP_TE_MARK 0x162c + 0x10 */
+#define CA_NI_L2FE_DSCP_TE_DATA		0x1640
 /* ★ The guaranteed CPU trap (fallback a): DFT_FWD redirects UUC/DLF to a REAL
  * MCE group (mc_group_id=0 was the reserved-NULL group -> blackhole 0x1f).  The
  * group has ONE member: mc_vec bit b selects ARB-FIB[b], whose copy ldpid =
@@ -2012,6 +2049,17 @@ enum cortina_ni_win {
  */
 #define CA_NI_L2FE_NI_INTF_DROP_CNT	0x11bc	/* frames NI->L2FE dropped   */
 #define CA_NI_L2FE_NI_INTF_PKT_CNT	0x11c0	/* frames NI->L2FE (ingress) */
+/* ★ L2FE post-parse HEADER_A of the LAST parsed frame (vendor aal_l2_fe_pp_heada_get;
+ * rtl8277c L2FE_PP_HEADER_A_{LOW,MID,HI} = 0xf43011c4/c8/cc, PP block unshifted on
+ * Elnath - 0x11c0/0x11d0 neighbours are live-verified).  Vendor bit decode:
+ *   HI : cpu_flag b31, deep_q b30, policy_group_id[29:27], policy_id[26:18],
+ *        policy_ena[17:16], marked b15, mirror b14, no_drop b13,
+ *        rx_packet_type[12:11], drop_code[10:8], mc_group_id[7:0]
+ *   MID: header_type[31:30], fe_bypass b29, packet_size[28:15], logic_spid[14:9],
+ *        logic_dpid[8:3] (= the RESOLVED dest ldpid), cos[2:0] */
+#define CA_NI_L2FE_PP_HEADER_A_LOW	0x11c4
+#define CA_NI_L2FE_PP_HEADER_A_MID	0x11c8
+#define CA_NI_L2FE_PP_HEADER_A_HI	0x11cc
 #define CA_NI_L2FE_DOS_FLOOD_CNT	0x1234	/* DoS/flood drop            */
 #define CA_NI_L2FE_PE_TM_PKT_CNT	0x1760	/* frames L2FE->TM (forwarded)*/
 #define CA_NI_QM_RMU0_RX_PKT_CNTR	0x6900	/* ELNATH (rtl 0x67d8); frames into QM RMU */
