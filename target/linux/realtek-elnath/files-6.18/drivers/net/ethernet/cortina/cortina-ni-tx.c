@@ -595,6 +595,11 @@ static netdev_tx_t cortina_ni_start_xmit(struct sk_buff *skb,
 			       16, 1, skb->data, min(len, 64u), false);
 	}
 
+	/* TX timestamp BEFORE the doorbell: once the doorbell rings, HW may complete
+	 * the frame and the reclaim path (timer/other CPU) can free this skb, so
+	 * touching it after the unlock below is a use-after-free. */
+	skb_tx_timestamp(skb);
+
 	/* descriptor visible before the doorbell (stock: dmb oshst) */
 	dma_wmb();
 	writel(q->wptr,
@@ -602,7 +607,6 @@ static netdev_tx_t cortina_ni_start_xmit(struct sk_buff *skb,
 
 	spin_unlock(&q->lock);
 
-	skb_tx_timestamp(skb);
 	mod_timer(&tx->reclaim_timer, jiffies + CA_NI_RECLAIM_INTERVAL);
 	return NETDEV_TX_OK;
 }
