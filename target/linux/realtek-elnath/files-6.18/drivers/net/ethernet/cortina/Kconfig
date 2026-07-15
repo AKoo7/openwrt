@@ -30,4 +30,14 @@ config CORTINA_NI
 	  the Realtek RTL9607F "Elnath" GPON SoC, including its internal
 	  MDIO bus and quad GbE PHYs.
 
+config CORTINA_GPON
+	tristate "Cortina-Access RTL9607F GPON MAC"
+	depends on OF
+	depends on HAS_IOMEM
+	help
+	  This driver supports the Cortina-Access GPON MAC (CA8277C class)
+	  found in the Realtek RTL9607F "Elnath" GPON ONU SoC: the PON-MAC
+	  register block, PSDS SerDes optics, PLOAM servicing and the GEM
+	  datapath.  Clean-room re-expression of the Cortina ca-network-engine.
+
 endif # NET_VENDOR_CORTINA
