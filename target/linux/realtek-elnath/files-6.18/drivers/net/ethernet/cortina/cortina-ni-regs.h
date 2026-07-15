@@ -428,6 +428,16 @@ enum cortina_ni_win {
 #define  CA_NI_NI_DEMUX1_STOCK_VAL	0x00000000u
 #define CA_NI_NI_L3QMRX_DEMUX_CFG0	0xa18c		/* ELNATH (rtl 0xa1c8) */
 #define  CA_NI_NI_DEMUX0_STOCK_VAL	0xffff7f7fu
+/* ★ THE REAL per-ldpid L2FE-vs-L3FE ingress fork (NIRX_L3FE_DEMUX_CFG1/0)
+ * lives at 0xa1c4/0xa1c8, NOT the 0xa188/0xa18c above (those are the RM_TBMAX/
+ * RM_CNTR rate-meter regs -- our writes there matched stock only by coincidence
+ * of reset values).  Without these two the L2FE never forks a host frame into the
+ * L3FE classifier -> l3fe_rx(0xa9bc)=0 -> the CPU-trap never fires.  Live-stock
+ * golden 2026-07-13: 0xa1c4=0x00CBDA98, 0xa1c8=0x7000DA98. */
+#define CA_NI_NIRX_L3FE_DEMUX_CFG1_REAL	0xa1c4
+#define  CA_NI_NIRX_L3FE_DEMUX_CFG1_REAL_VAL	0x00CBDA98u
+#define CA_NI_NIRX_L3FE_DEMUX_CFG0_REAL	0xa1c8
+#define  CA_NI_NIRX_L3FE_DEMUX_CFG0_REAL_VAL	0x7000DA98u
 #define CA_NI_NI_PORTORDER_CFG		0xa184		/* ELNATH INTERNAL_PORT_ID_CFG2 (rtl 0xa1c0) */
 #define  CA_NI_NI_PORTORDER_STOCK_VAL	0x0024009bu
 #define  CA_NI_NI_INTERNAL_STOCK_VAL	0x00a87f00u	/* 0xa180: demux_sel[7:0]=0 -> all ports to L3QM */
@@ -900,6 +910,29 @@ enum cortina_ni_win {
 #define  CA_NI_AXI_REO_WR0_VAL		0x00000004u
 #define CA_NI_AXI_REO_WR1		0x404
 #define  CA_NI_AXI_REO_WR1_VAL		0x8000000cu
+/* ★★ build97: the L3FE AXI read-reorder channel (vendor aal_l3fe_axi_reo_init, aal_l3fe.c:341,
+ * run LAST in aal_l3fe_init).  It is the SIBLING of the main NI AXI-REO channels our driver
+ * already programs (win10+0x000 = rd ORIG 0xF->0xC, win10+0x400 = wr ORIG 4); the L3FE channel
+ * (AXI ID 2->8) is at win10+0x480 (abs 0xf432d480 - TIER-1 STOCK VALIDATED 2026-07-12; the
+ * build96 win10+0x2080 guess was wrong).  Our driver SKIPPED it -> the L3FE's AXI reads (ID 2)
+ * aren't reordered -> the L3FE can't fetch the frame from memory -> l3fe_rx=0.  Each channel has
+ * 7 regs: ORIG(+0)/NEW(+4)/TOP(+8)/MASK(+c)/NEW0(+10) + two 0xFFFFFFFF at +0x18/+0x24.  Fields:
+ * ORIG_ID axi_id[3:0]; NEW_ID axi_id[3:0]+valid[31]; TOP_ADDR/MASK id[31:0].  All 7 values
+ * byte-match stock live. */
+#define CA_NI_L3FE_AXI_REO_ORIG_ID	0x480
+#define  CA_NI_L3FE_AXI_REO_ORIG_ID_VAL	0x00000002u	/* axi_id=2 */
+#define CA_NI_L3FE_AXI_REO_NEW_ID	0x484
+#define  CA_NI_L3FE_AXI_REO_NEW_ID_VAL	0x80000008u	/* axi_id=8, valid */
+#define CA_NI_L3FE_AXI_REO_TOP_ADDR	0x488
+#define  CA_NI_L3FE_AXI_REO_TOP_ADDR_VAL	0x10000000u
+#define CA_NI_L3FE_AXI_REO_TOP_ADDR_MASK 0x48c
+#define  CA_NI_L3FE_AXI_REO_TOP_ADDR_MASK_VAL 0x10000000u
+#define CA_NI_L3FE_AXI_REO_NEW_ID0	0x490
+#define  CA_NI_L3FE_AXI_REO_NEW_ID0_VAL	0x80000009u	/* axi_id=9, valid */
+#define CA_NI_L3FE_AXI_REO_RD18		0x498		/* +0x18 = 0xFFFFFFFF (per-channel, stock live) */
+#define  CA_NI_L3FE_AXI_REO_RD18_VAL	0xFFFFFFFFu
+#define CA_NI_L3FE_AXI_REO_RD24		0x4a4		/* +0x24 = 0xFFFFFFFF (per-channel, stock live) */
+#define  CA_NI_L3FE_AXI_REO_RD24_VAL	0xFFFFFFFFu
 
 /*
  * --- TX descriptor (8 bytes, little-endian, in coherent memory) ---
@@ -986,7 +1019,7 @@ enum cortina_ni_win {
 
 /* --- QM block: empty-buffer pool --- */
 /* push one 128-byte-aligned buffer phys addr into EQ pool <eqid> */
-#define CA_NI_QM_CPU_PUSH_PADDR(p)	(0x7328 + (p) * 8)	/* build81: RE-decoded CPU_PUSH_PADDR0 (addr[31:7]|eqid[3:0]); 0x63cc was WRONG -> EQ5 never fed */
+#define CA_NI_QM_CPU_PUSH_PADDR(p)	(0x63cc + (p) * 8)	/* build87: OLD offset RESTORED - live-stock devmem: 0x7328 is a dead/abort zone (SError); 0x63cc is the real CPU_PUSH_PADDR0 */
 #define  CA_NI_QM_PUSH_ADDR		GENMASK(31, 7)	/* pa >> 7 */
 #define  CA_NI_QM_PUSH_EQID		GENMASK(3, 0)
 /* per-cpu-port push status: bit31 = the (shallow) CPU-push stage has a
@@ -995,7 +1028,7 @@ enum cortina_ni_win {
  * the CPU.  The stage only drains once the EQ config is COMMITTED (see
  * CA_NI_QM_EQ_CFG_LOAD) and the RMU0 RX master runs; until then it caps
  * at ~4 and the ready bit stays low - so the poll must be bounded. */
-#define CA_NI_QM_CPU_PUSH_READY(p)	(0x7324 + (p) * 8)	/* build81: RE-decoded CPU_PUSH_RDY0 (rdy=bit31); 0x63c8 was WRONG */
+#define CA_NI_QM_CPU_PUSH_READY(p)	(0x63c8 + (p) * 8)	/* build87: OLD offset RESTORED - live-stock: 0x63c8=0x80000000 (valid ready-bit); 0x7324 reads blank/abort */
 #define  CA_NI_QM_PUSH_READY		BIT(31)
 /* generous per-push ready timeout (us); bounds the seed loop, can't hang */
 #define CA_NI_RX_PUSH_TIMEOUT_US	1000
@@ -1007,13 +1040,13 @@ enum cortina_ni_win {
  * live reads were actually CPU_PUSH_RDY(port) bits, not pool req - reverted to the
  * real 0x6388 (confirmed by disasm + the coordinator's independent RE). This is
  * the same register as CA_NI_QM_EQM_INACTIVE_BID below. */
-#define CA_NI_QM_EQM_PA_REQ(eqid)	(0x72e4 + (eqid) * 4)	/* build81: RE-decoded EQM_PA_REQ0 (req=bit31, ibid[13:0]); 0x6388 was WRONG -> EQ5 starvation was invisible */
+#define CA_NI_QM_EQM_PA_REQ(eqid)	(0x6388 + (eqid) * 4)	/* build87: OLD offset RESTORED - live-stock: 0x6388=0 at rest / 0x80000019 during a req; 0x72e4 is a pool-base ADDR table, not EQM_PA_REQ */
 #define  CA_NI_QM_PA_REQ_READY		BIT(31)		/* req: the pool WANTS buffers */
 #define  CA_NI_QM_PA_INACTIVE_CNT	GENMASK(13, 0)	/* buffer count */
 /* Per-packet-engine inactive-bid (free-buffer shortfall) count, read by stock
  * aal_l3qm_get_inactive_bid_cntr: bits[13:0] = # buffers the pool is SHORT (0 when
  * fully populated); bit31 = valid/err.  Indexed by PE, not eqid. */
-#define CA_NI_QM_EQM_INACTIVE_BID(pe)	(0x72e4 + (pe) * 4)	/* build81: = EQM_PA_REQ0 (same reg) */
+#define CA_NI_QM_EQM_INACTIVE_BID(pe)	(0x6388 + (pe) * 4)	/* build87: OLD offset RESTORED (= EQM_PA_REQ0 0x6388, same reg) */
 #define  CA_NI_QM_INACTIVE_BID_CNT	GENMASK(13, 0)
 #define CA_NI_RX_EQ_ID			5	/* build77: CPU_0 pool0 = EQ5 (RE of init_empty_buffer_CPU: EQ_PROFILE[2].eqp0=5; EQ13 was the WRONG deep-queue pool) */
 
@@ -1096,6 +1129,17 @@ enum cortina_ni_win {
  * writes a descriptor shape the poll routine misreads. */
 #define CA_NI_QM_EPP			0x6a3c	/* ELNATH EPP (rtl 0x68f4) */
 #define  CA_NI_QM_EPP_CMD_MODE_64	BIT(2)	/* cmd_mode: 1 = 64-bit */
+/* ★ Egress-scheduler egress-enable pair (Elnath, tier-1 live-stock).  0x6a20 =
+ * tx-path egress enable, 0x6a00 = CPU-path egress enable - each an 8-bit port mask
+ * (0xff00), NOT a single bit.  Stock live: BOTH read 0x0000FF00.  This is the
+ * aal_l3qm enable_tx (0x6a20) / enable_tx_cpu (0x6a00) pair for our chip.  Our
+ * match_stock_qm writes 0x6a00=0xFF00 early, but it reads back 0 - the EPP engine
+ * arming (0x6a3c GO) clears the CPU-path enable - so we re-assert BOTH last, after
+ * the GO.  Without 0x6a00 the ES never services CPU_0 egress -> the CPU-EPP
+ * writeback is starved -> the CPU ring keeps its DEADBEEF poison (PA=0, no RX). */
+#define CA_NI_QM_EPP_TX_EGR_EN		0x6a20
+#define CA_NI_QM_EPP_CPU_EGR_EN		0x6a00
+#define  CA_NI_QM_EPP_EGR_EN_ALL	0x0000FF00u
 /* EQ-config commit (stock aal_l3qm_load_eq_config, 07f ko @0x4f270): after
  * programming the per-EQ CFG0-4, unlock HDM write-protection, pulse
  * EQ_CFG_LOAD (all EQs), relock.  This LATCHES the bid range into the
@@ -1468,7 +1512,7 @@ enum cortina_ni_win {
  * 0xa1b4=0, corrupting ldpid 8-15 (b16-31: 0xAAAA=all L2FE) on the deep-q path (the CPU
  * frame ldpid 0x32 in 0xa1a8=0 was unaffected).  Restore to stock. */
 #define  CA_NI_NIRX_L3FE_DPQ_DEMUX_48_63_VAL	0x00000000u	/* ldpid 0x32 -> demux_id 0 = L3QM */
-#define  CA_NI_NIRX_L3FE_DPQ_DEMUX_32_47_VAL	0x00000002u	/* stock 0xa1ac (unconfirmed; = build34) */
+#define  CA_NI_NIRX_L3FE_DPQ_DEMUX_32_47_VAL	0x00000000u	/* ★ stock 0xa1ac=0 (tier-1 live broadcast diff 2026-07-12: the SOLE NIRX-demux divergence). The old 0x2 was copied from the normal-table DEMUX3 (0xa19c=0x2, correct) into the DPQ table where stock leaves it 0; that 0x2 diverted port0 deep-queue frames OFF the L3FE classifier -> l3fe_rx(0xa9bc)=0 -> CLS never sees the frame -> null EPP descriptors. Stock=0 lets the frame reach L3FE->CLS->CPU-trap. */
 #define  CA_NI_NIRX_L3FE_DPQ_DEMUX_16_31_VAL	0x22AA0000u	/* ldpid 0x19 -> L2FE (stock live) */
 #define  CA_NI_NIRX_L3FE_DPQ_DEMUX_0_15_VAL	0xAAAA0000u	/* stock live */
 /* ★★ build40: the REAL aal_ni NIRX-L3FE-demux per-ldpid table (0xa1d4-0xa1f0) - the
@@ -1544,6 +1588,10 @@ enum cortina_ni_win {
 #define  CA_NI_L2FE_LRN_FWD_CTRL_0_VAL	0x22000290u
 #define CA_NI_L2FE_PLC_LRN_FWD_CTRL_1	0x140c
 #define  CA_NI_L2FE_LRN_FWD_CTRL_1_VAL	0x0c100c10u
+#define CA_NI_L2FE_FDB_CTRL_0		0x1c00	/* FDB global control (aal_fdb_ctrl_set) - enables per-type fwd actions (unknown-DA/BC -> the LRN_FWD_CTRL dest). Live-stock golden. */
+#define  CA_NI_L2FE_FDB_CTRL_0_VAL	0x82BFEFF9u
+#define CA_NI_L2FE_FDB_CTRL_1		0x1c04	/* dest_ldpid[21:16]=0x10 (CPU_0) */
+#define  CA_NI_L2FE_FDB_CTRL_1_VAL	0x9F90012Cu
 #define CA_NI_L2FE_PLE_DEFAULT_REG	0x1504
 #define  CA_NI_L2FE_PLE_DEFAULT_VAL	0x001b0000u
 #define CA_NI_L2FE_ARB_CTRL		0x1600
@@ -1798,6 +1846,18 @@ enum cortina_ni_win {
 #define  CA_NI_L2FE_ARB_USE_HDR_A_DBUF	BIT(8)		/* 1=take dbuf from Header-A (FIB/L3FE) */
 #define CA_NI_L2FE_ARB_PORT_DBUF_ACCESS	0x1664
 #define CA_NI_L2FE_ARB_PORT_DBUF_DATA	0x1668
+/* ★★ build100: the ARB FLOW_DBUF table.  With ARB_CTRL.dbuf_sel=1 (stock) the HW uses THIS
+ * table (per-flow deep-buffer flags), NOT PORT_DBUF, as the deep_q source.  Our driver only
+ * programmed PORT_DBUF -> ignored -> the flooded broadcast ARP is never marked deep_q/cpu
+ * (bm_word0 cpu=0/deep_q=0) -> no buffer attached -> CPU-EPP descriptor PA=0.  Indirect
+ * (GO=bit31/WR=bit30, idx=flow_id/4); DATA bits[3:0]=dbuf_flg_0..3 (one per flow_id%4).
+ * ★ Elnath offset UNCERTAIN: ca8277b raw=0x1648/0x164c, but Elnath PORT_DBUF is +0x14 at
+ * 0x1664, and ca8277b FLOW_DBUF sits 8 bytes before PORT_DBUF -> best-guess 0x165c/0x1660.
+ * The before/after readback log confirms which is right (non-zero after write = correct). */
+#define CA_NI_L2FE_ARB_FLOW_DBUF_ACCESS	0x165c	/* Elnath best-guess (PORT_DBUF-8); ca8277b raw=0x1648 */
+#define CA_NI_L2FE_ARB_FLOW_DBUF_DATA	0x1660	/* ca8277b raw=0x164c */
+#define  CA_NI_L2FE_ARB_FLOW_DBUF_FLG_ALL 0x0000000Fu	/* dbuf_flg_0..3 all set = all 4 flows deep_q */
+#define  CA_NI_L2FE_ARB_FLOW_DBUF_ENTRIES 16u		/* test: mark flows 0..63 deep_q */
 #define  CA_NI_L2FE_ARB_DBUF_FLG	BIT(0)		/* output: deep-buffer => deep_q */
 #define  CA_NI_L2FE_ARB_DBUF_LDPID_VLD	BIT(1)
 #define  CA_NI_L2FE_ARB_DBUF_LDPID	GENMASK(7, 2)	/* match on resolved dest-ldpid */
@@ -1883,9 +1943,52 @@ enum cortina_ni_win {
  * byte-matched stock yet never fired).  Write stock's exact post-init value. */
 #define CA_NI_L3FE_STG0_CTRL		0x3400
 #define  CA_NI_L3FE_STG0_CTRL_VAL	0x001c787cu	/* tier-1 stock live (ours reset=0x001c7c7e) */
-#define CA_NI_L3FE_MY_MAC_LO		0x3210	/* stock 0x000198C7 (ONU eth0 MAC hi bytes) */
-#define CA_NI_L3FE_MY_MAC_HI		0x3214	/* stock 0xA46CAFCC */
+#define CA_NI_L3FE_MY_MAC_LO		0x3210	/* my-MAC/FIELD_CAM: LO = valid(bit16)|mac[0]<<8|mac[1] (stock=board MAC+valid; ours was 0) */
+#define  CA_NI_L3FE_MY_MAC_VALID	BIT(16)	/* 0x3210 bit16 = my-MAC entry valid (tier-1 stock diff 2026-07-12) */
+#define CA_NI_L3FE_MY_MAC_HI		0x3214	/* HI = mac[2]<<24|mac[3]<<16|mac[4]<<8|mac[5] */
 #define CA_NI_L3FE_SPCL_PKT_DET_CFG	0x3218	/* stock 0x0739DC24 (detection pipeline; matches, leave) */
+/* ★★ L3FE ingress-loopback port-validity table (ca8277b/Elnath L3FE_GLB_ILPB_LDPID @0xf43030d8;
+ * vendor aal_l3fe_l2lookup_init).  Our driver MISSED it -> a frame forwarded to the L3_LAN
+ * loopback ingress (ldpid 0x19) had NO valid L3FE ingress, so it never entered the classifier ->
+ * l3fe_rx(0xa9bc)=0 -> cls_hit=0.  Layout: valid0[0],ldpid0[6:1],valid1[8],ldpid1[14:9],
+ * valid2[16],ldpid2[22:17],valid3[23].  We mark ldpid0=L3_LAN(0x19), ldpid1=L3_WAN(0x18), and
+ * entry3 valid (ldpid3=0=NI port0) as valid L3 ingress (valid2/ETH_WAN left off - confirm vs stock). */
+#define CA_NI_L3FE_GLB_ILPB_LDPID	0x30d8	/* stock Elnath=0 (SDK's non-zero value does NOT apply here) - leave 0 */
+/* ★★ THE missing L3FE_GLB config block (ca8277b/Elnath).  Our driver NEVER ran the vendor
+ * L3FE global init (aal_l3fe_l2lookup_init aal_l3fe.c:269-310 + the glb ELPB setters
+ * :215-267, called from aal_l3fe_init :1030) -> the whole 0x30ac-0x30f8 block sat at 0 ->
+ * the L3FE stage was uninitialized -> it never ingested frames -> l3fe_rx(0xa9bc)=0 ->
+ * cls_hit=0 -> no CPU RX.  Values below = tier-1 live stock (captured under broadcast). */
+/* ★ build95: the remaining L3FE_GLB config our driver still left at 0 (tier-1 stock diff).
+ * All CONFIG (NOT ring/DMA pointers - ca8277b structs: FWD_CTRL=fwd-control bitfields,
+ * LF_CFG=ingress-FIFO thresholds, ILPB=per-port VLAN loopback config).  A zero LF_CFG
+ * (thresholds=0) blocks the L3FE ingress FIFO -> l3fe_rx=0 = the prime remaining gate. */
+#define CA_NI_L3FE_GLB_FWD_CTRL_1	0x30a4
+#define  CA_NI_L3FE_GLB_FWD_CTRL_1_VAL	0x8001B000u
+#define CA_NI_L3FE_GLB_FWD_CTRL_2	0x30a8
+#define  CA_NI_L3FE_GLB_FWD_CTRL_2_VAL	0x004641F4u
+#define CA_NI_L3FE_GLB_LF_CFG		0x30b4	/* ingress-FIFO hi/low/wr_fifo thresholds (dft 0x004641f4) */
+#define  CA_NI_L3FE_GLB_LF_CFG_VAL	0x4855CFE4u
+#define CA_NI_L3FE_GLB_ILPB_00		0x30bc	/* ingress-loopback VLAN config, entry0 (COUNT=4 stride 8) */
+#define  CA_NI_L3FE_GLB_ILPB_00_VAL	0x4856CF7Cu
+#define CA_NI_L3FE_GLB_FWD_CTRL_3	0x30ac
+#define  CA_NI_L3FE_GLB_FWD_CTRL_3_VAL	0x00000300u
+#define CA_NI_L3FE_GLB_CFG_30CC		0x30cc	/* unnamed in ca8277b but stock-mapped (reads 0xE21) - match stock */
+#define  CA_NI_L3FE_GLB_CFG_30CC_VAL	0x00000E21u
+#define CA_NI_L3FE_GLB_ELPB0		0x30e0	/* egress-loopback entry0 (port map, aal_l3fe_glb_elpb_set) */
+#define  CA_NI_L3FE_GLB_ELPB0_VAL	0x00007F03u
+#define CA_NI_L3FE_GLB_ELPB_DEEPQ_VLD1	0x30e4	/* deep-queue valid vec hi (aal_l3fe_glb_elpb_deepq_vld_set) */
+#define  CA_NI_L3FE_GLB_ELPB_DEEPQ_VLD1_VAL 0x00C00000u
+#define CA_NI_L3FE_GLB_ELPB_DEEPQ_VLD0	0x30e8	/* deep-queue valid vec lo */
+#define  CA_NI_L3FE_GLB_ELPB_DEEPQ_VLD0_VAL 0x00400000u
+#define CA_NI_L3FE_GLB_ELPB_DEEPQ1	0x30ec	/* deep-queue vec hi (aal_l3fe_glb_elpb_deepq_set) */
+#define  CA_NI_L3FE_GLB_ELPB_DEEPQ1_VAL	0x00F00000u
+#define CA_NI_L3FE_GLB_ELPB_DEEPQ0	0x30f0	/* deep-queue vec lo */
+#define  CA_NI_L3FE_GLB_ELPB_DEEPQ0_VAL	0x00F00000u
+#define CA_NI_L3FE_GLB_L3FE_L2FE_LDPID	0x30f4	/* the L3FE<->L2FE loopback ldpid binding */
+#define  CA_NI_L3FE_GLB_L3FE_L2FE_LDPID_VAL 0x000C0000u
+#define CA_NI_L3FE_GLB_VE		0x30f8	/* vlan-edit tpid enc (aal_l3fe_l2lookup_init) */
+#define  CA_NI_L3FE_GLB_VE_VAL		0x00040000u
 /* build74: L3FE global CLS-stage monitor (read cls_hit_0..3).  aal_l3fe_glb_cls_stg
  * _monitor_get: for i, write CTRL={enable bit0=1, bus_sel=(MONITOR_CLS_RESULT=3)<<5 | i},
  * read RETURN.  cls_hit[i]==0 across all while frames flow = the CLS lookup is NOT

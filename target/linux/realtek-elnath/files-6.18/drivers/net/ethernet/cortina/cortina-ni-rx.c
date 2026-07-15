@@ -67,6 +67,14 @@ static bool rx_debug;
 module_param(rx_debug, bool, 0644);
 MODULE_PARM_DESC(rx_debug, "dump the first received descriptors/frames");
 
+/* ★ build88: A/B which CPU-EPP ring NAPI reads descriptors from - 0 = the LOW ring at
+ * PADDR(0x7200)=0x0bc48000 (default/current); 1 = the HIGH ring at PADDR_HI(0x7220)=
+ * 0x0bc4a000.  The engine advances wptr but the LOW ring reads poison, so the engine
+ * may write descriptors into the HIGH ring; set rx_ring_hi=1 to test reading it. */
+static bool rx_ring_hi;
+module_param(rx_ring_hi, bool, 0644);
+MODULE_PARM_DESC(rx_ring_hi, "NAPI reads the HIGH (PADDR_HI 0x0bc4a000) CPU-EPP ring instead of the LOW one");
+
 /* ★ FBM pool ENABLE/FILL/PRELOAD gate - DEFAULT OFF because it CRASHED (build24):
  * enabling+preloading the FBM pool makes it reference/DMA our CPU-pool region, which
  * is NOT a truly reserved coherent window (no reserved-memory DT node excludes it), so
@@ -134,6 +142,15 @@ MODULE_PARM_DESC(redir_cpu_ldpid, "REDIR_LDPID[0x19]->this ldpid (0=stock: no re
 static u8 arb_dbuf_dpid = 0x08;	/* build68 STOCK: ARB_CTRL 0x89c71c82 (bits[7:4]=8); 0xf gave 0x89c71cf2 */
 module_param(arb_dbuf_dpid, byte, 0644);
 MODULE_PARM_DESC(arb_dbuf_dpid, "ARB_CTRL deep_q trigger pdpid (0xf=disable deep-queue/use normal path, 8=stock deep_q)");
+
+/* ★ build101 EXPERIMENT (prior-session never-tested fix): route L3_LAN (ldpid 0x19, where
+ * the flooded LAN broadcast resolves) DIRECTLY to a CPU port via PDPID_MAP[0x19], bypassing
+ * the L3FE/CLS trap.  Default 0x00 = the prior-session "CPU port 0" value (DIVERGENT from
+ * stock's 0x0d; note this session's vendor RE reads pdpid 0x00 as NI-wire-port0 and CPU as
+ * 0x09 - so if 0x00 egresses a wire, A/B 0x09/0x0d at runtime).  0x0d = stock L3_LAN. */
+static u8 pdpid_l3lan = 0x0d;	/* ★ STOCK L3_LAN->L3FE (entry fix); paired with the unconditional pool seed (drain fix) so frames enter L3FE AND RMU0 has buffers to admit them. */
+module_param(pdpid_l3lan, byte, 0644);
+MODULE_PARM_DESC(pdpid_l3lan, "PDPID_MAP[0x19] L3_LAN route: 0x00=CPU-port0 (prior-session test), 0x09=CPU(L2FE), 0x0d=stock L3_LAN");
 
 /* ★★ build48: the software push IS REQUIRED (build47 with sw_populate=1 BROKE the
  * NO_BUFFER wall: RMU0 admits, no_buf_drop +0, L3QM tx_cntr 0x690c climbs).  pa_req is
@@ -207,10 +224,12 @@ static bool cortina_ni_rx_push(struct cortina_ni *ni, u32 pa, u8 eqid)
 	 * of the ready timeout -> the HW dropped those pushes (FIFO full) -> the pool was
 	 * left short (inactive_bid_cntr never reached 0).  Return false so the caller
 	 * retries this buffer instead of losing it. */
-	if (i == CA_NI_RX_PUSH_TIMEOUT_US) {
+	/* ★ 2026-07-13 ca-ne.ko RE: stock aal_l3qm_set_cpu_push_paddr writes with NO
+	 * ready poll (check_cpu_push_ready has ZERO callers = dead code).  ALWAYS
+	 * write -- build80's return-false-on-timeout DROPPED pushes and left the
+	 * pool short.  Keep the bounded wait only as a courtesy for the shared FIFO. */
+	if (i == CA_NI_RX_PUSH_TIMEOUT_US)
 		ni->rx->push_timeo++;
-		return false;
-	}
 	writel((pa & CA_NI_RX_DESC_PA) | FIELD_PREP(CA_NI_QM_PUSH_EQID, eqid),
 	       ni_base(ni) + CA_NI_QM_CPU_PUSH_PADDR(CA_NI_RX_CPU_PORT));
 	return true;
@@ -224,19 +243,18 @@ static bool cortina_ni_rx_push(struct cortina_ni *ni, u32 pa, u8 eqid)
 static void cortina_ni_rx_seed_pool(struct cortina_ni *ni, u8 eqid, u32 base,
 				    u32 bufsz, unsigned int max_buf)
 {
-	unsigned int buf = 0, guard = 0;
+	unsigned int buf;
 
-	/* loop until EQM_PA_REQ0[eqid] clears its req (bit31) + ibid[13:0] = the pool no
-	 * longer wants buffers (coordinator: seed until req==0).  push() only advances buf
-	 * when the shared push-FIFO was ready, so a busy FIFO retries this same buffer. */
-	while ((readl(ni_base(ni) + CA_NI_QM_EQM_PA_REQ(eqid)) &
-		(CA_NI_QM_PA_REQ_READY | CA_NI_QM_INACTIVE_BID_CNT)) != 0 &&
-	       buf < max_buf && guard++ < max_buf * 8) {
-		if (cortina_ni_rx_push(ni, base + buf * bufsz, eqid))
-			buf++;			/* landed a distinct buffer */
-		else
-			udelay(2);		/* FIFO busy - retry this slot */
-	}
+	/* ★★ 2026-07-13 ca-ne.ko RE (aaeb153d) — THE RMU0-no-admit ROOT CAUSE.  Stock
+	 * ca_ni_refill_eq_buf_pool_with_rule_zero pushes the FULL pool capacity
+	 * UNCONDITIONALLY at cold seed; it NEVER gates on EQM_PA_REQ.  Our old gate
+	 * (while EQM_PA_REQ != 0) pushed ZERO buffers at cold start because 0x6388 reads
+	 * 0 at rest -> the loop body never ran -> RMU0 had no free buffer -> never
+	 * admitted (rx_cntr 0x6900 = 0).  Push max_buf distinct buffers unconditionally.
+	 * EQM_PA_REQ is ONLY for the CONTINUOUS refill (NAPI copy-break re-push /
+	 * the refill tasklet), never the cold seed. */
+	for (buf = 0; buf < max_buf; buf++)
+		cortina_ni_rx_push(ni, base + buf * bufsz, eqid);
 	dev_info(ni->dev, "seed EQ%u: %u buffers pushed, pa_req(0x%x)=0x%08x (want req=0)\n",
 		 eqid, buf, CA_NI_QM_EQM_PA_REQ(eqid),
 		 readl(ni_base(ni) + CA_NI_QM_EQM_PA_REQ(eqid)));
@@ -423,7 +441,9 @@ static int cortina_ni_rx_poll_voq(struct cortina_ni *ni, unsigned int voq,
 				  int budget)
 {
 	struct cortina_ni_rx *rx = ni->rx;
-	__le64 *vring = rx->ring + voq * CA_NI_RX_RING_SLOTS_PER_VOQ;
+	__le64 *vring = rx->ring +
+		(rx_ring_hi ? CA_NI_RX_RING_HI_OFFSET / sizeof(__le64) : 0) +
+		voq * CA_NI_RX_RING_SLOTS_PER_VOQ;
 	u32 rptr = rx->rptr[voq];
 	u32 wptr;
 	int work = 0;
@@ -686,6 +706,42 @@ static const struct { u8 ldpid, pdpid; } cortina_ni_rx_pdpid_map[] = {
 	 * wrong (rmu_rx still 0). */
 };
 
+/*
+ * ★★ build100: program the ARB FLOW_DBUF table - THE deep_q source when ARB_CTRL.dbuf_sel=1
+ * (stock).  Our driver only programmed PORT_DBUF (ignored when dbuf_sel=1), so the flooded
+ * broadcast ARP was never deep_q/cpu-marked (bm_word0 cpu=0/deep_q=0) -> no buffer attached
+ * -> the CPU-EPP descriptor writeback stored PA=0 (poison ring) while stock wrote a real PA.
+ * Set dbuf_flg=1 for all 4 flows in every entry (test) so the ARP is deep_q'd and gets a
+ * buffer.  Uses our proven ARB indirect protocol (GO=bit31, WR=bit30, idx=flow_id/4).  Dumps
+ * the table BEFORE + AFTER so the offset is verifiable: non-zero AFTER = 0x165c is correct;
+ * still 0 = the offset is wrong (try ca8277b 0x1648/0x164c next).
+ */
+static void cortina_ni_rx_flow_dbuf_init(struct cortina_ni *ni)
+{
+	u32 b[8], a[8];
+	unsigned int i;
+
+	for (i = 0; i < 8; i++) {
+		cortina_ni_rx_ind_read(ni, CA_NI_L2FE_ARB_FLOW_DBUF_ACCESS, i);
+		b[i] = readl(ni_base(ni) + CA_NI_L2FE_ARB_FLOW_DBUF_DATA);
+	}
+	for (i = 0; i < CA_NI_L2FE_ARB_FLOW_DBUF_ENTRIES; i++) {
+		writel(CA_NI_L2FE_ARB_FLOW_DBUF_FLG_ALL,
+		       ni_base(ni) + CA_NI_L2FE_ARB_FLOW_DBUF_DATA);
+		cortina_ni_rx_ind_store(ni, CA_NI_L2FE_ARB_FLOW_DBUF_ACCESS, i);
+	}
+	for (i = 0; i < 8; i++) {
+		cortina_ni_rx_ind_read(ni, CA_NI_L2FE_ARB_FLOW_DBUF_ACCESS, i);
+		a[i] = readl(ni_base(ni) + CA_NI_L2FE_ARB_FLOW_DBUF_DATA);
+	}
+	dev_info(ni->dev,
+		 "flow-dbuf(0x165c/0x1660) before[0..7]=%08x %08x %08x %08x %08x %08x %08x %08x\n",
+		 b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
+	dev_info(ni->dev,
+		 "flow-dbuf AFTER[0..7]=%08x %08x %08x %08x %08x %08x %08x %08x (want 0x0f = offset 0x165c correct; if all 0 the offset is 0x1648)\n",
+		 a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]);
+}
+
 static void cortina_ni_rx_arb_deepq_init(struct cortina_ni *ni)
 {
 	u32 d0, d1, i, e;
@@ -725,6 +781,13 @@ static void cortina_ni_rx_arb_deepq_init(struct cortina_ni *ni)
 	for (e = 0; e < ARRAY_SIZE(cortina_ni_rx_pdpid_map); e++) {
 		u8 pdpid = cortina_ni_rx_pdpid_map[e].pdpid;
 
+		/* ★ build101: override L3_LAN (ldpid 0x19) -> pdpid_l3lan (default 0x00 = CPU
+		 * port 0, the prior-session never-tested fix).  Routes the flooded LAN broadcast
+		 * to a CPU port directly, bypassing the L3FE/CLS trap, to test whether a
+		 * CPU-destined frame gets a buffer attached (descriptor PA != 0). */
+		if (cortina_ni_rx_pdpid_map[e].ldpid == CA_NI_RX_L3LAN_LDPID)
+			pdpid = pdpid_l3lan;
+
 		/* build33: write the STOCK PDPID for every ldpid - NO CPU override.  The CPU
 		 * frame reaches QM by resolving to ldpid 0x32 ([0x32]=0x08), the stock path,
 		 * NOT by bodging [0x19]->0x08 (which took the wrong ES-port route). */
@@ -738,7 +801,8 @@ static void cortina_ni_rx_arb_deepq_init(struct cortina_ni *ni)
 			cortina_ni_rx_ind_store(ni, CA_NI_L2FE_PDPID_MAP_ACCESS, idx);
 		}
 	}
-	dev_info(ni->dev, "pdpid: STOCK map written ([0x19]=0x0d L3-LAN, [0x32]=0x08 QM); CPU frame routes via ldpid 0x32\n");
+	dev_info(ni->dev, "pdpid: map written ([0x19]=0x%02x (build101 override, stock=0x0d), [0x32]=0x08 QM); L3_LAN routed to pdpid 0x%02x\n",
+		 pdpid_l3lan, pdpid_l3lan);
 
 	/*
 	 * ★★ REMOVED the LDPID->CPU redirect (was REDIR_LDPID[0x19]/[0x1f]->0x10).
@@ -970,7 +1034,7 @@ static void cortina_ni_rx_mc_group_init(struct cortina_ni *ni)
  * so our frame is a plain UUC/DLF that a FDB hit resolves to DeepQ_0 instead.
  * The L2FE hashes {DA,fid} into a bucket on APPEND; we supply the full key+action.
  */
-static void __maybe_unused cortina_ni_rx_fdb_add_cpu(struct cortina_ni *ni)
+static void cortina_ni_rx_fdb_add_cpu(struct cortina_ni *ni)
 {
 	static const u8 def_mac[ETH_ALEN] = { 0x02, 0x96, 0x07, 0xf0, 0x00, 0x01 };
 	const u8 *mac = (ni->tx && ni->tx->netdev) ?
@@ -1080,6 +1144,28 @@ static void cortina_ni_rx_mymac_trap(struct cortina_ni *ni)
 	writel(0, ni_base(ni) + CA_NI_L3FE_STG0_LPB_LOW3);
 	writel(CA_NI_L3FE_LPB_MID_SEL1, ni_base(ni) + CA_NI_L3FE_STG0_LPB_MID3);
 	writel(CA_NI_L3FE_LPB_HIGH_P3, ni_base(ni) + CA_NI_L3FE_STG0_LPB_HIGH3);
+
+	/* ★ Program the L3FE STG0 my-MAC (0x3210/0x3214) from our per-board MAC + the
+	 * valid bit (0x3210 bit16).  Tier-1 stock diff (2026-07-12): stock sets these to
+	 * its board MAC WITH the valid bit; ours were 0 (no MAC, valid clear).  Encoding:
+	 * LO = valid | mac[0]<<8 | mac[1];  HI = mac[2..5]. */
+	writel(CA_NI_L3FE_MY_MAC_VALID | ((u32)mac[0] << 8) | mac[1],
+	       ni_base(ni) + CA_NI_L3FE_MY_MAC_LO);
+	writel(((u32)mac[2] << 24) | ((u32)mac[3] << 16) | ((u32)mac[4] << 8) | mac[5],
+	       ni_base(ni) + CA_NI_L3FE_MY_MAC_HI);
+
+	/* ★ ILPB_LDPID (0x30d8) write DROPPED: tier-1 live shows stock 0x30d8=0 and stock's
+	 * L3FE works (l3fe_rx>0) WITH it 0 - so it is NOT the enter-L3 gate (the vendor
+	 * aal_l3fe_l2lookup_init value does not apply to Elnath).  Leave 0x30d8=0 to match
+	 * stock.  The real enter-L3 gate is elsewhere in the L3FE_GLB ELPB/DEEPQ_VLD block
+	 * (0x30e0/0x30e4/0x30e8 stock-nonzero, ours=0) - pinned by the live diff. */
+	dev_info(ni->dev,
+		 "l3fe-loopback: ilpb(0x30d8)=0x%08x(stock 0) elpb0(0x30e0)=0x%08x dqvld1(0x30e4)=0x%08x dqvld0(0x30e8)=0x%08x my_mac lo(0x3210)=0x%08x hi=0x%08x\n",
+		 readl(ni_base(ni) + CA_NI_L3FE_GLB_ILPB_LDPID),
+		 readl(ni_base(ni) + 0x30e0), readl(ni_base(ni) + 0x30e4),
+		 readl(ni_base(ni) + 0x30e8),
+		 readl(ni_base(ni) + CA_NI_L3FE_MY_MAC_LO),
+		 readl(ni_base(ni) + CA_NI_L3FE_MY_MAC_HI));
 
 	dev_emerg(ni->dev, "MYMAC 4 (survived - no SError)\n");
 	det = readl(ni_base(ni) + CA_NI_L3FE_SPCL_PKT_DET_CFG);
@@ -1628,6 +1714,101 @@ static const struct { u16 idx; u32 w[CA_NI_L3FE_CLS_FIB_WORDS]; } cls_fib_golden
 	{ 264, { 0, 0, 0, 0, 0x1C000000, 0x01000004, 0x00000600 } },
 };
 
+/*
+ * ★★ Replicate the vendor L3FE GLOBAL init that our driver never ran (the whole missing
+ * enter-L3 stage).  Vendor: aal_l3fe_l2lookup_init (aal_l3fe.c:269-310) + the glb ELPB/
+ * deep-queue setters (aal_l3fe_glb_elpb_set :215, _elpb_deepq_vld_set :238,
+ * _elpb_deepq_set :261), all reached from aal_l3fe_init (:1030).  Without this the
+ * L3FE_GLB block (0x30ac-0x30f8) sat at 0, so the L3FE stage was uninitialized and never
+ * ingested frames -> l3fe_rx(0xa9bc)=0 -> cls_hit=0 -> null CPU-EPP descriptors.  The
+ * values are tier-1 LIVE STOCK (captured under broadcast) because the SDK's derived values
+ * do NOT match Elnath (e.g. ILPB_LDPID 0x30d8 is 0 on stock but non-zero in the SDK) - so
+ * we replicate STOCK, not the SDK arithmetic.  ILPB_LDPID (0x30d8) is deliberately left 0.
+ */
+static void cortina_ni_rx_l3fe_glb_init(struct cortina_ni *ni)
+{
+	/* forwarding control 1/2/3 + ingress-FIFO thresholds (LF_CFG) + ingress-loopback
+	 * VLAN config (ILPB entry0) + the (unnamed-in-SDK but stock-mapped) 0x30cc slot.
+	 * LF_CFG at 0 leaves the L3FE ingress FIFO thresholds zero -> it never accepts a
+	 * frame -> l3fe_rx=0; these were the last L3FE_GLB regs our driver left unset. */
+	writel(CA_NI_L3FE_GLB_FWD_CTRL_1_VAL, ni_base(ni) + CA_NI_L3FE_GLB_FWD_CTRL_1);
+	writel(CA_NI_L3FE_GLB_FWD_CTRL_2_VAL, ni_base(ni) + CA_NI_L3FE_GLB_FWD_CTRL_2);
+	writel(CA_NI_L3FE_GLB_FWD_CTRL_3_VAL, ni_base(ni) + CA_NI_L3FE_GLB_FWD_CTRL_3);
+	writel(CA_NI_L3FE_GLB_LF_CFG_VAL, ni_base(ni) + CA_NI_L3FE_GLB_LF_CFG);
+	writel(CA_NI_L3FE_GLB_ILPB_00_VAL, ni_base(ni) + CA_NI_L3FE_GLB_ILPB_00);
+	writel(CA_NI_L3FE_GLB_CFG_30CC_VAL, ni_base(ni) + CA_NI_L3FE_GLB_CFG_30CC);
+
+	/* egress-loopback entry + deep-queue valid-vec + deep-queue vec (the ELPB block
+	 * that lets an L2FE frame loop into the L3FE ingress) */
+	writel(CA_NI_L3FE_GLB_ELPB0_VAL, ni_base(ni) + CA_NI_L3FE_GLB_ELPB0);
+	writel(CA_NI_L3FE_GLB_ELPB_DEEPQ_VLD1_VAL,
+	       ni_base(ni) + CA_NI_L3FE_GLB_ELPB_DEEPQ_VLD1);
+	writel(CA_NI_L3FE_GLB_ELPB_DEEPQ_VLD0_VAL,
+	       ni_base(ni) + CA_NI_L3FE_GLB_ELPB_DEEPQ_VLD0);
+	writel(CA_NI_L3FE_GLB_ELPB_DEEPQ1_VAL,
+	       ni_base(ni) + CA_NI_L3FE_GLB_ELPB_DEEPQ1);
+	writel(CA_NI_L3FE_GLB_ELPB_DEEPQ0_VAL,
+	       ni_base(ni) + CA_NI_L3FE_GLB_ELPB_DEEPQ0);
+
+	/* the L3FE<->L2FE loopback ldpid binding + the VLAN-edit tpid config */
+	writel(CA_NI_L3FE_GLB_L3FE_L2FE_LDPID_VAL,
+	       ni_base(ni) + CA_NI_L3FE_GLB_L3FE_L2FE_LDPID);
+	writel(CA_NI_L3FE_GLB_VE_VAL, ni_base(ni) + CA_NI_L3FE_GLB_VE);
+
+	dev_info(ni->dev,
+		 "l3fe-glb-init: fwd1(0x30a4)=0x%08x fwd2(0x30a8)=0x%08x lf_cfg(0x30b4)=0x%08x ilpb00(0x30bc)=0x%08x fwd3(0x30ac)=0x%08x 30cc=0x%08x elpb0(0x30e0)=0x%08x dqvld=0x%08x/0x%08x dq=0x%08x/0x%08x l2fe_ldpid(0x30f4)=0x%08x ve(0x30f8)=0x%08x\n",
+		 readl(ni_base(ni) + CA_NI_L3FE_GLB_FWD_CTRL_1),
+		 readl(ni_base(ni) + CA_NI_L3FE_GLB_FWD_CTRL_2),
+		 readl(ni_base(ni) + CA_NI_L3FE_GLB_LF_CFG),
+		 readl(ni_base(ni) + CA_NI_L3FE_GLB_ILPB_00),
+		 readl(ni_base(ni) + CA_NI_L3FE_GLB_FWD_CTRL_3),
+		 readl(ni_base(ni) + CA_NI_L3FE_GLB_CFG_30CC),
+		 readl(ni_base(ni) + CA_NI_L3FE_GLB_ELPB0),
+		 readl(ni_base(ni) + CA_NI_L3FE_GLB_ELPB_DEEPQ_VLD1),
+		 readl(ni_base(ni) + CA_NI_L3FE_GLB_ELPB_DEEPQ_VLD0),
+		 readl(ni_base(ni) + CA_NI_L3FE_GLB_ELPB_DEEPQ1),
+		 readl(ni_base(ni) + CA_NI_L3FE_GLB_ELPB_DEEPQ0),
+		 readl(ni_base(ni) + CA_NI_L3FE_GLB_L3FE_L2FE_LDPID),
+		 readl(ni_base(ni) + CA_NI_L3FE_GLB_VE));
+}
+
+/*
+ * ★★ build96: the L3FE AXI read-reorder channel init (vendor aal_l3fe_axi_reo_init,
+ * aal_l3fe.c:341, run LAST in aal_l3fe_init).  Our driver programs the main NI AXI-REO
+ * (cortina_ni_rx_axi_reo_init, low offsets) but SKIPS the L3FE channel at win10+0x2080.
+ * Without it the L3FE cannot AXI-fetch/reorder a frame from memory -> never ingests ->
+ * l3fe_rx(0xa9bc)=0.  Uses the same AXI-REO window (idx10) as the main reorder.  ★ the
+ * values are SDK-derived (aal_l3fe_axi_reo_init) - flag for stock validation.
+ */
+static void cortina_ni_rx_l3fe_axi_reo_init(struct cortina_ni *ni)
+{
+	void __iomem *reo = ni->win[CA_NI_WIN_AXI_REO];
+
+	if (!reo) {
+		dev_warn(ni->dev, "RX: L3FE AXI-REO window (idx %d) not mapped\n",
+			 CA_NI_WIN_AXI_REO);
+		return;
+	}
+	writel(CA_NI_L3FE_AXI_REO_ORIG_ID_VAL, reo + CA_NI_L3FE_AXI_REO_ORIG_ID);
+	writel(CA_NI_L3FE_AXI_REO_NEW_ID_VAL, reo + CA_NI_L3FE_AXI_REO_NEW_ID);
+	writel(CA_NI_L3FE_AXI_REO_TOP_ADDR_VAL, reo + CA_NI_L3FE_AXI_REO_TOP_ADDR);
+	writel(CA_NI_L3FE_AXI_REO_TOP_ADDR_MASK_VAL,
+	       reo + CA_NI_L3FE_AXI_REO_TOP_ADDR_MASK);
+	writel(CA_NI_L3FE_AXI_REO_NEW_ID0_VAL, reo + CA_NI_L3FE_AXI_REO_NEW_ID0);
+	writel(CA_NI_L3FE_AXI_REO_RD18_VAL, reo + CA_NI_L3FE_AXI_REO_RD18);
+	writel(CA_NI_L3FE_AXI_REO_RD24_VAL, reo + CA_NI_L3FE_AXI_REO_RD24);
+
+	dev_info(ni->dev,
+		 "l3fe-axi-reo (win10+0x480, abs 0xf432d480): orig=0x%08x new=0x%08x top=0x%08x mask=0x%08x new0=0x%08x +18=0x%08x +24=0x%08x (want 2/8|/1e8/1e8-mask/9|/FFFFFFFF x2)\n",
+		 readl(reo + CA_NI_L3FE_AXI_REO_ORIG_ID),
+		 readl(reo + CA_NI_L3FE_AXI_REO_NEW_ID),
+		 readl(reo + CA_NI_L3FE_AXI_REO_TOP_ADDR),
+		 readl(reo + CA_NI_L3FE_AXI_REO_TOP_ADDR_MASK),
+		 readl(reo + CA_NI_L3FE_AXI_REO_NEW_ID0),
+		 readl(reo + CA_NI_L3FE_AXI_REO_RD18),
+		 readl(reo + CA_NI_L3FE_AXI_REO_RD24));
+}
+
 static void cortina_ni_rx_cls_init(struct cortina_ni *ni)
 {
 	unsigned int e, i;
@@ -1721,9 +1902,26 @@ static int cortina_ni_rx_steer_init(struct cortina_ni *ni)
 	 * SErrored - it was never stock's mechanism. */
 	cortina_ni_rx_l2fe_forwarding(ni);
 
+	/* ★★ 2026-07-13 (ca-ne.ko RE aaeb153d + live-stock): the FDB GLOBAL control
+	 * (aal_fdb_ctrl_set 0x1c00/0x1c04) enables the per-type FDB forwarding actions
+	 * so unknown-DA / broadcast frames take the LRN_FWD_CTRL dest 0x10 (CPU_0).  We
+	 * wrote LRN_FWD_CTRL (0x1408/0x140c) but LEFT 0x1c00/0x1c04 at RESET, so the FDB
+	 * action never activated -> DLF/BC fell through to the DFT_FWD flood -> forwarded
+	 * OUT (bm_rx==bm_tx, l3fe_rx=0).  Golden: 0x1c00=0x82BFEFF9, 0x1c04=0x9F90012C. */
+	writel(CA_NI_L2FE_FDB_CTRL_0_VAL, ni_base(ni) + CA_NI_L2FE_FDB_CTRL_0);
+	writel(CA_NI_L2FE_FDB_CTRL_1_VAL, ni_base(ni) + CA_NI_L2FE_FDB_CTRL_1);
+
+	/* ★★ 2026-07-13: initialise the FDB engine (OP_INIT builds the hash table) +
+	 * add the own-MAC entry.  Without OP_INIT the FDB is dead, so the FDB
+	 * forwarding-control (0x1408/0x140c/0x1c00/0x1c04, unknown-DA/BC -> CPU_0)
+	 * never takes effect and DLF/broadcast frames fall through to DFT_FWD ->
+	 * forwarded out (l3fe_rx=0).  fdb_add_cpu was defined but never called. */
+	cortina_ni_rx_fdb_add_cpu(ni);
+
 	/* ★ ARB deep-queue: DeepQ_0 -> PDPID=QM -> ES port 7 -> RMU -> CPU (PDPID map
 	 * + dbuf_dpid + REDIR[0x1f] belt).  Must run before the DFT_FWD redir. */
 	cortina_ni_rx_arb_deepq_init(ni);
+	cortina_ni_rx_flow_dbuf_init(ni);	/* build100: the deep_q source (dbuf_sel=1) we never programmed */
 
 	/* ★ Build the REAL one-member MC group (member ldpid = DeepQ_0) that DFT_FWD
 	 * replicates DLF frames to.  Without it, DFT_FWD -> reserved null group 0 ->
@@ -1736,6 +1934,18 @@ static int cortina_ni_rx_steer_init(struct cortina_ni *ni)
 	 * PDPID=QM -> RMU -> CPU.  (The FDB path cortina_ni_rx_fdb_add_cpu is kept for
 	 * a future learned/foreign unicast but is not the own-MAC path.) */
 	cortina_ni_rx_mymac_trap(ni);
+
+	/* ★★ THE missing L3FE global init (0x30ac-0x30f8) - runs BEFORE the CLS rows,
+	 * mirroring the vendor aal_l3fe_init order (l2lookup_init/glb-setters before the
+	 * classifier rules).  This is what actually lets a frame INGRESS the L3FE stage
+	 * (l3fe_rx) so the CLS trap below can even see it. */
+	cortina_ni_rx_l3fe_glb_init(ni);
+
+	/* ★★ build96: the L3FE AXI read-reorder channel - vendor runs aal_l3fe_axi_reo_init
+	 * LAST in aal_l3fe_init (after l2lookup).  This is the L3FE's own DMA read-reorder,
+	 * distinct from the main NI AXI-REO we already program - lets the L3FE fetch the
+	 * frame from memory so it can ingest (l3fe_rx). */
+	cortina_ni_rx_l3fe_axi_reo_init(ni);
 
 	/* ★★★ build71: the L3-CLS special-packet trap - broadcast (ARP) -> CPU_0 via a
 	 * TCAM rule with dpid_pri=1 (dest 0x10 wins, cpu-bound -> CPU-EPP64).  This is
@@ -1820,6 +2030,21 @@ static int cortina_ni_rx_steer_init(struct cortina_ni *ni)
 			return ret;
 		}
 	}
+
+	/* ★ build99 ORDER TEST: re-arm the L2TE->L3FE ready handshake (NIRX_MISC rdy-bits
+	 * 0xa1bc=0x3e80, already stock-matching) HERE, at the END of steer_init - AFTER the
+	 * whole L3FE pipeline (l3fe_glb_init, l3fe_axi_reo_init, mymac_trap/STG0, cls_init)
+	 * is configured.  Our stock_routing arms it EARLY (in eq_init, before that config),
+	 * but the vendor sets it in aal_ni_init_ni which runs AFTER aal_l3fe_init.  If the
+	 * rdy-enable samples the L3FE pipeline-ready state at write time, arming it before
+	 * L3FE config is complete would leave the LAN->L3FE handoff disabled -> l3fe_rx=0.
+	 * Re-writing it last tests that order dependency (a candidate for the dynamic wall
+	 * where every static value already matches stock). */
+	writel(CA_NI_NI_NIRX_MISC_STOCK_VAL, ni_base(ni) + CA_NI_NI_NIRX_MISC_CFG);
+	dev_info(ni->dev,
+		 "l3fe-handoff re-arm (post-L3FE-config): nirx_misc(0xa1bc)=0x%08x\n",
+		 readl(ni_base(ni) + CA_NI_NI_NIRX_MISC_CFG));
+
 	return 0;
 }
 
@@ -2017,6 +2242,14 @@ static void cortina_ni_rx_stock_routing(struct cortina_ni *ni)
 	       ni_base(ni) + CA_NI_NI_L3QMRX_DEMUX_CFG1);
 	writel(CA_NI_NI_DEMUX0_STOCK_VAL,
 	       ni_base(ni) + CA_NI_NI_L3QMRX_DEMUX_CFG0);
+	/* ★★ THE l3fe_rx=0 FIX (live-stock 2026-07-13): the REAL per-ldpid
+	 * L2FE-vs-L3FE ingress fork is NIRX_L3FE_DEMUX_CFG1/0 at 0xa1c4/0xa1c8, not
+	 * the 0xa188/0xa18c above (rate-meter regs).  Without these, host frames never
+	 * enter the L3FE classifier so the CPU-trap can't fire.  Stock 0x00CBDA98/0x7000DA98. */
+	writel(CA_NI_NIRX_L3FE_DEMUX_CFG1_REAL_VAL,
+	       ni_base(ni) + CA_NI_NIRX_L3FE_DEMUX_CFG1_REAL);
+	writel(CA_NI_NIRX_L3FE_DEMUX_CFG0_REAL_VAL,
+	       ni_base(ni) + CA_NI_NIRX_L3FE_DEMUX_CFG0_REAL);
 	writel(CA_NI_NI_PORTORDER_STOCK_VAL,
 	       ni_base(ni) + CA_NI_NI_PORTORDER_CFG);
 	/* ★ INTERNAL_PORT_ID_CFG (0xa180) = 0x00A87F00: l3qmrx_demux_sel[7:0]=0 =
@@ -2661,6 +2894,19 @@ static void cortina_ni_rx_epp_init(struct cortina_ni *ni)
 	ni_rmw(ni, CA_NI_QM_EPP, 0, CA_NI_QM_EPP_CMD_MODE_64);
 	dev_info(ni->dev, "epp-init: cmd_mode/GO(0x6a3c)=0x%08x set LAST (after per-voq paddr)\n",
 		 readl(ni_base(ni) + CA_NI_QM_EPP));
+
+	/* ★★ THE CPU-egress ES enable (enable_tx_cpu equivalent).  Re-assert the
+	 * egress-scheduler egress-enable PAIR here, LAST, after the 0x6a3c GO - the
+	 * only spot nothing clobbers.  The tx-path enable 0x6a20 already reads 0xFF00,
+	 * but its CPU-path sibling 0x6a00, though set by match_stock_qm, reads back 0
+	 * (the EPP engine arming clears it).  Stock live: both = 0x0000FF00.  Without
+	 * the CPU-path enable the ES never services CPU_0 egress -> the CPU-EPP
+	 * writeback is starved -> the LOW ring keeps its DEADBEEF poison (PA=0). */
+	writel(CA_NI_QM_EPP_EGR_EN_ALL, ni_base(ni) + CA_NI_QM_EPP_TX_EGR_EN);
+	writel(CA_NI_QM_EPP_EGR_EN_ALL, ni_base(ni) + CA_NI_QM_EPP_CPU_EGR_EN);
+	dev_info(ni->dev, "epp-egr: tx(0x6a20)=0x%08x cpu(0x6a00)=0x%08x (want both 0x0000ff00)\n",
+		 readl(ni_base(ni) + CA_NI_QM_EPP_TX_EGR_EN),
+		 readl(ni_base(ni) + CA_NI_QM_EPP_CPU_EGR_EN));
 }
 
 /* ------------------------------------------------------------------ */
@@ -3387,12 +3633,21 @@ static int cortina_ni_rx_proc_show(struct seq_file *m, void *v)
 		p19 = readl(ni_base(ni) + CA_NI_L2FE_PDPID_MAP_DATA) &
 		      CA_NI_L2FE_PDPID_MAP_PDPID;
 
+		/* ★ pdpid[0x19]=0x0d (L3_LAN) is STOCK-CORRECT (vendor aal_port.h: 0x0d=L3_LAN,
+		 * 0x08=QM, 0x09=CPU).  The old "(want 0x8)" was WRONG - 0x08=QM egresses a wire
+		 * via L2TM, NOT the CPU.  On stock the CLS trap overrides L2 fwd -> dest CPU_0
+		 * (0x10) -> pdpid[0x10]=0x09 -> CPU-EPP; pdpid[0x19] is never on the CPU path.
+		 * l3fe_rx(0xa9bc) vs l3qm_rx(0xa9fc) UNDER BROADCAST = the decisive bisect:
+		 * l3fe_rx=0 -> frame never reaches the L3 classifier (routing/demux); l3fe_rx>0 &
+		 * cls_hit=0 -> STG0/CLS not matching; cls_hit>0 & qm_rx=0 -> trap not admitted. */
 		seq_printf(m,
-			   "fwd-chain: dft_fwd[p0]=0x%08x (redir_en=%u mcgid=0x%lx) pdpid[0x10]=0x%x pdpid[0x19]=0x%x(want 0x8) qm_rx=%u qm_tx=%u\n",
+			   "fwd-chain: dft_fwd[p0]=0x%08x (redir_en=%u mcgid=0x%lx) pdpid[0x10]=0x%x pdpid[0x19]=0x%x(stock 0x0d L3_LAN; NOT 0x8=QM->wire) qm_rx=%u qm_tx=%u l3fe_rx(0xa9bc)=%u l3qm_rx(0xa9fc)=%u\n",
 			   dft, !!(dft & CA_NI_PLE_DFT_REDIR_EN),
 			   FIELD_GET(CA_NI_PLE_DFT_MC_GROUP_ID, dft), pdpid, p19,
 			   readl(ni_base(ni) + CA_NI_QM_RX_CNTR),
-			   readl(ni_base(ni) + CA_NI_QM_TX_CNTR));
+			   readl(ni_base(ni) + CA_NI_QM_TX_CNTR),
+			   readl(ni_base(ni) + CA_NI_NI_L3FE_RX_PKT_CNT),
+			   readl(ni_base(ni) + CA_NI_NI_L3QM_RX_PKT_CNT));
 	}
 	/* ★ build68: full DFT_FWD[0..15] + MC_FIB[0x10..0x1b] dump so the coordinator can
 	 * VERIFY the routing tables from /proc (our image has no devmem).  DFT_FWD read =
@@ -3425,6 +3680,28 @@ static int cortina_ni_rx_proc_show(struct seq_file *m, void *v)
 		seq_printf(m, "  (want [0x19]=0x0b [0x10]=0x0f; arb_ctrl0x1600=0x%08x want 0x89c71c82; dq_tmport0x212c=0x%08x want 0x76543210)\n",
 			   readl(ni_base(ni) + CA_NI_L2FE_ARB_CTRL),
 			   readl(ni_base(ni) + CA_NI_L2TM_BM_DQ_TO_TM_PORT_MAP));
+
+		/* ★ build98: the FULL mc_fib[0x19] entry - all 4 DATA words with ca8277b labels
+		 * (the entry is a per-copy ACTION, not a bitmap).  DATA3(0x1638)={pol_en[0],
+		 * cos[3:1],ldpid[9:4]=per-copy dest}, DATA2(0x163c)={vid,mcgid[18:9],mcgid_en[19]},
+		 * DATA1(0x1640)/DATA0(0x1644)=mac_da.  Decode ldpid+mcgid: does mcgid 0x19 route to
+		 * the L3_LAN loopback (ldpid 0x19 -> L3FE) or CPU-direct (0x10)?  Our 0x0b -> ldpid 0
+		 * (NI0), which may be why the frame bypasses L3FE. */
+		{
+			u32 d3, d2, d1, d0;
+
+			cortina_ni_rx_ind_read(ni, CA_NI_L2FE_MC_FIB_ACCESS, 0x19);
+			d3 = readl(ni_base(ni) + 0x1638);
+			d2 = readl(ni_base(ni) + 0x163c);
+			d1 = readl(ni_base(ni) + 0x1640);
+			d0 = readl(ni_base(ni) + 0x1644);
+			seq_printf(m,
+				   "build98 mc_fib[0x19] full: DATA3(0x1638)=0x%08x{ldpid=0x%lx cos=%lu pol_en=%lu} DATA2(0x163c)=0x%08x{mcgid=0x%lx en=%lu} DATA1(0x1640)=0x%08x DATA0(0x1644)=0x%08x\n",
+				   d3, (unsigned long)((d3 >> 4) & 0x3f),
+				   (unsigned long)((d3 >> 1) & 0x7), (unsigned long)(d3 & 1),
+				   d2, (unsigned long)((d2 >> 9) & 0x3ff),
+				   (unsigned long)((d2 >> 19) & 1), d1, d0);
+		}
 
 		/* ★ build69: the admitted-frame header - THE last-ring witness.  Want
 		 * 0x80000010 (dest 0x10=CPU0, deep_q CLEAR) like stock, NOT 0xc0000020
@@ -3555,6 +3832,23 @@ static int cortina_ni_rx_proc_show(struct seq_file *m, void *v)
 			   !!(arb & CA_NI_L2FE_ARB_USE_HDR_A_DBUF),
 			   portdbuf, pd0, pd1, bmhdr,
 			   !!(bmhdr & BIT(30)), !!(bmhdr & BIT(31)));
+
+		/* ★ build100: FLOW_DBUF (the deep_q source when dbuf_sel=1) at traffic time -
+		 * confirm our write is still set (0x0f) at the tried offset 0x165c. */
+		{
+			u32 fd[4];
+			unsigned int k;
+
+			for (k = 0; k < 4; k++) {
+				cortina_ni_rx_ind_read(ni,
+					CA_NI_L2FE_ARB_FLOW_DBUF_ACCESS, k);
+				fd[k] = readl(ni_base(ni) +
+					      CA_NI_L2FE_ARB_FLOW_DBUF_DATA);
+			}
+			seq_printf(m,
+				   "flow-dbuf[0..3]@0x165c=0x%08x 0x%08x 0x%08x 0x%08x (want 0x0f each = deep_q source set)\n",
+				   fd[0], fd[1], fd[2], fd[3]);
+		}
 	}
 	/* ★ LAST-FRAME resolution: the BM latches the last RX FE (L2FE-resolved)
 	 * header + the raw RX-NI + the dequeued TX-NI header.  This shows what a REAL
@@ -3592,10 +3886,17 @@ static int cortina_ni_rx_proc_show(struct seq_file *m, void *v)
 		u32 initd = readl(ni_base(ni) + CA_NI_HV_INIT_DONE);
 		void __iomem *glb = ni->win[CA_NI_WIN_GLB];
 
+		/* ★ build98: NIRX_MISC_CFG offset is DISPUTED - our driver treats 0xa1bc as
+		 * NIRX_MISC (writes 0x3e80 = rdy_en bits9-13 SET, believing a -0x3c shift vs
+		 * rtl8277c), but the raw rtl8277c map puts NIRX_MISC (l2te_ni_*_rdy_en[13:9],
+		 * bit11=l3felan_port_rdy_en = the LAN->L3FE handoff gate) at 0xa1f8.  Read BOTH:
+		 * whichever holds ~0x3e80 (bits9-13) on stock is the real NIRX_MISC; if OURS
+		 * differs there, that unset rdy-enable is the l3fe_rx=0 gate. */
 		seq_printf(m,
-			   "gate: ni_init_done(a004)=0x%08x (ni_done=%u) nirx_misc(a1f8)=0x%08x\n",
+			   "gate: ni_init_done(a004)=0x%08x (ni_done=%u) nirx_misc@0xa1bc=0x%08x nirx_misc@0xa1f8=0x%08x (real one holds rdy_en bits9-13 ~0x3e80; bit11=l3felan_rdy)\n",
 			   initd, !!(initd & CA_NI_HV_INIT_DONE_NI),
-			   readl(ni_base(ni) + CA_NI_NI_NIRX_MISC_CFG));
+			   readl(ni_base(ni) + 0xa1bc),
+			   readl(ni_base(ni) + 0xa1f8));
 		if (glb)
 			seq_printf(m,
 				   "gate rst: bist/blk(28)=0x%08x blkreset(98)=0x%08x blkreset_ext(9c)=0x%08x dphy(a0)=0x%08x fabric(a4)=0x%08x\n",
@@ -3725,6 +4026,29 @@ static int cortina_ni_rx_proc_show(struct seq_file *m, void *v)
 			seq_printf(m, " v%u=%08x_%08x", v, upper_32_bits(sv), lower_32_bits(sv));
 		}
 		seq_puts(m, "\n");
+
+		/* ★ build88 DECISIVE: dump BOTH per-voq rings' voq0 first 16 entries -
+		 * LOW = PADDR(0x7200)=0x0bc48000 (where NAPI reads) vs HIGH = PADDR_HI(0x7220)=
+		 * 0x0bc4a000 (=PADDR+0x2000).  wptr advanced 38 but NAPI's LOW reads poison, so
+		 * the engine's real {PA,len} descriptors are in whichever ring is NOT deadbeef. */
+		{
+			unsigned int hi = CA_NI_RX_RING_HI_OFFSET / sizeof(__le64);
+			unsigned int k;
+
+			seq_puts(m, "build88 LOW(0x0bc48000) voq0:");
+			for (k = 0; k < 16; k++) {
+				u64 d = le64_to_cpu(rx->ring[k]);
+
+				seq_printf(m, " %08x_%08x", upper_32_bits(d), lower_32_bits(d));
+			}
+			seq_puts(m, "\nbuild88 HIGH(0x0bc4a000) voq0:");
+			for (k = 0; k < 16; k++) {
+				u64 d = le64_to_cpu(rx->ring[hi + k]);
+
+				seq_printf(m, " %08x_%08x", upper_32_bits(d), lower_32_bits(d));
+			}
+			seq_puts(m, "  (deadbeef=poison; real desc = a 0x094xxxxx PA + small len; rx_ring_hi param = which ring NAPI reads)\n");
+		}
 	}
 	/* ★★ PROVEN-cumulative per-stage counters (RE a0668fdf) - idle-vs-ping each; the
 	 * FIRST that does not climb under ping = the death stage.  l2tm_tx already climbs
