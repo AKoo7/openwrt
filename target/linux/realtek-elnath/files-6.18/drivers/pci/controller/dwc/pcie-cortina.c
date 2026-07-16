@@ -385,9 +385,21 @@ static int cortina_pcie_parse_serdes_cfg(struct cortina_pcie *cp)
  */
 #define CA_CLKEN_PCIE2		BIT(14)	/* gate_pcie2   : controller clock */
 #define CA_CLKEN_PCIE2_PS	BIT(24)	/* gate_pcie2_ps: SerDes PHY / refclk */
-#define CA_GPIO_B4_MUX		0x140	/* bank4 GPIO-function mux */
-#define CA_GPIO_B4_CFG		0x390	/* bank4 pin dir (clear = output) */
-#define CA_GPIO_B4_OUT		0x394	/* bank4 pin output level */
+/*
+ * PERST# pad-function mux.  This is a GLOBAL pinctrl register that lives in the
+ * rstmgr/GLB window (0xf4320140), NOT the per-GPIO bank window -- the pad mux and
+ * the GPIO data/dir registers are in different blocks.  Bit9 = PERST0 (pcie0,
+ * pin137), bit12 = PERST2 (pcie2, pin140); the bit must be set for the PERST# pad
+ * to reach the GPIO controller.  On a cold POR this mux reads 0 (pad
+ * disconnected), so the PCIe driver MUST set it itself: the GPON laser path
+ * (cg_laser_on) writes the same 0x140=0x3B00 including these bits, but only at
+ * activation -- long after PCIe probe -- so cold the endpoint never leaves reset
+ * and never enumerates.  (The old code wrongly wrote this mux into the per-GPIO
+ * window at 0xf4329140, which routed nothing.)
+ */
+#define CA_GLB_GPIO_MUX4	0x140	/* rstmgr/GLB window: bank4 pad-function mux */
+#define CA_GPIO_B4_CFG		0x390	/* PER_GPIO window: bank4 pin dir (clear = output) */
+#define CA_GPIO_B4_OUT		0x394	/* PER_GPIO window: bank4 pin output level */
 /* pcie2 = SerDes S2 (2.4 GHz RTL8192F) */
 #define S2_CORE_RST		BIT(8)
 #define S2_PHY_RST		BIT(2)
@@ -646,8 +658,8 @@ static void cortina_pcie0_precondition(struct cortina_pcie *cp)
 		usleep_range(1000, 2000);
 	}
 
-	ca_rmw(cp->gpio, CA_GPIO_B4_MUX, 0, S0_PERST);		/* PERST# assert (low) */
-	ca_rmw(cp->gpio, CA_GPIO_B4_CFG, S0_PERST, 0);
+	ca_rmw(cp->rstmgr, CA_GLB_GPIO_MUX4, 0, S0_PERST);	/* GLB pinmux: route PERST0 pad -> GPIO */
+	ca_rmw(cp->gpio, CA_GPIO_B4_CFG, S0_PERST, 0);		/* PERST# assert (low) */
 	ca_rmw(cp->gpio, CA_GPIO_B4_OUT, S0_PERST, 0);
 
 	ca_rmw(cp->rstmgr, CA_RST_BLOCK, 0, S0_CORE_RST);	usleep_range(1000, 2000);
@@ -699,10 +711,13 @@ static void cortina_pcie_host_reset(struct cortina_pcie *cp)
 	ca_rmw(cp->rstmgr, CA_GLOBAL_CONFIG, 0, CA_CLKEN_PCIE2 | CA_CLKEN_PCIE2_PS);
 	usleep_range(1000, 2000);
 
-	/* PERST# assert: GPIO bank4 pin12 -> GPIO function, output, drive low. */
-	ca_rmw(cp->gpio, CA_GPIO_B4_MUX, 0, S2_PERST);
-	ca_rmw(cp->gpio, CA_GPIO_B4_CFG, S2_PERST, 0);
-	ca_rmw(cp->gpio, CA_GPIO_B4_OUT, S2_PERST, 0);
+	/* PERST# assert: route pin140 via the GLB pinmux, then drive it as a GPIO
+	 * output low.  The mux MUST be the GLB/rstmgr register (0xf4320140), not the
+	 * per-GPIO window -- on a cold POR it is 0 and nothing else sets it before
+	 * PCIe needs the endpoint out of reset. */
+	ca_rmw(cp->rstmgr, CA_GLB_GPIO_MUX4, 0, S2_PERST);	/* GLB pinmux: route PERST2 pad -> GPIO */
+	ca_rmw(cp->gpio, CA_GPIO_B4_CFG, S2_PERST, 0);		/* dir = output */
+	ca_rmw(cp->gpio, CA_GPIO_B4_OUT, S2_PERST, 0);		/* drive low (assert) */
 
 	ca_rmw(cp->rstmgr, CA_RST_BLOCK, 0, S2_CORE_RST);	/* core_reset assert */
 	usleep_range(1000, 2000);
