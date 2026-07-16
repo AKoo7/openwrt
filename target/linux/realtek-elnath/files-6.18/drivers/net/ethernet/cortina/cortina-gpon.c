@@ -1873,9 +1873,12 @@ static const struct net_device_ops cg_wan_ops = {
 	.ndo_set_mac_address	= eth_mac_addr,
 };
 
-/* Register gpon0.  MAC = a locally-administered address one above eth0's
- * (02:96:07:f0:00:01); per-board factory-MAC injection is the fleet TODO
- * shared with eth0.  Carrier tracks the data-path install. */
+/* Register gpon0.  MAC = a locally-administered FALLBACK one above eth0's
+ * (02:96:07:f0:00:01).  The per-board factory MAC (base+1, mirroring stock
+ * nas0_0 = ELAN_MAC_ADDR+1) is applied by userspace before the WAN comes up:
+ * the 05_factory_mac uci-defaults script reads ELAN_MAC_ADDR from the stock
+ * ubi_Config/config_hs.xml (read-only NAND) and netifd sets it via the
+ * `device` macaddr.  Carrier tracks the data-path install. */
 static void cg_wan_create(struct cortina_gpon *cg)
 {
 	static const u8 mac[ETH_ALEN] = { 0x02, 0x96, 0x07, 0xf0, 0x00, 0x02 };

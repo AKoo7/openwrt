@@ -1134,7 +1134,8 @@ static void cortina_ni_tx_set_mac(struct cortina_ni *ni,
 	struct device_node *child;
 	int ret = -ENODEV;
 
-	/* stock keeps the MAC in the "ethernet@0" child (bootarg-patched) */
+	/* the "ethernet@0" child would carry a DT MAC; on this board neither
+	 * U-Boot nor the stock DTB fills it (live stock reads all-zero) */
 	child = of_get_child_by_name(ni->dev->of_node, "ethernet");
 	if (child) {
 		ret = of_get_ethdev_address(child, ndev);
@@ -1143,6 +1144,12 @@ static void cortina_ni_tx_set_mac(struct cortina_ni *ni,
 	if (ret)
 		ret = of_get_ethdev_address(ni->dev->of_node, ndev);
 	if (ret || !is_valid_ether_addr(ndev->dev_addr)) {
+		/* LAA fallback only: the per-board factory MAC (base MAC =
+		 * ELAN_MAC_ADDR from the stock ubi_Config/config_hs.xml on
+		 * read-only NAND) is applied by the 05_factory_mac
+		 * uci-defaults script through netifd before the interface
+		 * comes up; the my-MAC comparator + FDB CPU entry re-program
+		 * from dev_addr on every link-up, so they follow. */
 		eth_hw_addr_set(ndev, cortina_ni_default_mac);
 		dev_warn(ni->dev, "no MAC in DT, using default %pM\n",
 			 ndev->dev_addr);

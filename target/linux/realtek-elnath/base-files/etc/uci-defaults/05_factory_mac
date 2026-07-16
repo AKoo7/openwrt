@@ -1,0 +1,60 @@
+#!/bin/sh
+# X411AXF / RTL9607F "Elnath": pin the per-board FACTORY MAC on the netdevs.
+#
+# Provisioning source (the same one stock uses; live-verified 2026-07-16):
+# the hardware-settings XML in the stock config UBI volume -
+#   NAND "ubi_device" partition -> UBI volume "ubi_Config" (auto-attached
+#   READ-ONLY as ubi0 via bootargs ubi.mtd=ubi_device; every MTD partition
+#   is read-only in the DTS) -> config_hs.xml:
+#     <Value Name="ELAN_MAC_ADDR" Value="98c7a46cafcb"/>   (base MAC)
+# (U-Boot env "ethaddr" is a 00:50:c2 placeholder and the DTB is not
+# bootloader-patched, so this XML is the ONLY per-board MAC source.)
+#
+# Stock per-interface assignment (live stock `ip link`):
+#   LAN bridge br0     = base MAC
+#   GPON WAN nas0_0    = base MAC + 1
+# We mirror that: eth0 = base, gpon0 = base + 1 (the WAN DHCP identity /
+# MAC-keyed reservations ride on gpon0's MAC).
+#
+# netifd applies these `device` macaddrs while the netdevs are down, before
+# bringing them up; the cortina-ni driver re-programs its my-MAC comparator +
+# FDB CPU entry from dev_addr on every link-up, so the hardware follows.
+#
+# On any failure (volume absent/unreadable, no ELAN_MAC_ADDR) the drivers'
+# locally-administered fallbacks (02:96:07:f0:00:01/02) stay - fleet rule is
+# "factory MAC when the board provides one, LAA otherwise", never a per-board
+# hardcode in the image.
+
+. /lib/functions/system.sh
+
+mnt="/tmp/.factory_cfg"
+mac=""
+mkdir -p "$mnt"
+if mount -t ubifs -o ro ubi0:ubi_Config "$mnt" 2>/dev/null; then
+	mac=$(sed -n 's/.*Name="ELAN_MAC_ADDR"[^V]*Value="\([0-9a-fA-F]\{12\}\)".*/\1/p' \
+		"$mnt/config_hs.xml" 2>/dev/null | head -n1)
+	umount "$mnt"
+fi
+rmdir "$mnt" 2>/dev/null
+
+if [ "${#mac}" != "12" ]; then
+	logger -t factory-mac "no ELAN_MAC_ADDR in ubi_Config - keeping driver LAA MACs"
+	exit 0
+fi
+
+lan_mac=$(echo "$mac" | sed 's/../&:/g;s/:$//' | tr 'A-F' 'a-f')
+wan_mac=$(macaddr_add "$lan_mac" 1)
+
+logger -t factory-mac "factory MAC: eth0(LAN)=$lan_mac gpon0(WAN)=$wan_mac"
+
+uci -q batch <<EOF
+set network.lan_dev=device
+set network.lan_dev.name='eth0'
+set network.lan_dev.macaddr='$lan_mac'
+set network.wan_dev=device
+set network.wan_dev.name='gpon0'
+set network.wan_dev.macaddr='$wan_mac'
+commit network
+EOF
+
+exit 0
