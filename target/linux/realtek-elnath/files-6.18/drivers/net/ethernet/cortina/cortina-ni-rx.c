@@ -238,6 +238,35 @@ static u32 cortina_ni_rx_wptr(struct cortina_ni *ni)
 	return cortina_ni_rx_wptr_voq(ni, CA_NI_RX_VOQ);
 }
 
+/*
+ * DS PON control-frame consumer (the cortina-gpon driver registers here).
+ * A plain pointer store/load: the hook is set once at GPON probe and only
+ * cleared at GPON remove, and the RX path tolerates either value.
+ */
+static cortina_ni_pon_rx_fn cortina_ni_pon_rx_cb;
+
+void cortina_ni_pon_rx_hook_set(cortina_ni_pon_rx_fn fn)
+{
+	WRITE_ONCE(cortina_ni_pon_rx_cb, fn);
+}
+EXPORT_SYMBOL_GPL(cortina_ni_pon_rx_hook_set);
+
+/*
+ * DS PON DATA (WAN) consumer: de-encapsulated data-GEM frames the PDC steers
+ * to CPU port 0 arrive on this same EPP ring as plain Ethernet frames whose
+ * HEADER_A.lspid = PON (7); the GPON driver registers its WAN netdev here so
+ * they are delivered there instead of eth0 (LAN lspids are the NI ports
+ * 0..6, so the test cannot steal a LAN frame).  Same store/load discipline
+ * as the control-frame hook above.
+ */
+static struct net_device *cortina_ni_pon_wan_ndev;
+
+void cortina_ni_pon_wan_ndev_set(struct net_device *ndev)
+{
+	WRITE_ONCE(cortina_ni_pon_wan_ndev, ndev);
+}
+EXPORT_SYMBOL_GPL(cortina_ni_pon_wan_ndev_set);
+
 /* consume one CPU-EPP descriptor.  The frame sits in a software-populated DRAM buffer
  * inside our coherent CPU-pool region; copy it into a fresh skb and deliver, then
  * RE-PUSH that buffer's PA back to its EQ free-list (copy-break recycle).  cpu_eq=0
@@ -324,6 +353,54 @@ static void cortina_ni_rx_frame(struct cortina_ni *ni, u64 desc)
 		ndev->stats.rx_length_errors++;
 		ndev->stats.rx_errors++;
 		return;
+	}
+
+	/*
+	 * DS PON control frame (GPON OMCI): the PDC steers the OMCC DS GEM to
+	 * CPU port 0 with a HW-prepended 16-byte PON header — DA 00:13:25:00:
+	 * 00:00, SA 00:13:25:00:00:01, ethertype bytes [12:13] = 0xff,0xf1
+	 * (vendor CA_PUC_GLOBAL_LNK_TYPE; 0xfff0 = PLOAM/MPCP, which on this
+	 * silicon never reaches the CPU — the GPON MAC handles PLOAM in HW).
+	 * Strip the header and hand the OMCI PDU to the GPON driver; these
+	 * frames never enter the network stack (vendor ca_ni_rx_fill_pkt
+	 * does the same data += 16 / len -= 16).  Ethernet frames cannot
+	 * false-match: 0xfff1 is not a real ethertype on this LAN.
+	 */
+	if (unlikely(buf[off + 12] == 0xff && buf[off + 13] == 0xf1)) {
+		cortina_ni_pon_rx_fn fn = READ_ONCE(cortina_ni_pon_rx_cb);
+
+		rx->pon_frames++;
+		if (fn && len > 16)
+			fn(buf + off + 16, len - 16);
+		return;
+	}
+
+	/*
+	 * DS PON DATA (WAN): a de-encapsulated data-GEM frame carries
+	 * HEADER_A.lspid = PON (7) — the lspid our PDC map entry stamps —
+	 * while LAN frames carry an NI-port lspid (0..6) and the headerless
+	 * swid format parses lspid 0.  Deliver to the GPON WAN netdev.
+	 */
+	if (unlikely(!swid &&
+		     FIELD_GET(CA_NI_HDRA_W1_LSPID, hdra_lo) == CA_NI_LSPID_PON)) {
+		struct net_device *wan = READ_ONCE(cortina_ni_pon_wan_ndev);
+
+		if (wan) {
+			rx->wan_frames++;
+			skb = napi_alloc_skb(&rx->napi, len);
+			if (unlikely(!skb)) {
+				rx->drop_nobuf++;
+				wan->stats.rx_dropped++;
+				return;
+			}
+			skb_put_data(skb, buf + off, len);
+			skb->protocol = eth_type_trans(skb, wan);
+			napi_gro_receive(&rx->napi, skb);
+			wan->stats.rx_packets++;
+			wan->stats.rx_bytes += len;
+			return;
+		}
+		/* no WAN netdev registered: fall through to eth0 (diagnosable) */
 	}
 
 	skb = napi_alloc_skb(&rx->napi, len);
@@ -4169,8 +4246,9 @@ static int cortina_ni_rx_proc_show(struct seq_file *m, void *v)
 	seq_printf(m, "gphy: fault=0x%04x last=0x%04x recoveries=%llu rearms=%llu\n",
 		   cortina_ni_rx_gphy_fault(ni), rx->last_fault,
 		   rx->recoveries, rx->rearms);
-	seq_printf(m, "frames=%llu bytes=%llu polls=%llu swid=%llu\n",
-		   rx->frames, rx->bytes, rx->polls, rx->swid_frames);
+	seq_printf(m, "frames=%llu bytes=%llu polls=%llu swid=%llu pon=%llu wan=%llu\n",
+		   rx->frames, rx->bytes, rx->polls, rx->swid_frames,
+		   rx->pon_frames, rx->wan_frames);
 	seq_printf(m, "drops: nosop=%llu badpa=%llu len=%llu nobuf=%llu dead=%llu\n",
 		   rx->drop_nosop, rx->drop_badpa, rx->drop_len,
 		   rx->drop_nobuf, rx->slot_dead);

@@ -373,6 +373,62 @@ static void cortina_ni_tx_port_mac_init(struct cortina_ni *ni)
 	       CA_NI_HV_AUTOSYNC_FC_ALL, CA_NI_HV_AUTOSYNC_STS_ALL);
 }
 
+/*
+ * L2FE ARB ldpid->pdpid map: route the "9th queue" ldpids (0x08..0x0f, the
+ * CPU-injected US PON control-frame ports) to the PON-OAM egress.  Without it
+ * a CPU-injected OMCI frame (HEADER_A ldpid = PON+8 = 0x0f) has no physical
+ * route, never reaches the PUC, and the OLT receives no upstream OMCI.  Only
+ * touches ldpid 0x08..0x0f (unused by the Ethernet CPU-RX/LAN paths, which use
+ * ldpid 0x19/0x32), so it cannot disturb the working datapath.  32 entries:
+ * ldpid 0x08..0x0f x dbuf {0,1} x my_mac {0,1} -> PPORT_OAM.
+ */
+static int cortina_ni_arb_map_one(struct cortina_ni *ni, u32 idx, u32 pdpid)
+{
+	void __iomem *ni_r = ni_base(ni);
+	u32 val;
+	int ret;
+
+	writel(pdpid, ni_r + CA_NI_L2FE_ARB_PDPID_DATA);
+	writel(CA_DMA_LSO_BD_ACCESS_GO | CA_DMA_LSO_BD_ACCESS_WRITE | idx,
+	       ni_r + CA_NI_L2FE_ARB_PDPID_ACCESS);
+	ret = readl_poll_timeout(ni_r + CA_NI_L2FE_ARB_PDPID_ACCESS, val,
+				 !(val & CA_DMA_LSO_BD_ACCESS_GO),
+				 CA_NI_TX_POLL_US, CA_NI_TX_POLL_TIMEOUT_US);
+	if (ret)
+		dev_warn(ni->dev, "ARB map[0x%02x] timed out\n", idx);
+	return ret;
+}
+
+static void cortina_ni_arb_oam_map_init(struct cortina_ni *ni)
+{
+	u32 my_mac, dbuf, ldpid, idx;
+
+	for (my_mac = 0; my_mac <= 1; my_mac++) {
+		for (dbuf = 0; dbuf <= 1; dbuf++) {
+			/* 9th-queue (control-frame inject) -> OAM engine */
+			for (ldpid = CA_NI_LDPID_9QUEUE_LO;
+			     ldpid <= CA_NI_LDPID_9QUEUE_HI; ldpid++) {
+				idx = (my_mac << 7) | (dbuf << 6) | ldpid;
+				if (cortina_ni_arb_map_one(ni, idx,
+							   CA_NI_PPORT_OAM))
+					return;
+			}
+			/* CPU_MQ / LLID-GEM-index (US PON DATA inject) -> QM
+			 * (vendor aal_port.c global init maps all of
+			 * 0x20..0x3f, both dbuf + my_mac, to PPORT_QM) */
+			for (ldpid = CA_NI_LDPID_CPU_MQ_LO;
+			     ldpid <= CA_NI_LDPID_CPU_MQ_HI; ldpid++) {
+				idx = (my_mac << 7) | (dbuf << 6) | ldpid;
+				if (cortina_ni_arb_map_one(ni, idx,
+							   CA_NI_PPORT_QM))
+					return;
+			}
+		}
+	}
+	dev_info(ni->dev,
+		 "L2FE ARB: ldpids 0x08-0x0f -> PON-OAM, 0x20-0x3f -> QM\n");
+}
+
 static int cortina_ni_tx_hw_init(struct cortina_ni *ni)
 {
 	int ret;
@@ -432,6 +488,7 @@ static int cortina_ni_tx_hw_init(struct cortina_ni *ni)
 	cortina_ni_tx_qm_init(ni);
 	cortina_ni_tx_tm_init(ni);
 	cortina_ni_tx_port_mac_init(ni);
+	cortina_ni_arb_oam_map_init(ni);	/* US PON control-frame egress route */
 	return 0;
 }
 
@@ -455,15 +512,35 @@ static unsigned int cortina_ni_tx_reclaim_q(struct cortina_ni *ni,
 	while (q->finished != rptr) {
 		struct sk_buff *skb = q->slot[q->finished].skb;
 
-		if (!skb) {	/* must not happen: HW advanced past us */
-			netdev_err(ndev, "VP%u: hole at %u (rptr %u)\n",
-				   q->vp, q->finished, rptr);
-			break;
+		if (!skb) {
+			u8 pon = q->slot[q->finished].pon;
+
+			if (!pon) {	/* must not happen: HW advanced past us */
+				netdev_err(ndev, "VP%u: hole at %u (rptr %u)\n",
+					   q->vp, q->finished, rptr);
+				break;
+			}
+			/* PON control-frame descriptor: coherent scratch,
+			 * nothing to unmap/free; the frame (EOF) descriptor
+			 * releases its scratch slot (under this q->lock) */
+			if (pon >= 2)
+				ni->tx->pon_busy &= ~BIT(pon - 2);
+			q->slot[q->finished].pon = 0;
+			q->finished = (q->finished + 1) % CA_NI_TX_RING_SIZE;
+			q->reclaimed++;
+			freed++;
+			continue;
 		}
 		dma_unmap_single(ni->dev, q->slot[q->finished].addr,
 				 q->slot[q->finished].len, DMA_TO_DEVICE);
-		ndev->stats.tx_packets++;
-		ndev->stats.tx_bytes += q->slot[q->finished].len;
+		if (!q->slot[q->finished].pon) {
+			ndev->stats.tx_packets++;
+			ndev->stats.tx_bytes += q->slot[q->finished].len;
+		} else {
+			/* PON data skb (pon=1 + skb): counted on the WAN
+			 * netdev at enqueue, not on eth0 */
+			q->slot[q->finished].pon = 0;
+		}
 		dev_consume_skb_any(skb);
 		q->slot[q->finished].skb = NULL;
 		q->finished = (q->finished + 1) % CA_NI_TX_RING_SIZE;
@@ -616,6 +693,262 @@ static netdev_tx_t cortina_ni_start_xmit(struct sk_buff *skb,
 	mod_timer(&tx->reclaim_timer, jiffies + CA_NI_RECLAIM_INTERVAL);
 	return NETDEV_TX_OK;
 }
+
+/* ------------------------------------------------------------------ */
+/* US PON control-frame (OMCI) TX — see cortina-ni.h / cortina-ni-regs.h */
+/* ------------------------------------------------------------------ */
+
+/* set once at TX probe; the GPON driver's responder calls in through it */
+static struct cortina_ni *cortina_ni_pon_tx_ni;
+
+/* 16-byte PON control-frame header (stock ca_ni_tx_encap_pon_control_packet,
+ * disasm @0xa92ac: fixed DA/SA, link type 0xff 0xf1 = OMCI, byte [14] = 0,
+ * byte [15] = (cos > 6) — this board's ko is the G3 build and OMCI goes out
+ * at cos 7/8, so [15] = 0x01). */
+static const u8 cortina_ni_pon_hdr[CA_NI_PON_HDR_LEN] = {
+	0x00, 0x13, 0x25, 0x00, 0x00, 0x00,	/* DA */
+	0x00, 0x13, 0x25, 0x00, 0x00, 0x01,	/* SA */
+	0xff, 0xf1, 0x00, 0x01,			/* OMCI link type + G3 cos>=7 flag */
+};
+
+int cortina_ni_pon_tx(const u8 *pdu, unsigned int len)
+{
+	struct cortina_ni *ni = READ_ONCE(cortina_ni_pon_tx_ni);
+	struct cortina_ni_tx *tx;
+	struct cortina_ni_txq *q;
+	unsigned int frame_len, slot;
+	dma_addr_t blk_dma;
+	__le32 *desc, *w;
+	u32 lo, hi;
+	u8 *blk;
+
+	if (!ni || !ni->tx || !ni->tx->pon_buf)
+		return -ENODEV;
+	tx = ni->tx;
+	if (!len || len > CA_NI_PON_TX_PDU_MAX)
+		return -EINVAL;
+	frame_len = CA_NI_PON_HDR_LEN + len;	/* 64 for a 48B OMCI PDU */
+
+	/* always txq[0]: pon_busy and the scratch are guarded by its lock;
+	 * _bh so the responder may call from NAPI softirq or process ctx */
+	q = &tx->txq[0];
+	spin_lock_bh(&q->lock);
+
+	/*
+	 * Reclaim UNCONDITIONALLY here: the scratch (CA_NI_PON_TX_SLOTS) is much
+	 * smaller than the descriptor ring, so under a fast OMCI burst (the OLT's
+	 * MIB-Upload-Next walk sends ~1 message every ~25ms) the scratch runs out
+	 * long before the ring does.  If we only reclaimed on ring-low, pon_busy
+	 * would never get cleared during the burst and we'd -EBUSY-drop replies
+	 * even though the HW already drained them.  A dropped reply is fatal to
+	 * the stateful MIB-Upload-Next walk (the responder advances its pointer,
+	 * so the OLT's retransmit gets the wrong entry -> the upload desyncs and
+	 * the OLT aborts).  So free every completed slot on every send.
+	 */
+	cortina_ni_tx_reclaim_q(ni, q);
+	slot = ffz(tx->pon_busy);		/* >= SLOTS when all busy */
+	if (cortina_ni_txq_free_desc(q) <= CA_NI_TX_RESERVE_DESC + 2 ||
+	    slot >= CA_NI_PON_TX_SLOTS) {
+		tx->pon_fail++;
+		spin_unlock_bh(&q->lock);
+		return -EBUSY;		/* caller drops; the OLT retransmits */
+	}
+	tx->pon_busy |= BIT(slot);
+
+	blk = (u8 *)tx->pon_buf + slot * CA_NI_PON_TX_SLOT_SZ;
+	blk_dma = tx->pon_buf_dma + slot * CA_NI_PON_TX_SLOT_SZ;
+
+	/* frame = 16-byte PON header + the OMCI PDU (coherent, no mapping) */
+	memcpy(blk + CA_NI_PON_TX_FRAME_OFF, cortina_ni_pon_hdr,
+	       CA_NI_PON_HDR_LEN);
+	memcpy(blk + CA_NI_PON_TX_FRAME_OFF + CA_NI_PON_HDR_LEN, pdu, len);
+
+	/* Header block {LSO para0 = 0, LSO para1 = pkt_size, HEADER_A}: plain
+	 * little-endian stores, exactly the stock stores (disasm
+	 * __ca_ni_send_single_pkt: `stp wzr, w<size>, [x4]` then the 64-bit
+	 * HEADER_A at +8).  ★ WORD ORDER (stock-proven): the word at +8 is
+	 * the PKT_INFO half (no_drop/pol_id/cpu_flg, spec bits 32..63) and
+	 * the word at +12 is the cos/ldpid/lspid/pkt_size half (bits 0..31)
+	 * — the pol_id bfi lands in the LOW-address word.  pol_en stays 0
+	 * for OMCI (the G3 branch passes pol=INVALID; only the 0xff/0xf1
+	 * override sets pol_id = (DA[5]&0x3f)*8+7 = 7, without pol_en). */
+	lo = FIELD_PREP(CA_NI_PON_HDRA_LO_COS, CA_NI_PON_COS) |
+	     FIELD_PREP(CA_NI_PON_HDRA_LO_LDPID, CA_NI_PON_LDPID) |
+	     FIELD_PREP(CA_NI_PON_HDRA_LO_LSPID, CA_NI_PON_LSPID) |
+	     FIELD_PREP(CA_NI_PON_HDRA_LO_PKT_SIZE, frame_len) |
+	     CA_NI_PON_HDRA_LO_FE_BYPASS;
+	hi = CA_NI_PON_HDRA_HI_NO_DROP |
+	     FIELD_PREP(CA_NI_PON_HDRA_HI_POL_ID, CA_NI_PON_POL_ID);
+	w = (__le32 *)blk;
+	w[0] = 0;
+	w[1] = cpu_to_le32(frame_len);
+	w[2] = cpu_to_le32(hi);		/* +8:  pkt_info word (stock order) */
+	w[3] = cpu_to_le32(lo);		/* +12: cos/ldpid/pkt_size word */
+
+	/* descriptor pair: SOF + HP=01 header block, then the EOF frame */
+	desc = q->desc + q->wptr * CA_NI_TX_DESC_WORDS;
+	desc[0] = cpu_to_le32(lower_32_bits(blk_dma));
+	desc[1] = cpu_to_le32(CA_NI_TX_DESC1_SOF | CA_NI_TX_DESC1_HP0 |
+			      FIELD_PREP(CA_NI_TX_DESC1_HDR_LEN,
+					 CA_NI_PON_HDR_BLK_LEN));
+	q->slot[q->wptr].skb = NULL;
+	q->slot[q->wptr].addr = 0;
+	q->slot[q->wptr].len = 0;
+	q->slot[q->wptr].pon = 1;
+	q->wptr = (q->wptr + 1) % CA_NI_TX_RING_SIZE;
+
+	desc = q->desc + q->wptr * CA_NI_TX_DESC_WORDS;
+	desc[0] = cpu_to_le32(lower_32_bits(blk_dma + CA_NI_PON_TX_FRAME_OFF));
+	desc[1] = cpu_to_le32(CA_NI_TX_DESC1_EOF |
+			      FIELD_PREP(CA_NI_TX_DESC1_HDR_LEN, frame_len));
+	q->slot[q->wptr].skb = NULL;
+	q->slot[q->wptr].addr = 0;
+	q->slot[q->wptr].len = 0;
+	q->slot[q->wptr].pon = 2 + slot;
+	q->wptr = (q->wptr + 1) % CA_NI_TX_RING_SIZE;
+
+	q->enq++;
+	tx->pon_enq++;
+
+	/* header block + frame + descriptors visible before the doorbell */
+	dma_wmb();
+	writel(q->wptr,
+	       dma_base(ni) + CA_DMA_LSO_VP_TXQ_WPTR(q->vp, CA_NI_TX_TXQ));
+
+	spin_unlock_bh(&q->lock);
+
+	mod_timer(&tx->reclaim_timer, jiffies + CA_NI_RECLAIM_INTERVAL);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(cortina_ni_pon_tx);
+
+/*
+ * US PON DATA (WAN) TX — Stage D.  Same 2-descriptor HEADER_A chain as the
+ * OMCI path, but the frame is the dma-mapped skb (up to MTU-size, too big
+ * for the 128-byte scratch) and the HEADER_A is a plain data header: ldpid =
+ * PON (0x07, no 9th-queue offset), cos = the data queue, fe_bypass, no_drop,
+ * no policer.  In the PUC 8Q VoQ map the frame lands in T-CONT 7 queue 0
+ * (VoQ 56), whose US_PORT_ID the GPON driver bound to the OLT-assigned data
+ * GEM and whose T-CONT CAM entry it bound to the OLT's data alloc-id.
+ * Descriptor bookkeeping: SOF slot releases the header-block scratch (pon =
+ * 2+slot), EOF slot carries the skb (normal unmap+consume reclaim).
+ */
+netdev_tx_t cortina_ni_pon_data_tx(struct sk_buff *skb,
+				   struct net_device *ndev)
+{
+	struct cortina_ni *ni = READ_ONCE(cortina_ni_pon_tx_ni);
+	struct cortina_ni_tx *tx;
+	struct cortina_ni_txq *q;
+	unsigned int len, slot;
+	dma_addr_t blk_dma, daddr;
+	__le32 *desc, *w;
+	u32 lo, hi;
+	u8 *blk;
+
+	if (!ni || !ni->tx || !ni->tx->pon_buf) {
+		ndev->stats.tx_errors++;
+		dev_kfree_skb_any(skb);
+		return NETDEV_TX_OK;
+	}
+	tx = ni->tx;
+
+	if (skb_padto(skb, ETH_ZLEN))	/* freed by the helper on failure */
+		return NETDEV_TX_OK;
+	len = max_t(unsigned int, skb->len, ETH_ZLEN);
+	if (unlikely(len > CA_NI_TX_MAX_FRAME || skb_linearize(skb))) {
+		ndev->stats.tx_dropped++;
+		dev_kfree_skb_any(skb);
+		return NETDEV_TX_OK;
+	}
+
+	/* txq[0], shared with the OMCI path: pon_busy + scratch live under
+	 * its lock (ndo_start_xmit runs with BH off -> plain spin_lock) */
+	q = &tx->txq[0];
+	spin_lock(&q->lock);
+
+	cortina_ni_tx_reclaim_q(ni, q);	/* scratch << ring: reclaim every send */
+	slot = ffz(tx->pon_busy);
+	if (cortina_ni_txq_free_desc(q) <= CA_NI_TX_RESERVE_DESC + 2 ||
+	    slot >= CA_NI_PON_TX_SLOTS) {
+		tx->pon_fail++;
+		ndev->stats.tx_dropped++;
+		spin_unlock(&q->lock);
+		dev_kfree_skb_any(skb);	/* WAN clients retransmit (DHCP/TCP) */
+		return NETDEV_TX_OK;
+	}
+
+	daddr = dma_map_single(ni->dev, skb->data, len, DMA_TO_DEVICE);
+	if (unlikely(dma_mapping_error(ni->dev, daddr))) {
+		tx->drop_nomap++;
+		ndev->stats.tx_dropped++;
+		spin_unlock(&q->lock);
+		dev_kfree_skb_any(skb);
+		return NETDEV_TX_OK;
+	}
+	WARN_ON_ONCE(upper_32_bits(daddr));
+	tx->pon_busy |= BIT(slot);
+
+	blk = (u8 *)tx->pon_buf + slot * CA_NI_PON_TX_SLOT_SZ;
+	blk_dma = tx->pon_buf_dma + slot * CA_NI_PON_TX_SLOT_SZ;
+
+	/* header block {LSO para0 = 0, LSO para1 = pkt_size, HEADER_A}: the
+	 * same stock word order as the OMCI path (+8 = pkt_info half, +12 =
+	 * cos/ldpid/pkt_size half) */
+	lo = FIELD_PREP(CA_NI_PON_HDRA_LO_COS, CA_NI_PON_DATA_COS) |
+	     FIELD_PREP(CA_NI_PON_HDRA_LO_LDPID, CA_NI_PON_DATA_LDPID) |
+	     FIELD_PREP(CA_NI_PON_HDRA_LO_LSPID, CA_NI_PON_LSPID) |
+	     FIELD_PREP(CA_NI_PON_HDRA_LO_PKT_SIZE, len) |
+	     CA_NI_PON_HDRA_LO_FE_BYPASS;
+	hi = CA_NI_PON_HDRA_HI_NO_DROP |
+	     FIELD_PREP(CA_NI_PON_HDRA_HI_POL_ID,
+			CA_NI_PON_DATA_TCONT * 8 + CA_NI_PON_DATA_COS);
+	w = (__le32 *)blk;
+	w[0] = 0;
+	w[1] = cpu_to_le32(len);
+	w[2] = cpu_to_le32(hi);
+	w[3] = cpu_to_le32(lo);
+
+	/* SOF + HP=01 header block (releases scratch slot on reclaim) */
+	desc = q->desc + q->wptr * CA_NI_TX_DESC_WORDS;
+	desc[0] = cpu_to_le32(lower_32_bits(blk_dma));
+	desc[1] = cpu_to_le32(CA_NI_TX_DESC1_SOF | CA_NI_TX_DESC1_HP0 |
+			      FIELD_PREP(CA_NI_TX_DESC1_HDR_LEN,
+					 CA_NI_PON_HDR_BLK_LEN));
+	q->slot[q->wptr].skb = NULL;
+	q->slot[q->wptr].addr = 0;
+	q->slot[q->wptr].len = 0;
+	q->slot[q->wptr].pon = 2 + slot;
+	q->wptr = (q->wptr + 1) % CA_NI_TX_RING_SIZE;
+
+	/* EOF = the frame itself (skb reclaimed by the normal unmap path;
+	 * pon=1 with skb set = "WAN data skb", stats counted here not eth0) */
+	desc = q->desc + q->wptr * CA_NI_TX_DESC_WORDS;
+	desc[0] = cpu_to_le32(lower_32_bits(daddr));
+	desc[1] = cpu_to_le32(CA_NI_TX_DESC1_EOF |
+			      FIELD_PREP(CA_NI_TX_DESC1_HDR_LEN, len));
+	q->slot[q->wptr].skb = skb;
+	q->slot[q->wptr].addr = daddr;
+	q->slot[q->wptr].len = len;
+	q->slot[q->wptr].pon = 1;
+	q->wptr = (q->wptr + 1) % CA_NI_TX_RING_SIZE;
+
+	q->enq++;
+	tx->pon_data_enq++;
+	ndev->stats.tx_packets++;
+	ndev->stats.tx_bytes += len;
+
+	skb_tx_timestamp(skb);	/* before the doorbell (UAF lesson) */
+
+	dma_wmb();
+	writel(q->wptr,
+	       dma_base(ni) + CA_DMA_LSO_VP_TXQ_WPTR(q->vp, CA_NI_TX_TXQ));
+
+	spin_unlock(&q->lock);
+
+	mod_timer(&tx->reclaim_timer, jiffies + CA_NI_RECLAIM_INTERVAL);
+	return NETDEV_TX_OK;
+}
+EXPORT_SYMBOL_GPL(cortina_ni_pon_data_tx);
 
 /* ------------------------------------------------------------------ */
 /* link handling + the M2b on-air proof frame                          */
@@ -773,6 +1106,8 @@ static int cortina_ni_tx_proc_show(struct seq_file *m, void *v)
 	seq_printf(m, "last_word1=0x%08x busy=%llu nomap=%llu linearize=%llu oversize=%llu\n",
 		   tx->last_word1, tx->tx_busy, tx->drop_nomap,
 		   tx->drop_linearize, tx->drop_oversize);
+	seq_printf(m, "pon_tx enq=%llu data_enq=%llu fail=%llu busy_slots=0x%02x\n",
+		   tx->pon_enq, tx->pon_data_enq, tx->pon_fail, tx->pon_busy);
 	for (i = 0; i < CA_NI_TX_NUM_VPS; i++) {
 		struct cortina_ni_txq *q = &tx->txq[i];
 
@@ -848,6 +1183,15 @@ int cortina_ni_tx_probe(struct cortina_ni *ni)
 	timer_setup(&tx->reclaim_timer, cortina_ni_tx_reclaim_timer, 0);
 	INIT_WORK(&tx->announce_work, cortina_ni_tx_announce);
 
+	/* US PON control-frame (OMCI) TX scratch — non-fatal when absent,
+	 * cortina_ni_pon_tx just reports -ENODEV */
+	tx->pon_buf = dmam_alloc_coherent(ni->dev,
+					  CA_NI_PON_TX_SLOTS *
+					  CA_NI_PON_TX_SLOT_SZ,
+					  &tx->pon_buf_dma, GFP_KERNEL);
+	if (!tx->pon_buf)
+		dev_warn(ni->dev, "no PON TX scratch - US OMCI TX disabled\n");
+
 	ret = cortina_ni_tx_hw_init(ni);
 	if (ret)
 		return ret;
@@ -864,6 +1208,7 @@ int cortina_ni_tx_probe(struct cortina_ni *ni)
 	proc_create_single_data("cortina_ni_tx", 0444, init_net.proc_net,
 				cortina_ni_tx_proc_show, ni);
 
+	WRITE_ONCE(cortina_ni_pon_tx_ni, ni);	/* open the PON TX entry */
 	dev_info(ni->dev, "M2b TX ready: %s -> port %d (direct-TX)\n",
 		 ndev->name, CA_NI_TX_PORT);
 	return 0;

@@ -34,6 +34,7 @@ config CORTINA_GPON
 	tristate "Cortina-Access RTL9607F GPON MAC"
 	depends on OF
 	depends on HAS_IOMEM
+	select CRC32
 	help
 	  This driver supports the Cortina-Access GPON MAC (CA8277C class)
 	  found in the Realtek RTL9607F "Elnath" GPON ONU SoC: the PON-MAC

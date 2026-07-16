@@ -983,6 +983,81 @@ enum cortina_ni_win {
 #define CA_NI_TX_MAX_FRAME		2047	/* 11-bit len field */
 #define CA_NI_TX_RESERVE_DESC		2	/* stock keeps 2 in hand */
 
+/*
+ * --- header-mode TX descriptor (US PON control frames / OMCI) ---
+ *
+ * The generic (mode=0) descriptor encoding of the same engine: HP[1:0]=01
+ * marks "HEADER_A present, no HEADER_CPU".  The frame is sent as a
+ * TWO-descriptor chain (vendor __ca_ni_send_single_pkt): descriptor 0 (SOF)
+ * points at a 16-byte header block {LSO para0, LSO para1, HEADER_A lo,
+ * HEADER_A hi}, descriptor 1 (EOF) at the frame bytes.  buf_len is 16 bits
+ * at [23:8] in this mode (not the 11-bit direct-TX field).
+ */
+#define CA_NI_TX_DESC1_HDR_LEN		GENMASK(23, 8)	/* buf_len, header mode */
+#define CA_NI_TX_DESC1_SOF		BIT(30)		/* sop_eop = 10 */
+#define CA_NI_TX_DESC1_EOF		BIT(29)		/* sop_eop = 01 */
+
+/*
+ * --- US PON control-frame (OMCI) injection ---
+ *
+ * The OMCI response rides the SAME DMA-LSO ring as Ethernet, as a 16-byte
+ * PON control header (DA 00:13:25:00:00:00, SA 00:13:25:00:00:01, link type
+ * 0xff 0xf1, flags 0) + the 48-byte OMCI PDU.  HEADER_A steers it: ldpid =
+ * PON(7)+8 (the "9th queue" high-prio inject), lspid = CPU0 logical port
+ * 0x10, cos 7, no_drop, fe_bypass, pol_id = (DA[5] & 0x3f)*8 + 7 = 7 (lands
+ * in T-CONT0 VOQ 7, whose OMCC alloc/GEM bind the GPON ISR installed),
+ * pol_en (vendor ca_ni_tx_get_pon_paras + __ca_ni_send_single_pkt, 77c GPON
+ * branch; the aal_gpon OMCI pkt template uses cos=8 -> txq 7 + 9th queue).
+ *
+ * HEADER_A bit layout (G3 Header spec, both 32-bit words little-endian in
+ * the header block, exactly as the vendor CPU stores them):
+ *   word0 (bits 0..31):  cos[2:0] ldpid[8:3] lspid[14:9] pkt_size[28:15]
+ *                        fe_bypass[29] hdr_type[31:30]
+ *   word1 (bits 32..63): mcgid[7:0] drop_code[10:8] rx_pkt_type[12:11]
+ *                        no_drop[13] mirror[14] mark[15] pol_en[17:16]
+ *                        pol_id[26:18] pol_grp[29:27] deep_q[30] cpu_flg[31]
+ */
+#define CA_NI_PON_HDRA_LO_COS		GENMASK(2, 0)
+#define CA_NI_PON_HDRA_LO_LDPID		GENMASK(8, 3)
+#define CA_NI_PON_HDRA_LO_LSPID		GENMASK(14, 9)
+#define CA_NI_PON_HDRA_LO_PKT_SIZE	GENMASK(28, 15)
+#define CA_NI_PON_HDRA_LO_FE_BYPASS	BIT(29)
+#define CA_NI_PON_HDRA_HI_NO_DROP	BIT(13)
+#define CA_NI_PON_HDRA_HI_POL_EN	GENMASK(17, 16)
+#define CA_NI_PON_HDRA_HI_POL_ID	GENMASK(26, 18)
+#define CA_NI_PON_LDPID			(7 + 8)	/* PON port 7 + 9th-queue inject */
+#define CA_NI_PON_LSPID			0x10	/* CPU0 logical port */
+#define CA_NI_PON_COS			7
+#define CA_NI_PON_POL_ID		7	/* OMCC VOQ 7 of T-CONT 0 */
+
+/* --- US PON DATA (WAN) injection (Stage D): same 2-descriptor HEADER_A
+ *     chain, but a plain data HEADER_A.  Vendor ca_ni_tx_get_pon_paras (GPON
+ *     data, 8Q VoQ mode): ldpid = 0x20 + tcont (the CPU_MQ / LLID-GEM-index
+ *     logical ports 0x20..0x3f, whose ARB map entry routes to the QM physical
+ *     port 0x08), cos = queue.  The PUC 8Q VoQ map (VoQID = {ldpid[3:0],
+ *     cos[2:0]}) then lands the frame in VoQ tcont*8+cos, whose US_PORT_ID
+ *     the GPON driver points at the OLT-assigned data GEM.  (Vendor data TX
+ *     uses fe_bypass=0 + pol_en=1/pol_id=gem-idx with a fully-programmed FE;
+ *     ours keeps the proven OMCI-inject convention: fe_bypass=1, no policer.)
+ *     lspid stays the CPU logical port. --- */
+#define CA_NI_LSPID_PON			0x07	/* PON logical port (AAL_LPORT_PON); DS RX lspid key */
+#define CA_NI_PON_DATA_TCONT		1	/* hw data T-CONT (0 = OMCC) */
+#define CA_NI_PON_DATA_COS		0	/* data queue 0 -> VoQ 8 */
+#define CA_NI_PON_DATA_LDPID		(0x20 + CA_NI_PON_DATA_TCONT)
+
+/* coherent TX scratch: N slots of {16B header block @0, frame @32}.  32 slots
+ * (guarded by a u32 bitmap) comfortably absorb the OLT's MIB-Upload-Next reply
+ * burst so no reply is ever -EBUSY-dropped (a drop desyncs the stateful upload
+ * walk); combined with the unconditional reclaim in cortina_ni_pon_tx. */
+#define CA_NI_PON_TX_SLOTS		32
+#define CA_NI_PON_TX_SLOT_SZ		128
+#define CA_NI_PON_TX_FRAME_OFF		32
+#define CA_NI_PON_HDR_BLK_LEN		16	/* lso0 + lso1 + HEADER_A */
+#define CA_NI_PON_HDR_LEN		16	/* DA + SA + 0xfff1 + flags */
+#define CA_NI_PON_TX_PDU_MAX		(CA_NI_PON_TX_SLOT_SZ - \
+					 CA_NI_PON_TX_FRAME_OFF - \
+					 CA_NI_PON_HDR_LEN)
+
 #define CA_NI_TX_POLL_US		1
 #define CA_NI_TX_POLL_TIMEOUT_US	10000
 
@@ -1485,6 +1560,27 @@ enum cortina_ni_win {
 
 /* CPU port 0 logical destination port id (AAL_LPORT_CPU_0) */
 #define CA_NI_LDPID_CPU0		0x10
+
+/*
+ * --- L2FE ARB ldpid->pdpid map (stock aal_port.c global init, aal_port_arb_
+ *     ldpid_pdpid_map_set): selects the physical egress port for a logical
+ *     dest port.  A CPU-injected US OMCI frame carries HEADER_A ldpid =
+ *     PON(7)+8 = 0x0f (the "9th queue"); without a map entry that ldpid has no
+ *     route to the PON-OAM egress, so the frame never reaches the PUC and the
+ *     OLT sees zero upstream OMCI.  Vendor maps all 9th-queue ldpids 0x08..0x0f
+ *     (both dbuf, both my_mac) -> PPORT_OAM.  Offsets are the LIVE board map
+ *     (stock rootfs reg.txt): this silicon has extra ARB_MC_MTU registers that
+ *     shift PDPID_MAP +0x18 above the stale 5.10 header (0x1654 -> 0x166c).
+ *     Indirect: DATA = pdpid, ACCESS = go[31]|write[30]|addr[7:0]; addr =
+ *     (my_mac<<7)|(dbuf<<6)|ldpid. --- */
+#define CA_NI_L2FE_ARB_PDPID_ACCESS	0x166c	/* addr[7:0], rbw[30], go[31] */
+#define CA_NI_L2FE_ARB_PDPID_DATA	0x1670	/* pdpid[3:0] */
+#define CA_NI_PPORT_OAM			0x0c	/* AAL_PPORT_OAM */
+#define CA_NI_PPORT_QM			0x08	/* AAL_PPORT_QM (US PON data path) */
+#define CA_NI_LDPID_9QUEUE_LO		0x08	/* AAL_LPORT_9QUEUE_NI0 */
+#define CA_NI_LDPID_9QUEUE_HI		0x0f	/* AAL_LPORT_9QUEUE_NI7 (PON 7 + 8) */
+#define CA_NI_LDPID_CPU_MQ_LO		0x20	/* AAL_LPORT_CPU_MQ_0 / LLID_GEM_INDEX_0 */
+#define CA_NI_LDPID_CPU_MQ_HI		0x3f	/* vendor maps all of 0x20..0x3f -> PPORT_QM */
 
 /* --- NI-RX L3FE demux routing map (stock aal_ni_init_nirx_l3fe_demux, 07f
  *     ko @0x6030, called from aal_ni_init_ni).  These registers map the

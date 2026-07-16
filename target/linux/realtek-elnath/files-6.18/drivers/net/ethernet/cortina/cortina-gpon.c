@@ -25,7 +25,9 @@
 
 #include <linux/module.h>
 #include <linux/kernel.h>
+#include <linux/crc32.h>
 #include <linux/delay.h>
+#include <linux/etherdevice.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/of.h>
@@ -33,12 +35,15 @@
 #include <linux/platform_device.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
+#include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/uaccess.h>
 #include <linux/workqueue.h>
 
 #include "cortina-gpon-serdes.h"
 #include "cortina-gpon-bosa.h"
+#include "cortina-ni.h"		/* cortina_ni_pon_rx_hook_set + cortina_ni_pon_tx */
+#include "omci_responder.h"	/* Stage C: the G.988 responder + ME model */
 
 #define DRV_NAME		"cortina-gpon"
 
@@ -80,8 +85,8 @@
  * enable is GLOBAL_PON_INTENABLE_0.PON_MACe.  The vendor ISR masks/unmasks
  * THIS bit around servicing ("disable SoC IRQ").
  */
-#define CG_GLB_PON_INT0		0x180	/* GLOBAL_PON_INTERRUPT_0 */
-#define CG_GLB_PON_INTEN0	0x184	/* GLOBAL_PON_INTENABLE_0 */
+#define CG_GLB_PON_INT0		0x1b0	/* GLOBAL_PON_INTERRUPT_0 */
+#define CG_GLB_PON_INTEN0	0x1b4	/* GLOBAL_PON_INTENABLE_0 */
 #define CG_PON_INT0_PON_MAC	BIT(0)	/* PON_MACi/e */
 /*
  * PON interrupt aggregation, level 2 of 2: the NE global sub-interrupt
@@ -264,8 +269,13 @@
  */
 #define CG_REG_TCONT_ACCESS	0x14c	/* header 0x12c: alloc_id[11:0], sw_plm_en[16], rbw[30], go[31] */
 #define CG_REG_TCONT_DATA	0x150	/* header 0x130: ploam_en[0], omci_en[1], index[6:2] (hw T-CONT 0-31) */
+#define CG_REG_DS_GEM_ACCESS	0x154	/* header 0x134: id[11:0] (GEM port-id), sw_aes[16], rbw[30], go[31] */
+#define CG_REG_DS_GEM_DATA	0x158	/* header 0x138: vld[0], aes[1], tdm[2], index[10:3] (intern gem) */
 #define CG_REG_US_PORT_ACCESS	0x190	/* header 0x170: index[7:0] (us hw gem 0-255), rbw[30], go[31] */
 #define CG_REG_US_PORT_DATA	0x194	/* header 0x174: id[11:0] (GEM port-id) */
+
+#define CG_DS_GEM_VLD		BIT(0)
+#define CG_DS_GEM_INDEX(x)	(((x) & 0xff) << 3)
 
 #define CG_TBL_GO		BIT(31)
 #define CG_TBL_WR		BIT(30)
@@ -275,6 +285,121 @@
 #define CG_TCONT_INDEX_MASK	(0x1f << 2)
 
 #define CG_OMCC_US_GEM_IDX_NUM	8	/* vendor AAL_GPON_OMCI_RSV_PORT_MAX: us hw gems 0..7 = OMCC */
+
+/*
+ * Stage D — the WAN data path.  ONE data T-CONT + ONE bidirectional data GEM
+ * (what this OLT's default lineprofile provisions), plus the DS broadcast GEM.
+ *
+ * Index scheme (vendor-faithful): hw T-CONT 0 = OMCC, hw T-CONT 1 = data.
+ * In the PUC's 8Q VoQ map (VoQID = {HdrA.ldpid[3:0], HdrA.cos[2:0]}) the
+ * data T-CONT's queues are VoQ 8..15, and the vendor keeps the internal GEM
+ * index == VoQ for US GEMs (OMCC = 0..7, first data GEM = tcont*8+queue), so
+ * the US engine stamps US_PORT_ID[VoQ] onto the burst.  The CPU injects data
+ * with HEADER_A ldpid = 0x20+tcont (the CPU_MQ/LLID-GEM logical ports, whose
+ * ARB map entry routes to the QM physical port) — see cortina-ni-regs.h.
+ * The DS broadcast GEM (port-id 4095, carries e.g. the DHCP OFFER on this
+ * OLT family) gets the next internal index, DS-only.
+ */
+#define CG_DATA_TCONT_IDX	1	/* hw T-CONT of the OLT's data alloc-id */
+#define CG_DATA_GEM_IDX		(CG_DATA_TCONT_IDX * 8)	/* intern gem idx = VoQ 8 */
+#define CG_MCAST_GEM_IDX	(CG_DATA_GEM_IDX + 1)	/* DS-only broadcast GEM */
+#define CG_MCAST_GEM_ID		4095	/* G.984 broadcast GEM port-id */
+
+/*
+ * PDC (packet-downstream classifier) sub-block: PON window + 0x9000, a
+ * SEPARATE block from the GPON MAC (+0x6000) — plain header offsets, no
+ * +0x20 silicon shift (that shift is a GPON-MAC-block quirk; confirm with
+ * one stock devmem of 0x4f5509014 at Online).  The PDC maps each DS GEM
+ * (by internal index) to a logical destination port: without it a
+ * de-encapsulated DS frame has nowhere to go and DS OMCI never reaches the
+ * CPU.  Vendor __pdc_gpon_family_init (aal_pdc.c): map entries 0..7 (the
+ * OMCC-reserved GEMs) -> CPU port 0 with fe_bypass+no_drop+cos 6, entries
+ * 8..255 (data GEMs) -> L3_WAN; then PDC_CTRL arms the map memory and the
+ * OMCI high-priority override (cos 7 -> CPU_0).
+ *
+ * PDC_MAP indirect access protocol = the same go/rbw/poll dance as the MAC
+ * tables: ACCESS = go(bit31) | rbw(bit30, 1=write) | address[7:0], poll
+ * bit31 self-clear (<= 10000 reads); data through DATA0/DATA1.
+ */
+#define CG_PDC_CTRL		0x9014	/* dft 0x2 (pdc_map_mem_en) */
+#define CG_PDC_CTRL_MAP_MEM_EN	BIT(1)
+#define CG_PDC_CTRL_HP_COS_SH	16	/* omci_hp_cos[18:16] */
+#define CG_PDC_CTRL_HP_LDPID_SH	19	/* omci_hp_ldpid[24:19] */
+#define CG_PDC_CTRL_HP_EN	BIT(25)	/* omci_hp_en */
+#define CG_PDC_CTRL_HP_MASK	GENMASK(25, 16)
+#define CG_PDC_MAP_ACCESS	0x9020	/* address[7:0], rbw[30], go[31] */
+#define CG_PDC_MAP_DATA1	0x9024	/* pol_en[3:2], pol_id[12:4], pol_grp_id[15:13], deepq[16] */
+#define CG_PDC_MAP_DATA0	0x9028	/* cos[2:0], ldpid[8:3], lspid[14:9], fe_bypass[15], no_drop[31] */
+#define CG_PDC_MAP_ENTRIES	256	/* vendor AAL_PDC_MAP_ENTRY_NUM */
+#define CG_PDC_D1_POL_ID(x)	(((x) & 0x1ff) << 4)
+#define CG_PDC_D0_COS(x)	((x) & 0x7)
+#define CG_PDC_D0_LDPID(x)	(((x) & 0x3f) << 3)
+#define CG_PDC_D0_LSPID(x)	(((x) & 0x3f) << 9)
+#define CG_PDC_D0_FE_BYPASS	BIT(15)
+#define CG_PDC_D0_NO_DROP	BIT(31)
+/* logical port ids (vendor aal_port.h) */
+#define CG_LPORT_CPU_0		0x10	/* CPU port 0 = the NI CPU-RX EPP port we drain */
+#define CG_LPORT_L3_WAN		0x18
+#define CG_LPORT_PON		0x07
+
+/*
+ * PUC (PON Upstream Classifier) sub-block: PON window + 0x8000.  This is the
+ * admission stage between the NI DMA-LSO egress and the GPON-MAC GEM-US
+ * engine.  A CPU-injected US OMCI frame reaches the PUC (via its HEADER_A
+ * ldpid = PON(7)+8 = the "9th queue", 8Q VoQID = {ldpid[3:0]=0xf, cos[2:0]=7}
+ * = 127), but with the block at reset defaults the OMCC VoQs are neither
+ * mapped, valid, nor GEM/cos-stamped -> the frame is silently dropped: the
+ * DMA-LSO ring drains yet nothing ever bursts upstream and the OLT keeps
+ * retransmitting its OMCI Get.  This is the vendor aal_puc_init GPON path,
+ * run once at __gpon_datapath_init after the PDC.  Offsets are plain PON-
+ * window offsets (reg.txt); the +0x20 shift is a GPON-MAC-block quirk and
+ * does NOT apply here (PUC is a distinct sub-block, like the PDC at +0x9000).
+ *
+ * Indirect tables reuse the go/rbw/poll protocol (ACCESS = go[31] | rbw[30]
+ * | addr; DATA around it): PVTBL (per-T-CONT VoQ map, 5 data words),
+ * VOQBPREMAP (per-VoQ back-pressure remap).
+ */
+#define CG_PUC_BASE		0x8000	/* PON window + 0x8000 */
+#define CG_PUC_PVTBL_ACCESS	(CG_PUC_BASE + 0x000)	/* addr[5:0]=T-CONT, rbw[30], go[31] */
+#define CG_PUC_PVTBL_DATA4	(CG_PUC_BASE + 0x004)
+#define CG_PUC_PVTBL_DATA3	(CG_PUC_BASE + 0x008)
+#define CG_PUC_PVTBL_DATA2	(CG_PUC_BASE + 0x00c)	/* voq7[7:0], schmode[8], entryvld[12], wrr0/1 */
+#define CG_PUC_PVTBL_DATA1	(CG_PUC_BASE + 0x010)	/* voq3[3:0],voq4,voq5,voq6,voq7[31] */
+#define CG_PUC_PVTBL_DATA0	(CG_PUC_BASE + 0x014)	/* voq0,voq1,voq2,voq3[31:27] */
+#define CG_PUC_VOQMAPCFG	(CG_PUC_BASE + 0x04c)	/* voqmapsel[1:0]: 0 = 8Q mode */
+#define CG_PUC_BTCCFG		(CG_PUC_BASE + 0x050)
+#define CG_PUC_PUCCFG		(CG_PUC_BASE + 0x08c)	/* dft 0x84040001 */
+#define CG_PUC_VOQBUFLIMSEL0	(CG_PUC_BASE + 0x090)	/* 16 regs, stride 4 (0x090..0x0cc) */
+#define CG_PUC_VOQBUFLIMSEL_N	16
+#define CG_PUC_VOQBUFLIMIT_A	(CG_PUC_BASE + 0x0d0)
+#define CG_PUC_VOQBUFLIMIT_B	(CG_PUC_BASE + 0x0d4)
+#define CG_PUC_VOQBUFLIMIT_C	(CG_PUC_BASE + 0x0d8)
+#define CG_PUC_BPCNTL		(CG_PUC_BASE + 0x0e4)	/* bpen[0], dropen[4], bpth[30:16] */
+#define CG_PUC_VOQBPREMAP_ACCESS (CG_PUC_BASE + 0x0e8)	/* addr[7:0]=VoQ, rbw[30], go[31] */
+#define CG_PUC_VOQBPREMAP_DATA	(CG_PUC_BASE + 0x0ec)	/* tqmvoqid[7:0] */
+#define CG_PUC_PONCNTL_INTEN	(CG_PUC_BASE + 0x0f4)
+#define CG_PUC_CTRL		(CG_PUC_BASE + 0x13c)	/* dft 0x3300007c; shp_en[30], rl_en[26] */
+#define CG_PUC_CTRL1		(CG_PUC_BASE + 0x140)	/* rlovhd[4:0], shpovhd[9:5], agrshpovhd[14:10] */
+#define CG_PUC_CTRL2		(CG_PUC_BASE + 0x144)	/* dft 0x03000000; pirovhd[4:0], pir_en[26] */
+#define CG_PUC_VOQFLUSH		(CG_PUC_BASE + 0x0dc)	/* voqid[7:0], tcontid[12:8], openpktflushen[16], start[31] */
+#define CG_PUC_VALID_VOQ0	(CG_PUC_BASE + 0x1bc)	/* valid_voqN = VALID_VOQ0 - (voq/32)*4 */
+#define CG_PUC_Q2PQSRCFG01	(CG_PUC_BASE + 0x230)	/* qm_rpt_lv0[15:0], lv1[31:16] */
+#define CG_PUC_Q2PQSRCFG23	(CG_PUC_BASE + 0x234)	/* qm_rpt_lv2[15:0], lv3[31:16] */
+#define CG_PUC_BMC_RX_PKT	(CG_PUC_BASE + 0x17c)	/* US frames received by the PUC */
+#define CG_PUC_BMC_RX_PKT_ENQ	(CG_PUC_BASE + 0x180)	/* US frames enqueued to a VoQ */
+#define CG_PUC_BMC_FORCE_DROP	(CG_PUC_BASE + 0x184)	/* US frames dropped (invalid VoQ) */
+#define CG_PUC_US_OMCI_HDR_A	(CG_PUC_BASE + 0x160)	/* gemid[7:0],cos[10:8],tcont[21:16],datapkt[30],en[31] */
+#define CG_PUC_US_OMCI_HP_HDR_A	(CG_PUC_BASE + 0x164)	/* gemid[7:0],cos[10:8],tcont[21:16] */
+#define CG_PUC_GLOBAL_PLOAM_CFG	(CG_PUC_BASE + 0x168)	/* us_hdr_min_size[21:16], us_ext_omci_en[31] */
+
+/* XGPN_PUCIF_CTRL (PON window + 0x4fe0, dft 0x1040a100): the PUC<->US-scheduler
+ * interface control; GPON sets cntr_inccfg=2 (clear-on-read) -> 0x5040a100. */
+#define CG_XGPN_PUCIF_CTRL	0x4fe0
+#define CG_XGPN_PUCIF_CTRL_VAL	0x5040a100
+
+#define CG_PUC_TCONT_NUM	32	/* AAL_GPON_SYSTEM_MAX_TCONT_NUM */
+#define CG_PUC_QUEUE_PER_TCONT	8	/* 8Q mode */
+#define CG_PUC_9TH_QUEUE_VOQ	127	/* the CPU high-prio inject VoQ (ldpid 0xf, cos 7) */
 /*
  * onu_cfg (hdr 0x118 -> silicon +0x138).  Top byte laser_on_align=0x12 aligns
  * the upstream laser burst to the OLT's grant window; at the reset default
@@ -337,6 +462,35 @@ struct cortina_gpon {
 	bool omcc_up;			/* OMCC channel bound + link signalled */
 	u16 omcc_alloc;			/* last alloc-id bound to T-CONT[0] */
 	u16 omcc_gem;			/* last omci_port.id bound to us-gem 0..7 */
+
+	/* DS OMCI receive (Stage B: count + decode-log; responder = Stage C) */
+	u32 omci_rx;			/* DS OMCI PDUs delivered by the NI CPU-RX hook */
+	u32 omci_rx_short;		/* runt PDUs (< 8 bytes, not decodable) */
+	bool pdc_ready;			/* PDC map + CTRL programmed */
+	bool puc_ready;			/* PUC US-VoQ admission programmed */
+
+	/* Stage C: the G.988 OMCI responder + US OMCI TX */
+	struct omci_onu *omci;		/* responder context (kzalloc'd at probe) */
+	spinlock_t omci_lock;		/* RX hook (softirq) vs isr_work/AVC work */
+	bool omci_active;		/* ctx armed (OMCC up) */
+	struct delayed_work veip_avc_work;	/* the ~31s post-O5 VEIP oper-up AVC */
+	u32 omci_tx;			/* US OMCI responses enqueued to the NI */
+	u32 omci_tx_fail;		/* NI TX rejected (ring/scratch busy) */
+	u32 omci_ds_crc_ok;		/* DS MIC self-check (first PDUs only) */
+	u32 omci_ds_crc_bad;
+
+	/* Stage D: the OLT-provisioned WAN data path.  The shadow (dt_/dg_)
+	 * survives an O5 exit so a LOS re-range where the OLT does NOT
+	 * re-provision still re-installs (the X111W fiber-pull lesson); an
+	 * on-wire MIB-Reset clears it (fresh provisioning follows). */
+	u16 dt_alloc;			/* data T-CONT alloc-id (OMCI Set/Create ME 262) */
+	u16 dt_inst;			/* ..the ME instance it came on */
+	u16 dg_gem;			/* data GEM port-id (OMCI Create ME 268 attr 1) */
+	u16 dg_tcont_ptr;		/* ME 268 attr 2 (diagnostic) */
+	u8 dg_dir;			/* ME 268 attr 3 direction (diagnostic) */
+	bool data_installed;
+	u32 omci_cfg_log;		/* config-ME body log budget used */
+	struct net_device *wan_ndev;	/* gpon0 */
 };
 
 static struct cortina_gpon *cg_singleton;
@@ -580,6 +734,267 @@ static void cg_laser_on(struct cortina_gpon *cg)
 	 * the net-level readback in /proc/gpon. */
 }
 
+/* One PDC map-memory entry write: DATA0/DATA1, then kick ACCESS, poll go. */
+static int cg_pdc_map_write(struct cortina_gpon *cg, u32 idx, u32 d0, u32 d1)
+{
+	int i;
+
+	writel(d0, cg->pon + CG_PDC_MAP_DATA0);
+	writel(d1, cg->pon + CG_PDC_MAP_DATA1);
+	writel(CG_TBL_GO | CG_TBL_WR | (idx & 0xff), cg->pon + CG_PDC_MAP_ACCESS);
+	for (i = 0; i < 10000; i++) {
+		if (!(readl(cg->pon + CG_PDC_MAP_ACCESS) & CG_TBL_GO))
+			return 0;
+	}
+	dev_warn(cg->dev, "PDC map[%u] write timed out\n", idx);
+	return -ETIMEDOUT;
+}
+
+/*
+ * PDC init (vendor __pdc_gpon_family_init): route the DS GEMs.  Without this
+ * the OMCC downstream GEM is de-encapsulated by the MAC (omci_port.en is
+ * HW-latched) but the resulting frame has no destination — DS OMCI never
+ * reaches the CPU and the OLT parks us Offline/"fail" with Received-OMCI=0.
+ * Entries 0..7 (OMCC-reserved internal GEMs) -> CPU port 0, forwarding-engine
+ * bypass, no-drop, cos 6, pol_id 0x80+idx (the 128..255 PON-DS policer bank);
+ * entries 8..255 (data GEMs) -> L3_WAN, pol_id idx-8 (refined per-GEM at the
+ * OMCI Create in Stage D).  Then PDC_CTRL: map-mem enable + the OMCI
+ * high-priority override (omci_hp: cos 7, ldpid CPU_0) — expected readback
+ * 0x02870002.  Runs once, after the puc/pdc reset release (PON_CNTL=0x30e at
+ * the tail of cg_psds_init), before the MAC is enabled (vendor
+ * __gpon_datapath_init order: ds_frame_thrsd -> pdc -> puc).
+ */
+static void cg_pdc_init(struct cortina_gpon *cg)
+{
+	u32 idx, d0, d1, ctrl;
+
+	for (idx = 0; idx < CG_PDC_MAP_ENTRIES; idx++) {
+		if (idx < CG_OMCC_US_GEM_IDX_NUM) {
+			d0 = CG_PDC_D0_COS(6) | CG_PDC_D0_LDPID(CG_LPORT_CPU_0) |
+			     CG_PDC_D0_LSPID(CG_LPORT_PON) |
+			     CG_PDC_D0_FE_BYPASS | CG_PDC_D0_NO_DROP;
+			d1 = CG_PDC_D1_POL_ID(idx + 0x80);
+		} else {
+			d0 = CG_PDC_D0_LDPID(CG_LPORT_L3_WAN) |
+			     CG_PDC_D0_LSPID(CG_LPORT_PON);
+			d1 = CG_PDC_D1_POL_ID(idx - 8);
+		}
+		if (cg_pdc_map_write(cg, idx, d0, d1))
+			return;
+	}
+
+	ctrl = readl(cg->pon + CG_PDC_CTRL);
+	ctrl &= ~CG_PDC_CTRL_HP_MASK;
+	ctrl |= CG_PDC_CTRL_MAP_MEM_EN | CG_PDC_CTRL_HP_EN |
+		(7 << CG_PDC_CTRL_HP_COS_SH) |
+		(CG_LPORT_CPU_0 << CG_PDC_CTRL_HP_LDPID_SH);
+	writel(ctrl, cg->pon + CG_PDC_CTRL);
+
+	cg->pdc_ready = true;
+	dev_info(cg->dev, "PDC: OMCC DS GEMs 0-7 -> CPU_0, ctrl=0x%08x\n",
+		 readl(cg->pon + CG_PDC_CTRL));
+}
+
+/* PUC indirect-table op: kick ACCESS (go[31] + rbw[30]=write + index), poll go. */
+static int cg_puc_ind_write(struct cortina_gpon *cg, u32 access_off, u32 index)
+{
+	int i;
+
+	writel(CG_TBL_GO | CG_TBL_WR | index, cg->pon + access_off);
+	for (i = 0; i < 10000; i++) {
+		if (!(readl(cg->pon + access_off) & CG_TBL_GO))
+			return 0;
+	}
+	dev_warn(cg->dev, "PUC indirect +0x%04x[%u] timed out\n", access_off, index);
+	return -ETIMEDOUT;
+}
+
+/* One PUC per-VoQ valid bit (PUC_valid_voqN, 256-bit mask across 8 regs). */
+static void cg_puc_voq_valid(struct cortina_gpon *cg, u32 voq, bool valid)
+{
+	u32 off = CG_PUC_VALID_VOQ0 - (voq / 32) * 4;
+	u32 v = readl(cg->pon + off);
+
+	if (valid)
+		v |= BIT(voq % 32);
+	else
+		v &= ~BIT(voq % 32);
+	writel(v, cg->pon + off);
+}
+
+/*
+ * Program one PUC pvtbl entry (per-T-CONT VoQ map) + its 8 VoQs' back-
+ * pressure remap and valid bits.  @ena gates the per-queue enable bit (bit 8
+ * of each 9-bit voqN field) and the valid-VoQ mask; the entry itself is
+ * always marked entryvld so the scheduler walks it.  voqN 9-bit fields are
+ * bit-split across the 5 DATA words exactly as the vendor packs them;
+ * schmode = 0 (strict priority), wrr weights 0.
+ */
+static int cg_puc_pvtbl_program(struct cortina_gpon *cg, u32 tcont, bool ena)
+{
+	void __iomem *pon = cg->pon;
+	u32 voq[CG_PUC_QUEUE_PER_TCONT];
+	u32 d0, d1, d2, q;
+
+	for (q = 0; q < CG_PUC_QUEUE_PER_TCONT; q++)
+		voq[q] = (q + tcont * CG_PUC_QUEUE_PER_TCONT) | ((u32)ena << 8);
+
+	d0 = voq[0] | (voq[1] << 9) | (voq[2] << 18) |
+	     ((voq[3] & 0x1f) << 27);
+	d1 = ((voq[3] >> 5) & 0xf) | (voq[4] << 4) | (voq[5] << 13) |
+	     (voq[6] << 22) | ((voq[7] & 1) << 31);
+	d2 = ((voq[7] >> 1) & 0xff) | BIT(12);	/* schmode=0, entryvld=1 */
+
+	writel(0, pon + CG_PUC_PVTBL_DATA4);
+	writel(0, pon + CG_PUC_PVTBL_DATA3);
+	writel(d2, pon + CG_PUC_PVTBL_DATA2);
+	writel(d1, pon + CG_PUC_PVTBL_DATA1);
+	writel(d0, pon + CG_PUC_PVTBL_DATA0);
+	if (cg_puc_ind_write(cg, CG_PUC_PVTBL_ACCESS, tcont))
+		return -ETIMEDOUT;
+
+	for (q = 0; q < CG_PUC_QUEUE_PER_TCONT; q++) {
+		u32 qid = q + tcont * CG_PUC_QUEUE_PER_TCONT;
+
+		if (qid <= 63) {
+			writel(qid & 0x7, pon + CG_PUC_VOQBPREMAP_DATA);
+			if (cg_puc_ind_write(cg, CG_PUC_VOQBPREMAP_ACCESS, qid))
+				return -ETIMEDOUT;
+		}
+		cg_puc_voq_valid(cg, qid, ena);
+	}
+	return 0;
+}
+
+/*
+ * Flush one T-CONT's 8 VoQs (PUC_VOQFLUSH: start + openpktflushen + tcontid +
+ * voqid, poll start self-clear) — the vendor aal_gpon_restore_tcont runs this
+ * after every CAM re-install ("workaround", aal_puc_voq_flush_by_idx) so a
+ * re-range doesn't burst frames queued before the link drop.  The vendor
+ * additionally brackets each flush with a VoQ drop-enable + pvtbl disable;
+ * ours flushes while gpon0's carrier is off (nothing enqueues), so the plain
+ * flush+poll suffices.
+ */
+static void cg_puc_voq_flush(struct cortina_gpon *cg, u32 tcont)
+{
+	u32 q, v;
+	int i;
+
+	for (q = 0; q < CG_PUC_QUEUE_PER_TCONT; q++) {
+		v = BIT(31) | BIT(16) | ((tcont & 0x1f) << 8) |
+		    ((tcont * CG_PUC_QUEUE_PER_TCONT + q) & 0xff);
+		writel(v, cg->pon + CG_PUC_VOQFLUSH);
+		for (i = 0; i < 10000; i++) {
+			if (!(readl(cg->pon + CG_PUC_VOQFLUSH) & BIT(31)))
+				break;
+			udelay(1);
+		}
+		if (i == 10000)
+			dev_warn(cg->dev, "VoQ %u flush timed out\n",
+				 tcont * CG_PUC_QUEUE_PER_TCONT + q);
+	}
+}
+
+/*
+ * PUC init (vendor aal_puc_init, GPON path) — the US admission plumbing that
+ * connects the CPU-injected DMA-LSO frame to the OMCC T-CONT / GEM-US burst.
+ * Without it the DMA-LSO ring drains but the frame lands in an unmapped,
+ * invalid VoQ and is dropped -> the OLT never receives our OMCI reply and
+ * loops its Get.  Run once, right after the PDC (vendor __gpon_datapath_init
+ * order), entirely in the PON+0x8000 sub-block (does not touch the MAC or the
+ * Ethernet datapath).  8Q VoQ mode: VoQID = {HdrA.ldpid[3:0], HdrA.cos[2:0]}.
+ * Only T-CONT 0 (the OMCC) has its 8 VoQs enabled; the CPU high-priority OMCI
+ * inject additionally uses the "9th queue" VoQ 127 (ldpid 0xf, cos 7).
+ */
+static void cg_puc_init(struct cortina_gpon *cg)
+{
+	void __iomem *pon = cg->pon;
+	u32 tcont, q, v;
+
+	/* clear the PUC interrupt-enable (vendor: PUC_PONCNTL_INTENABLE = 0) */
+	writel(0, pon + CG_PUC_PONCNTL_INTEN);
+
+	/* PUCCFG: inccfg=2 (clear-on-read), crccntl=2 (regenerate US CRC),
+	 * invalid_voqdrop_enable=1 (drop frames that hit an invalid VoQ) */
+	v = readl(pon + CG_PUC_PUCCFG);
+	v = (v & ~(GENMASK(18, 16) | GENMASK(1, 0))) | (2u << 16) | 2u;
+	v |= BIT(30);
+	writel(v, pon + CG_PUC_PUCCFG);
+
+	/* VoQ buffer limits (GPON scfg VOQBUFLIMIT A/B/C) + per-VoQ limit-select
+	 * (below 8 queues use A, 8..16 use B, >16 use C; all 256 -> A) */
+	writel(0x7a0, pon + CG_PUC_VOQBUFLIMIT_A);
+	writel(0x3b0, pon + CG_PUC_VOQBUFLIMIT_B);
+	writel(0x200, pon + CG_PUC_VOQBUFLIMIT_C);
+	for (q = 0; q < CG_PUC_VOQBUFLIMSEL_N; q++)
+		writel(0x55555555, pon + CG_PUC_VOQBUFLIMSEL0 + q * 4);
+
+	/* VoQ map mode = 8Q (voqmapsel = 0) */
+	writel(0, pon + CG_PUC_VOQMAPCFG);
+
+	/*
+	 * pvtbl: per-T-CONT VoQ map.  Only T-CONT 0 (OMCC) has queues enabled;
+	 * every entry is marked valid (entryvld) so the scheduler walks it.
+	 * voqN 9-bit field = queue_id | (enable << 8), bit-split across the 5
+	 * DATA words exactly as the vendor packs it.  schmode=0 (strict), SP
+	 * weights (wrr=0).  Also program the back-pressure remap (queue_id<=63:
+	 * tqmvoqid = queue_id & 7) and the per-VoQ valid bit.
+	 */
+	for (tcont = 0; tcont < CG_PUC_TCONT_NUM; tcont++)
+		if (cg_puc_pvtbl_program(cg, tcont, tcont == 0))
+			return;
+	/* the CPU high-priority OMCI inject rides the 9th queue (VoQ 127) */
+	cg_puc_voq_valid(cg, CG_PUC_9TH_QUEUE_VOQ, true);
+
+	/*
+	 * US OMCI header-A replacement: for an OMCI control frame (matched by
+	 * the GLOBAL_LNK_TYPE 0xfff1, HW reset default) the PUC stamps the OMCC
+	 * GEM index + CoS onto the upstream frame.  Normal: enable_replacement,
+	 * gemid=6, cos=6.  High-priority (the 9th-queue inject): gemid=7, cos=7.
+	 * us_ext_omci_en + us_hdr_min_size=30 accepts extended (>=14B) OMCI.
+	 */
+	writel(BIT(31) | (6u << 8) | 6u, pon + CG_PUC_US_OMCI_HDR_A);
+	writel((7u << 8) | 7u, pon + CG_PUC_US_OMCI_HP_HDR_A);
+	v = readl(pon + CG_PUC_GLOBAL_PLOAM_CFG);
+	v = (v & ~GENMASK(21, 16)) | (30u << 16) | BIT(31);
+	writel(v, pon + CG_PUC_GLOBAL_PLOAM_CFG);
+
+	/* back-pressure: drop off, bp on, threshold 0x100 */
+	v = readl(pon + CG_PUC_BPCNTL);
+	v = (v & ~(BIT(4) | GENMASK(30, 16))) | BIT(0) | (0x100u << 16);
+	writel(v, pon + CG_PUC_BPCNTL);
+
+	/* BTC (GPON): pfovrhd=5, schmode=FRAGMENT(0), wdaligned=0,
+	 * minrmnwindowsz=5, sch2en=1, lrgfrmfragen=1 (segment >4095B frames) */
+	v = readl(pon + CG_PUC_BTCCFG);
+	v = (v & ~GENMASK(5, 0)) | 5u;
+	v &= ~(BIT(8) | BIT(12));
+	v |= BIT(16) | BIT(25);
+	v = (v & ~GENMASK(31, 27)) | (5u << 27);
+	writel(v, pon + CG_PUC_BTCCFG);
+
+	/* QM<->PUC report-adjust levels (GPON) */
+	writel(0x00c80000, pon + CG_PUC_Q2PQSRCFG01);	/* lv0=0, lv1=0xc8 */
+	writel(0x05c201b8, pon + CG_PUC_Q2PQSRCFG23);	/* lv2=0x1b8, lv3=0x5c2 */
+
+	/* PUC<->US-scheduler interface: cntr clear-on-read */
+	writel(CG_XGPN_PUCIF_CTRL_VAL, pon + CG_XGPN_PUCIF_CTRL);
+
+	/* aggregate shaper + PIR (rate limiter off) */
+	v = readl(pon + CG_PUC_CTRL);
+	v = (v | BIT(30)) & ~BIT(26);	/* shp_en=1, rl_en=0 */
+	writel(v, pon + CG_PUC_CTRL);
+	writel(20u | (20u << 5) | (20u << 10), pon + CG_PUC_CTRL1);
+	v = readl(pon + CG_PUC_CTRL2);
+	v = (v & ~GENMASK(4, 0)) | 20u | BIT(26);	/* pirovhd=20, pir_en=1 */
+	writel(v, pon + CG_PUC_CTRL2);
+
+	cg->puc_ready = true;
+	dev_info(cg->dev,
+		 "PUC: OMCC T-CONT0 VoQs + 9th-queue enabled, puccfg=0x%08x pucif=0x%08x\n",
+		 readl(pon + CG_PUC_PUCCFG), readl(pon + CG_XGPN_PUCIF_CTRL));
+}
+
 /*
  * Program the GPON MAC identity + datapath, then start the activation FSM.  The
  * G.984.3 O1->O5 ranging runs in HARDWARE: once the serial number is programmed
@@ -640,7 +1055,16 @@ static void cg_mac_activate(struct cortina_gpon *cg)
 	 * 0x13880 -> +0xf0): REMOVED for the O1-stuck bisect 2026-07-15 --
 	 * restoring the exact 2026-07-13 working write-set.  Re-add only after
 	 * ranging is proven again, one write per boot. */
-	/* password / AES keys / gemport / PDC-PUC: deferred (not needed to range) */
+	/* PDC: route the OMCC DS GEMs to the CPU (Stage B — vendor
+	 * __gpon_datapath_init runs it right after the DS max_packet_size,
+	 * before the MAC enable).  Safe pre-range: it only writes the PDC
+	 * sub-block (+0x9000), not the MAC. */
+	cg_pdc_init(cg);
+	/* PUC (US-side): the CPU-inject OMCI admission -> OMCC T-CONT/GEM-US
+	 * burst.  Vendor __gpon_datapath_init runs aal_puc_init right after the
+	 * PDC.  Isolated to the PON+0x8000 sub-block; safe pre-range. */
+	cg_puc_init(cg);
+	/* password / AES keys: deferred (not needed to range) */
 
 	/* Wait for the downstream to lock (RGB8 bit15 BER_NOTIFY) before enabling
 	 * ranging, so the FSM sees a live downstream at the moment en is asserted. */
@@ -807,6 +1231,104 @@ static void cg_omcc_gem_bind(struct cortina_gpon *cg, u32 gem_id)
 		 CG_OMCC_US_GEM_IDX_NUM - 1, cg->omcc_gem);
 }
 
+/* DS GEM CAM: entry[GEM port-id] -> {intern gem index, vld} (vendor
+ * aal_gpon_ds_gem_port_set; the aes bit is set later on Encrypted_Port-ID) */
+static int cg_ds_gem_bind(struct cortina_gpon *cg, u32 gem_id, u32 idx)
+{
+	if (cg_tbl_op(cg, CG_REG_DS_GEM_ACCESS, gem_id & 0xfff))
+		return -ETIMEDOUT;
+	writel(CG_DS_GEM_VLD | CG_DS_GEM_INDEX(idx), cg->mac + CG_REG_DS_GEM_DATA);
+	return cg_tbl_op(cg, CG_REG_DS_GEM_ACCESS, CG_TBL_WR | (gem_id & 0xfff));
+}
+
+/*
+ * Stage D — install the OLT-provisioned WAN data path (idempotent; runs in
+ * the isr_work context so the indirect-table ops never race the OMCC binds).
+ * Needs the OMCC up (O5 + omci_port latched) and both halves of the OLT's
+ * provisioning snooped: the data alloc-id (ME 262) and the data GEM port-id
+ * (ME 268).  Everything is derived from those two values:
+ *   - T-CONT CAM[alloc]  -> hw T-CONT 1 (omci_en + ploam_en, vendor-faithful)
+ *   - US_PORT[8..15]     -> data GEM (VoQ==intern-gem-idx, 8Q map; the CPU
+ *                           injects on VoQ 8, binding all 8 queues is free)
+ *   - DS GEM CAM[gem]    -> intern idx 8;  CAM[4095 broadcast] -> idx 9
+ *   - PDC map[8]/map[9]  -> CPU port 0 (fe_bypass, no_drop; lspid = PON so
+ *                           the NI CPU-RX delivers to gpon0)
+ *   - PUC pvtbl[1] + valid VoQs 8..15, then the vendor voq_flush workaround
+ */
+static void cg_data_try_install(struct cortina_gpon *cg)
+{
+	u32 alloc = READ_ONCE(cg->dt_alloc);
+	u32 gem = READ_ONCE(cg->dg_gem);
+	u32 d, i;
+
+	if (cg->data_installed || !cg->omcc_up || !alloc || !gem)
+		return;
+
+	if (alloc == cg->omcc_alloc) {
+		/* single-alloc OLT: rebinding the CAM would steal the OMCC's
+		 * T-CONT (proven 9602C regression).  Leave the CAM alone and
+		 * warn — the data path then needs the ride-the-OMCC variant. */
+		dev_warn(cg->dev,
+			 "data alloc %u == OMCC alloc: NOT rebinding CAM (single-alloc OLT?)\n",
+			 alloc);
+	} else {
+		if (cg_tbl_op(cg, CG_REG_TCONT_ACCESS, alloc & 0xfff))
+			return;
+		d = readl(cg->mac + CG_REG_TCONT_DATA);
+		d &= ~CG_TCONT_INDEX_MASK;
+		d |= CG_TCONT_INDEX(CG_DATA_TCONT_IDX) |
+		     CG_TCONT_OMCI_EN | CG_TCONT_PLOAM_EN;
+		writel(d, cg->mac + CG_REG_TCONT_DATA);
+		if (cg_tbl_op(cg, CG_REG_TCONT_ACCESS, CG_TBL_WR | (alloc & 0xfff)))
+			return;
+	}
+
+	/* US: every VoQ of the data T-CONT stamps the data GEM port-id */
+	for (i = 0; i < CG_PUC_QUEUE_PER_TCONT; i++) {
+		u32 idx = CG_DATA_GEM_IDX + i;
+
+		if (cg_tbl_op(cg, CG_REG_US_PORT_ACCESS, idx))
+			return;
+		d = readl(cg->mac + CG_REG_US_PORT_DATA);
+		d = (d & ~0xfffu) | (gem & 0xfff);
+		writel(d, cg->mac + CG_REG_US_PORT_DATA);
+		if (cg_tbl_op(cg, CG_REG_US_PORT_ACCESS, CG_TBL_WR | idx))
+			return;
+	}
+
+	/* DS: unicast data GEM + the broadcast GEM (DHCP OFFER rides it) */
+	if (cg_ds_gem_bind(cg, gem, CG_DATA_GEM_IDX) ||
+	    cg_ds_gem_bind(cg, CG_MCAST_GEM_ID, CG_MCAST_GEM_IDX))
+		return;
+
+	/* PDC: both intern indices -> CPU port 0, forwarding-engine bypass,
+	 * lspid = PON (the NI CPU-RX WAN-delivery key) */
+	for (i = 0; i < 2; i++) {
+		u32 idx = CG_DATA_GEM_IDX + i;
+
+		if (cg_pdc_map_write(cg, idx,
+				     CG_PDC_D0_COS(0) |
+				     CG_PDC_D0_LDPID(CG_LPORT_CPU_0) |
+				     CG_PDC_D0_LSPID(CG_LPORT_PON) |
+				     CG_PDC_D0_FE_BYPASS | CG_PDC_D0_NO_DROP,
+				     CG_PDC_D1_POL_ID(idx)))
+			return;
+	}
+
+	/* PUC: enable the data T-CONT's VoQs, then the flush workaround */
+	if (cg_puc_pvtbl_program(cg, CG_DATA_TCONT_IDX, true))
+		return;
+	cg_puc_voq_flush(cg, CG_DATA_TCONT_IDX);
+
+	cg->data_installed = true;
+	dev_info(cg->dev,
+		 "DATA path UP: alloc %u -> T-CONT %u, gem %u (US VoQ %u, DS idx %u), bcast %u -> idx %u\n",
+		 alloc, CG_DATA_TCONT_IDX, gem, CG_DATA_GEM_IDX,
+		 CG_DATA_GEM_IDX, CG_MCAST_GEM_ID, CG_MCAST_GEM_IDX);
+	if (cg->wan_ndev)
+		netif_carrier_on(cg->wan_ndev);
+}
+
 /*
  * Datapath reset on O5 exit — STUB for this phase.  The vendor
  * aal_gpon_datapath_reset / drain_out flushes the GEM/T-CONT datapath so a
@@ -817,7 +1339,18 @@ static void cg_omcc_gem_bind(struct cortina_gpon *cg, u32 gem_id)
 static void cg_datapath_reset_stub(struct cortina_gpon *cg)
 {
 	cg->omcc_up = false;
-	dev_warn(cg->dev, "O5 exit: datapath reset (stub - GEM/T-CONT drain is next phase)\n");
+	/* disarm the responder: the next O5 re-inits it with a fresh MIB
+	 * (the OLT re-provisions after a deact/re-range) */
+	spin_lock_bh(&cg->omci_lock);
+	cg->omci_active = false;
+	spin_unlock_bh(&cg->omci_lock);
+	cancel_delayed_work(&cg->veip_avc_work);
+	/* data path down; the dt_/dg_ shadow SURVIVES so the O5 re-entry
+	 * re-installs even when the OLT does not re-provision (LOS re-range) */
+	cg->data_installed = false;
+	if (cg->wan_ndev)
+		netif_carrier_off(cg->wan_ndev);
+	dev_warn(cg->dev, "O5 exit: datapath reset (OMCC + data down, shadow kept)\n");
 }
 
 /* Try to bring the OMCC link up: needs O5 + HW-filled omci_port.en. */
@@ -835,9 +1368,238 @@ static void cg_omcc_try_up(struct cortina_gpon *cg, u8 state)
 	}
 	cg_omcc_gem_bind(cg, CG_OMCI_PORT_ID(omci_port));
 	cg->omcc_up = true;
-	/* OMCC link-up signal: the G.988 responder (next phase) keys off this */
 	dev_info(cg->dev, "OMCC link UP (alloc %u, gem %u) - ready for OMCI\n",
 		 cg->omcc_alloc, cg->omcc_gem);
+
+	/* Stage C: arm the G.988 responder on a fresh MIB.  SN = the PLOAM
+	 * identity programmed into the MAC ("XPON" + VSSN 5C6CAFCB).  The
+	 * MIB-Data-Sync seed 200 is a POISON: it must NOT match the OLT's
+	 * stored lsync, so its ME2 audit mismatches and it re-provisions from
+	 * MIB-Reset (the X111W warm-readmit lesson; the on-wire MIB-Reset
+	 * then zeroes it).  Also start the ~31s VEIP oper-up AVC timer. */
+	if (cg->omci) {
+		static const u8 sn[8] = {
+			'X', 'P', 'O', 'N', 0x5c, 0x6c, 0xaf, 0xcb
+		};
+
+		spin_lock_bh(&cg->omci_lock);
+		omci_onu_init(cg->omci, sn, 200);
+		cg->omci_active = true;
+		spin_unlock_bh(&cg->omci_lock);
+		schedule_delayed_work(&cg->veip_avc_work, 31 * HZ);
+		dev_info(cg->dev, "OMCI responder armed (%u MIB rows, mds seed 200)\n",
+			 cg->omci->nrows);
+	}
+}
+
+/*
+ * US OMCI TX (Stage C): the 48-byte PDU (trailer + MIC already stamped by
+ * the responder) goes out the NI DMA-LSO ring; the HW GEM-encapsulates it
+ * onto the OMCC upstream on the next matching BWmap grant.
+ */
+static void cg_omci_tx(struct cortina_gpon *cg, const u8 *pdu48)
+{
+	int ret = -ENODEV;
+
+	if (IS_REACHABLE(CONFIG_CORTINA_NI))
+		ret = cortina_ni_pon_tx(pdu48, OMCI_LEN);
+	if (ret) {
+		cg->omci_tx_fail++;
+		dev_warn_ratelimited(cg->dev, "US OMCI TX failed (%d)\n", ret);
+	} else {
+		cg->omci_tx++;
+	}
+}
+
+/* The ~31s post-O5 VEIP (ME 329) operational-up AVC: the OLT waits for it
+ * before marking the service matched/active (its Match State stays Initial
+ * until the ONU reports the WAN egress port up). */
+static void cg_veip_avc_work(struct work_struct *work)
+{
+	struct cortina_gpon *cg = container_of(to_delayed_work(work),
+					       struct cortina_gpon,
+					       veip_avc_work);
+	u8 frame[OMCI_LEN];
+	bool emit = false;
+
+	spin_lock_bh(&cg->omci_lock);
+	if (cg->omci_active && !cg->omci->avc_veip_up_sent) {
+		omci_onu_emit_veip_up_avc(cg->omci, frame);
+		emit = true;
+	}
+	spin_unlock_bh(&cg->omci_lock);
+	if (emit) {
+		cg_omci_tx(cg, frame);
+		dev_info(cg->dev, "VEIP oper-up AVC emitted (~31s post-O5)\n");
+	}
+}
+
+/*
+ * DS OMCI receive: the NI CPU-RX hook hands us each OMCI PDU (the 16-byte
+ * PON control header already stripped).  Decode-log (Stage B) + answer with
+ * the G.988 responder and TX the reply upstream (Stage C).  Runs in NAPI
+ * softirq context: no sleeping; the responder context is spinlocked against
+ * the isr_work/AVC-work writers.
+ *
+ * Baseline OMCI PDU layout (G.988, all big-endian byte math):
+ *   [0:1] TCI    [2] msg-type {AR=bit6, AK=bit5, MT=bits4:0}
+ *   [3]   device-id (0x0A = baseline)
+ *   [4:5] ME class    [6:7] ME instance
+ *   [8:39] contents   [40:47] trailer (incl. the 4-byte MIC/CRC)
+ */
+static void cg_rx_omci(const u8 *pdu, unsigned int len)
+{
+	struct cortina_gpon *cg = READ_ONCE(cg_singleton);
+	static const char *const mt_name[32] = {
+		[4] = "Create", [5] = "Delete", [8] = "Set", [9] = "Get",
+		[11] = "Get-all-alarms", [12] = "Get-all-alarms-next",
+		[13] = "MIB-upload", [14] = "MIB-upload-next",
+		[15] = "MIB-reset", [16] = "Alarm", [17] = "AVC", [18] = "Test",
+		[19] = "Start-SW-dl", [20] = "DL-section", [21] = "End-SW-dl",
+		[22] = "Activate-SW", [23] = "Commit-SW", [24] = "Sync-time",
+		[25] = "Reboot", [26] = "Get-next", [27] = "Test-result",
+		[28] = "Get-current-data", [29] = "Set-table",
+	};
+	const char *name;
+	u8 mt;
+
+	if (!cg)
+		return;
+	if (len < 8) {
+		cg->omci_rx_short++;
+		return;
+	}
+	cg->omci_rx++;
+
+	mt = pdu[2];
+	name = mt_name[mt & 0x1f] ? mt_name[mt & 0x1f] : "?";
+	/* log the first PDUs + then 1-in-64 (the MIB-upload walk is chatty) */
+	if (cg->omci_rx <= 24 || !(cg->omci_rx & 63))
+		dev_info(cg->dev,
+			 "DS OMCI #%u: len=%u tci=0x%02x%02x mt=%u(%s)%s%s dev=0x%02x me=%u/%u\n",
+			 cg->omci_rx, len, pdu[0], pdu[1], mt & 0x1f, name,
+			 (mt & BIT(6)) ? " AR" : "", (mt & BIT(5)) ? " AK" : "",
+			 pdu[3], (pdu[4] << 8) | pdu[5], (pdu[6] << 8) | pdu[7]);
+
+	/* DS MIC self-check on the first PDUs: decides the CRC-32 convention
+	 * against live OLT frames — the same convention our US MIC must use.
+	 * be = I.363.5/AAL5 (~crc32_be, the G.984.4 spec form, what the
+	 * responder emits); le = reflected zlib (what the 9602C SW path used).
+	 * Diagnostic only. */
+	if (len >= OMCI_LEN && cg->omci_ds_crc_ok + cg->omci_ds_crc_bad < 16) {
+		u32 want = ((u32)pdu[44] << 24) | ((u32)pdu[45] << 16) |
+			   ((u32)pdu[46] << 8) | pdu[47];
+		u32 be = ~crc32_be(~0u, pdu, 44);
+		u32 le = crc32_le(~0u, pdu, 44) ^ ~0u;
+
+		if (be == want)
+			cg->omci_ds_crc_ok++;
+		else
+			cg->omci_ds_crc_bad++;
+		if (cg->omci_rx <= 4)
+			dev_info(cg->dev, "DS OMCI MIC self-check: %s (want %08x be %08x le %08x)\n",
+				 be == want ? "AAL5-BE" :
+				 (le == want ? "ZLIB-LE" : "NEITHER"),
+				 want, be, le);
+	}
+
+	/* ---- Stage D: snoop the data-path-defining MEs (the responder still
+	 * answers them; the driver additionally installs the HW tables). ---- */
+	{
+		u16 class_id = ((u16)pdu[4] << 8) | pdu[5];
+		u16 inst = ((u16)pdu[6] << 8) | pdu[7];
+		u8 m = mt & 0x1f;
+		bool cfg = (m == 4 || m == 8 || m == 6);	/* Create/Set/Delete */
+
+		/* body dump of the datapath/bridging MEs (bounded budget) —
+		 * the live source of truth for what THIS OLT provisions */
+		if (cfg && cg->omci_cfg_log < 48 && len >= 24) {
+			switch (class_id) {
+			case 45: case 47: case 84: case 130: case 171:
+			case 262: case 266: case 268: case 277: case 280:
+			case 281: case 309: case 329:
+				cg->omci_cfg_log++;
+				dev_info(cg->dev,
+					 "OMCI cfg mt=%u me=%u/0x%04x body=%*phN\n",
+					 m, class_id, inst, 16, pdu + 8);
+				break;
+			}
+		}
+
+		/* ME 262 T-CONT: the data alloc-id.  Set carries {mask[8:9],
+		 * alloc[10:11] when attr-1 bit set}; a Create's SBC body has
+		 * alloc first.  The OMCC alloc (= onu-id) never comes here. */
+		if (class_id == 262 && len >= 12) {
+			u32 alloc = 0;
+
+			if (m == 8 && (((pdu[8] << 8) | pdu[9]) & 0x8000))
+				alloc = ((u16)pdu[10] << 8) | pdu[11];
+			else if (m == 4)
+				alloc = ((u16)pdu[8] << 8) | pdu[9];
+			if (alloc && alloc != 0xffff && alloc != cg->dt_alloc) {
+				WRITE_ONCE(cg->dt_alloc, alloc);
+				cg->dt_inst = inst;
+				dev_info(cg->dev,
+					 "OMCI: data T-CONT me-inst 0x%04x alloc-id %u\n",
+					 inst, alloc);
+				schedule_work(&cg->isr_work);
+			}
+		}
+
+		/* ME 268 GEM-port-network-CTP Create: SBC body = port-id[0:1],
+		 * T-CONT ptr[2:3], direction[4] (1=US, 2=DS, 3=bidirectional).
+		 * THE data GEM is the BIDIRECTIONAL one (this OLT: gem 223,
+		 * tcont-ptr 0x8000, dir 3).  The OLT also creates a DS-only
+		 * broadcast CTP FIRST (gem 4095, tcont-ptr 0, dir 2) — that
+		 * one is covered by the fixed CG_MCAST_GEM_ID install, so it
+		 * must never claim the data-GEM slot (live-proven ordering). */
+		if (class_id == 268 && m == 4 && len >= 13) {
+			u16 g = ((u16)pdu[8] << 8) | pdu[9];
+
+			if (g && g != cg->omcc_gem) {
+				if (pdu[12] == 3 && g != cg->dg_gem) {
+					WRITE_ONCE(cg->dg_gem, g);
+					cg->dg_tcont_ptr = ((u16)pdu[10] << 8) | pdu[11];
+					cg->dg_dir = pdu[12];
+					dev_info(cg->dev,
+						 "OMCI: data GEM port-id %u (tcont-ptr 0x%04x dir %u)\n",
+						 g, cg->dg_tcont_ptr, cg->dg_dir);
+					schedule_work(&cg->isr_work);
+				} else if (pdu[12] != 3) {
+					dev_info(cg->dev,
+						 "OMCI: uni-dir GEM CTP %u (dir %u) — not the data GEM\n",
+						 g, pdu[12]);
+				}
+			}
+		}
+
+		/* on-wire MIB-Reset: fresh provisioning follows — drop the
+		 * shadow so stale ids are never re-installed */
+		if (m == 15) {
+			WRITE_ONCE(cg->dt_alloc, 0);
+			WRITE_ONCE(cg->dg_gem, 0);
+			cg->data_installed = false;
+			if (cg->wan_ndev)
+				netif_carrier_off(cg->wan_ndev);
+		}
+	}
+
+	/* Stage C: answer with the responder + TX the reply upstream.  The
+	 * PDU is 48 bytes; clamp a padded frame so a Create body never
+	 * swallows trailing pad bytes. */
+	if (len > OMCI_LEN)
+		len = OMCI_LEN;
+	{
+		u8 resp[OMCI_LEN];
+		int n = 0;
+
+		spin_lock(&cg->omci_lock);
+		if (cg->omci_active)
+			n = omci_onu_input(cg->omci, pdu, len, resp);
+		spin_unlock(&cg->omci_lock);
+		if (n == OMCI_LEN)
+			cg_omci_tx(cg, resp);
+	}
 }
 
 /* Bottom half: drain the event ring and run the FSM tracker + OMCC binds. */
@@ -903,6 +1665,11 @@ static void cg_isr_work(struct work_struct *work)
 		if (ev.intr & (CG_INT_PORTID | CG_INT_ONU_ST_CHG))
 			cg_omcc_try_up(cg, ev.state);
 	}
+
+	/* Stage D: (re-)install the data path once the OMCC is up and both
+	 * provisioning halves are known (also re-run by cg_rx_omci kicking
+	 * this work when the OLT's ME 262/268 arrive). */
+	cg_data_try_install(cg);
 }
 
 /*
@@ -1064,6 +1831,75 @@ static void cg_intr_teardown(struct cortina_gpon *cg)
 	cancel_work_sync(&cg->isr_work);
 }
 
+/* ------------------------------------------------------------------ */
+/* gpon0 — the WAN netdev over the GPON data path (Stage D)            */
+/* ------------------------------------------------------------------ */
+
+static int cg_wan_open(struct net_device *ndev)
+{
+	struct cortina_gpon *cg = cg_singleton;
+
+	if (cg && cg->data_installed)
+		netif_carrier_on(ndev);
+	else
+		netif_carrier_off(ndev);
+	netif_start_queue(ndev);
+	return 0;
+}
+
+static int cg_wan_stop(struct net_device *ndev)
+{
+	netif_stop_queue(ndev);
+	return 0;
+}
+
+static netdev_tx_t cg_wan_xmit(struct sk_buff *skb, struct net_device *ndev)
+{
+	struct cortina_gpon *cg = cg_singleton;
+
+	if (!cg || !cg->data_installed || !IS_REACHABLE(CONFIG_CORTINA_NI)) {
+		ndev->stats.tx_dropped++;
+		dev_kfree_skb_any(skb);
+		return NETDEV_TX_OK;
+	}
+	return cortina_ni_pon_data_tx(skb, ndev);
+}
+
+static const struct net_device_ops cg_wan_ops = {
+	.ndo_open		= cg_wan_open,
+	.ndo_stop		= cg_wan_stop,
+	.ndo_start_xmit		= cg_wan_xmit,
+	.ndo_validate_addr	= eth_validate_addr,
+	.ndo_set_mac_address	= eth_mac_addr,
+};
+
+/* Register gpon0.  MAC = a locally-administered address one above eth0's
+ * (02:96:07:f0:00:01); per-board factory-MAC injection is the fleet TODO
+ * shared with eth0.  Carrier tracks the data-path install. */
+static void cg_wan_create(struct cortina_gpon *cg)
+{
+	static const u8 mac[ETH_ALEN] = { 0x02, 0x96, 0x07, 0xf0, 0x00, 0x02 };
+	struct net_device *ndev;
+
+	ndev = alloc_etherdev(0);
+	if (!ndev)
+		return;
+	strscpy(ndev->name, "gpon0", sizeof(ndev->name));
+	ndev->netdev_ops = &cg_wan_ops;
+	eth_hw_addr_set(ndev, mac);
+	SET_NETDEV_DEV(ndev, cg->dev);
+	netif_carrier_off(ndev);
+	if (register_netdev(ndev)) {
+		dev_warn(cg->dev, "gpon0 register failed - no WAN netdev\n");
+		free_netdev(ndev);
+		return;
+	}
+	cg->wan_ndev = ndev;
+	if (IS_REACHABLE(CONFIG_CORTINA_NI))
+		cortina_ni_pon_wan_ndev_set(ndev);
+	dev_info(cg->dev, "WAN netdev gpon0 registered (%pM)\n", mac);
+}
+
 /* Read the 4 ASCII bytes of the vendor-id register in wire order. */
 static void cg_read_vendor(struct cortina_gpon *cg, char out[5])
 {
@@ -1109,6 +1945,29 @@ static int cg_proc_show(struct seq_file *m, void *v)
 		   cg_state_name[cg->last_state & 7]);
 	seq_printf(m, "omcc           = %s (alloc=%u gem=%u)\n",
 		   cg->omcc_up ? "UP" : "down", cg->omcc_alloc, cg->omcc_gem);
+	seq_printf(m, "ds_omci_rx     = %u (short=%u)  pdc_ctrl = 0x%08x (%s, expect 0x02870002)\n",
+		   cg->omci_rx, cg->omci_rx_short, readl(cg->pon + CG_PDC_CTRL),
+		   cg->pdc_ready ? "programmed" : "NOT programmed");
+	seq_printf(m, "puc            = %s  us_rx=%u enq=%u drop=%u  pucif=0x%08x\n",
+		   cg->puc_ready ? "programmed" : "NOT programmed",
+		   readl(cg->pon + CG_PUC_BMC_RX_PKT),
+		   readl(cg->pon + CG_PUC_BMC_RX_PKT_ENQ),
+		   readl(cg->pon + CG_PUC_BMC_FORCE_DROP),
+		   readl(cg->pon + CG_XGPN_PUCIF_CTRL));
+	seq_printf(m, "omci_resp      = %s tx=%u fail=%u ds_crc ok=%u bad=%u",
+		   cg->omci_active ? "armed" : "off",
+		   cg->omci_tx, cg->omci_tx_fail,
+		   cg->omci_ds_crc_ok, cg->omci_ds_crc_bad);
+	if (cg->omci)
+		seq_printf(m, "  mds=%u store=%u avc=%u unhandled=%u",
+			   cg->omci->mds, cg->omci->store_n,
+			   cg->omci->avc_count, cg->omci->unhandled);
+	seq_putc(m, '\n');
+	seq_printf(m, "data           = %s alloc=%u (me 0x%04x) gem=%u (tcont-ptr 0x%04x dir %u) bcast=%u carrier=%d\n",
+		   cg->data_installed ? "INSTALLED" : "down",
+		   cg->dt_alloc, cg->dt_inst, cg->dg_gem, cg->dg_tcont_ptr,
+		   cg->dg_dir, CG_MCAST_GEM_ID,
+		   cg->wan_ndev ? netif_carrier_ok(cg->wan_ndev) : -1);
 	seq_printf(m, "omci_port      = 0x%08x (en=%d id=%u)\n",
 		   cg_mac_rd(cg, CG_REG_OMCI_PORT),
 		   !!(cg_mac_rd(cg, CG_REG_OMCI_PORT) & CG_OMCI_PORT_EN),
@@ -1234,6 +2093,15 @@ static int cortina_gpon_probe(struct platform_device *pdev)
 	cg->dev = dev;
 	cg->irq = -1;		/* until cg_intr_setup succeeds */
 
+	/* Stage C: the G.988 responder context — allocated up front so the
+	 * OMCC-up path (which can fire during the probe's ranging poll) only
+	 * ever initializes it, never allocates.  ~7 KB. */
+	spin_lock_init(&cg->omci_lock);
+	INIT_DELAYED_WORK(&cg->veip_avc_work, cg_veip_avc_work);
+	cg->omci = devm_kzalloc(dev, sizeof(*cg->omci), GFP_KERNEL);
+	if (!cg->omci)
+		dev_warn(dev, "no OMCI responder ctx - DS OMCI will not be answered\n");
+
 	/*
 	 * Map the whole 48 KiB PON window.  The window is a 40-bit AXI address
 	 * (0x4_F5500000); ioremap takes a 64-bit phys_addr_t so this is fine on
@@ -1326,6 +2194,12 @@ static int cortina_gpon_probe(struct platform_device *pdev)
 		dev_warn(dev, "vendor-id != \"XPON\" - PON window base may be wrong\n");
 
 	cg_singleton = cg;
+	/* Stage B: receive the DS OMCI PDUs the NI CPU-RX path classifies out
+	 * (ethertype 0xfff1).  Registered after cg_singleton so the handler
+	 * never sees a half-initialized context. */
+	if (IS_REACHABLE(CONFIG_CORTINA_NI))
+		cortina_ni_pon_rx_hook_set(cg_rx_omci);
+	cg_wan_create(cg);	/* Stage D: the gpon0 WAN netdev */
 	cg->proc = proc_create_data("gpon", 0644, NULL, &cg_proc_ops, cg);
 	platform_set_drvdata(pdev, cg);
 	dev_info(dev, "cortina-gpon phase-0 probe complete (/proc/gpon)\n");
@@ -1336,7 +2210,16 @@ static void cortina_gpon_remove(struct platform_device *pdev)
 {
 	struct cortina_gpon *cg = platform_get_drvdata(pdev);
 
+	if (IS_REACHABLE(CONFIG_CORTINA_NI)) {
+		cortina_ni_pon_wan_ndev_set(NULL);
+		cortina_ni_pon_rx_hook_set(NULL);
+	}
+	cancel_delayed_work_sync(&cg->veip_avc_work);
 	cg_intr_teardown(cg);
+	if (cg->wan_ndev) {
+		unregister_netdev(cg->wan_ndev);
+		free_netdev(cg->wan_ndev);
+	}
 	if (cg->proc)
 		proc_remove(cg->proc);
 	if (cg_singleton == cg)

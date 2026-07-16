@@ -12,3 +12,10 @@ config interface 'lan'
 	option proto 'static'
 	option ipaddr '192.168.1.1'
 	option netmask '255.255.255.0'
+
+# Stage D: gpon0 = the GPON WAN data path (cortina-gpon). Carrier comes up
+# when the OLT's OMCI provisioning (data T-CONT + GEM) is installed; netifd
+# then DHCPs the WAN lease (lab: 192.168.158.0/24 from hades).
+config interface 'wan'
+	option device 'gpon0'
+	option proto 'dhcp'
