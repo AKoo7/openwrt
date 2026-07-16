@@ -18,6 +18,17 @@ define Device/realtek_rtl9607f_x411axf
   #               them nf_conntrack/nf_nat) so the netfilter kernel side comes
   #               from the package KCONFIG, not hand-edited target config.
   #               Ships the standard /etc/config/firewall.
-  DEVICE_PACKAGES := dnsmasq firewall4
+  #   LuCI web UI (plain http on the LAN, same lean set proven on
+  #   realtek-luna/hsgq_x111w -- NOT the `luci` collection, which would drag in
+  #   luci-app-package-manager; no ssl/nginx variants on this lab HGU):
+  #     uhttpd uhttpd-mod-ubus - the web server on :80 + the ubus JSON-RPC
+  #                              bridge LuCI's client-side JS talks to
+  #     rpcd rpcd-mod-file     - the ubus RPC daemon backing session auth,
+  #                              uci access and file reads for the UI
+  #     luci-base luci-mod-admin-full luci-theme-bootstrap - the UI core,
+  #       the standard admin pages (status/system/network) and the theme
+  DEVICE_PACKAGES := dnsmasq firewall4 \
+	luci-base luci-mod-admin-full luci-theme-bootstrap \
+	uhttpd uhttpd-mod-ubus rpcd rpcd-mod-file
 endef
 TARGET_DEVICES += realtek_rtl9607f_x411axf
