@@ -189,6 +189,17 @@
 	gpon@f5500000 {
 		compatible = "realtek,rtl9607f-gpon";
 		reg = <0x04 0xf5500000 0x00 0xc000>;
+		/*
+		 * The GPON MAC has no dedicated GIC SPI: its int_top feeds
+		 * GLOBAL_PON_INTERRUPT_0 (GLB+0x180, PON_MACi bit0), which is
+		 * line 5 of the NE global sub-controller ne_ictl@0xf4320194
+		 * (cortina,per-ictl: +0 STATUS/+4 ENABLE), whose output is
+		 * GIC SPI 1 (stock DTB: ne_ictl interrupts = <0 1 4>, child
+		 * pon_ictl@0 interrupts = <5>).  We carry no per-ictl irqchip,
+		 * so the gpon driver takes GIC SPI 1 directly (IRQF_SHARED)
+		 * and manages the PON_MACe / ne_ictl-line-5 gates itself.
+		 */
+		interrupts = <0x00 0x01 0x04>;	/* GIC SPI 1, level-high (NE global) */
 	};
 
 	/*
