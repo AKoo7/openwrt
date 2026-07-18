@@ -64,6 +64,19 @@
 #define CG_PSDS_RGB8		0xa05c	/* DS-lock status; locked = (val & 0x9c01)==0x9c00 (stock 0x19c00) */
 #define CG_PSDS_GBOX_CTRL	0xa060	/* rx/tx bit-ordering[7:4]; stock=0x454.  WAS 0xa064 (stock=0) -> our US tx_bit_ordering never took -> OLT saw US LOS (live-diff 2026-07-13) */
 #define CG_PON_EPON_SPARE	0x01c8	/* EPON_GLB_SPARE_CFG (PON window); bit31 for GPON los-rst */
+/*
+ * PSDS internal analog-register indirect interface (the ~266-row CMU/PLL/CDR/TX
+ * profile is loaded through it).  Command word (+0xa088): bit31 = strobe,
+ * bit30 = write (else read), bits[11:0] = internal register index; write-data
+ * at +0xa08c, read-data at +0xa090.  The vendor aal_psds_reset CMU/PLL re-lock
+ * (cg_psds_relock) strobes internal reg CG_PSDS_CMU_IDX bits[7:4].
+ */
+#define CG_PSDS_IND_CMD		0xa088
+#define CG_PSDS_IND_WDATA	0xa08c
+#define CG_PSDS_IND_RDATA	0xa090
+#define CG_PSDS_IND_READ	0x80000000u	/* command: strobe, read */
+#define CG_PSDS_IND_WRITE	0xc0000000u	/* command: strobe, write */
+#define CG_PSDS_CMU_IDX		0x400		/* analog CMU reg; [7:4] = re-lock strobe */
 
 /*
  * GLB (global) PON/GPON reset & clock control window: phys 0x4_F4320000, 4 KiB.
@@ -474,6 +487,9 @@ struct cortina_gpon {
 	spinlock_t omci_lock;		/* RX hook (softirq) vs isr_work/AVC work */
 	bool omci_active;		/* ctx armed (OMCC up) */
 	struct delayed_work veip_avc_work;	/* the ~31s post-O5 VEIP oper-up AVC */
+	struct delayed_work coldstart_work;	/* stuck-O1 US-lock-miss recovery */
+	int coldstart_tries;		/* re-rolls THIS stuck episode (reset on leaving O1) */
+	u32 coldstart_rolls;		/* total re-rolls this power-on (/proc visibility) */
 	u32 omci_tx;			/* US OMCI responses enqueued to the NI */
 	u32 omci_tx_fail;		/* NI TX rejected (ring/scratch busy) */
 	u32 omci_ds_crc_ok;		/* DS MIC self-check (first PDUs only) */
@@ -489,6 +505,19 @@ struct cortina_gpon {
 	u16 dg_tcont_ptr;		/* ME 268 attr 2 (diagnostic) */
 	u8 dg_dir;			/* ME 268 attr 3 direction (diagnostic) */
 	bool data_installed;
+	/*
+	 * HW CAM identity currently ARMED in silicon for the data path, tracked
+	 * separately from the dt_/dg_ OLT-provisioned shadow above: what
+	 * cg_data_try_install last wrote into the T-CONT / DS-GEM / US-PORT CAMs.
+	 * A re-range/reconfig that installs a genuinely DIFFERENT alloc/gem must
+	 * invalidate these stale predecessors FIRST (cg_data_teardown, vendor
+	 * drain-then-clear order) so a reassigned alloc can never burst into
+	 * another ONU's grant slot; a same-{alloc,gem} state is left untouched
+	 * (no HW writes -> no re-provision churn, the proven fiber-pull path).
+	 * The OMCC's armed alloc is tracked by omcc_alloc above.
+	 */
+	u16 hw_data_alloc;		/* alloc-id armed -> hw T-CONT 1 (0 = none) */
+	u16 hw_data_gem;		/* GEM port-id armed in DS-GEM CAM + US_PORT (0 = none) */
 	u32 omci_cfg_log;		/* config-ME body log budget used */
 	struct net_device *wan_ndev;	/* gpon0 */
 };
@@ -683,6 +712,10 @@ MODULE_PARM_DESC(activate, "program the SN + start GPON ranging at probe (defaul
 static bool cg_do_bosa_init = true;
 module_param_named(bosa_init, cg_do_bosa_init, bool, 0444);
 MODULE_PARM_DESC(bosa_init, "program the GN25L95 BOSA laser driver over per_i2c before ranging (default on; off = no upstream burst, DS-side diagnostics only)");
+
+static bool cg_coldstart_wd = true;
+module_param_named(coldstart_wd, cg_coldstart_wd, bool, 0644);
+MODULE_PARM_DESC(coldstart_wd, "stuck-O1 recovery watchdog: re-roll the SerDes/laser bring-up while the FSM sits at O1 (default on; 0 = observe-only A/B baseline — flip live via /sys/module to recover a wedged boot in place)");
 
 /*
  * Enable the upstream laser.
@@ -1136,6 +1169,169 @@ static inline u32 cg_mac_rd(struct cortina_gpon *cg, u32 off)
 }
 
 /*
+ * Re-lock the PON-SerDes CMU/PLL (vendor aal_psds_reset).  At cold power-on the
+ * CMU can latch a metastable phase off the reference clock, so the upstream
+ * burst never frames: the ONU sits at O1 with the downstream locked and the OLT
+ * reports "Laser out".  Strobe the analog CMU field (PSDS internal register
+ * CG_PSDS_CMU_IDX bits[7:4]) through the vendor value sequence 0x8 -> 0xd ->
+ * 0x7 -> 0x0 with ~1 ms settles, then re-wait the RX/TX clock-ready (a05c bits
+ * 15/11 CKRDY_TX/10 CKRDY_RX set, bit0 RX_LOS clear; bit12 frame-lock is not
+ * required for the analog re-lock).  This is the dedicated re-lock the vendor
+ * runs on every GPON re-range/reconfigure, and the Cortina analog of the 9602C
+ * O3-entry TX-PLL relock.  It does NOT power-cycle the SerDes (POW_PCIX
+ * untouched), so the PON APB clock and the GPON MAC config are undisturbed.
+ */
+static void cg_psds_relock(struct cortina_gpon *cg)
+{
+	void __iomem *pon = cg->pon;
+	static const u8 seq[] = { 0x8, 0xd, 0x7, 0x0 };
+	u32 base;
+	int i, k;
+
+	/* read the current CMU reg (a088 read strobe -> a090), clear field [7:4] */
+	writel(CG_PSDS_IND_READ | CG_PSDS_CMU_IDX, pon + CG_PSDS_IND_CMD);
+	udelay(10);
+	base = readl(pon + CG_PSDS_IND_RDATA) & ~0xf0u;
+
+	/* strobe [7:4] = 8 -> d -> 7 -> 0, ~1 ms apart (aal_psds_reset) */
+	for (k = 0; k < ARRAY_SIZE(seq); k++) {
+		writel(base | ((u32)seq[k] << 4), pon + CG_PSDS_IND_WDATA);
+		writel(CG_PSDS_IND_WRITE | CG_PSDS_CMU_IDX, pon + CG_PSDS_IND_CMD);
+		mdelay(1);
+	}
+
+	/* re-wait the CMU/PLL lock (bounded ~1000 ms, as the vendor does) */
+	for (i = 0; i < 1001; i++) {
+		if ((readl(pon + CG_PSDS_RGB8) & 0x8c01) == 0x8c00)
+			break;
+		mdelay(1);
+	}
+	dev_info(cg->dev, "psds re-lock (8/d/7/0): base=0x%08x lock at %dms rgb8=0x%08x\n",
+		 base, i, readl(pon + CG_PSDS_RGB8));
+}
+
+/* Re-arm the GPON MAC's interrupt enables (the four W1C groups + int_top).  The
+ * GLB-level aggregation gates (PON_INTEN0 / NE_ICTL_EN) and the requested IRQ
+ * live outside the GTC block and survive a GTC reset, so a cold-start re-roll
+ * only needs to restore THIS.  Shared by cg_intr_setup() and the watchdog. */
+static void cg_mac_intr_arm(struct cortina_gpon *cg)
+{
+	static const struct { u32 sts, en, mask; } grp[4] = {
+		{ CG_REG_INT,  CG_REG_INT_EN,  CG_INT_EN_DEFAULT },
+		{ CG_REG_INT2, CG_REG_INT2_EN, 0 },
+		{ CG_REG_INT3, CG_REG_INT3_EN, 0 },
+		{ CG_REG_INT4, CG_REG_INT4_EN, 0 },
+	};
+	int i;
+
+	writel(0, cg->mac + CG_REG_INT_TOP_EN);
+	(void)readl(cg->mac + CG_REG_INT_TOP);		/* read-clear stale */
+	for (i = 0; i < 4; i++) {
+		writel(0, cg->mac + grp[i].en);
+		writel(grp[i].mask, cg->mac + grp[i].sts);	/* W1C stale */
+		writel(grp[i].mask, cg->mac + grp[i].en);
+	}
+	writel(CG_INT_TOP_EN_ALL, cg->mac + CG_REG_INT_TOP_EN);
+}
+
+/*
+ * Cold-start US-lock recovery watchdog.  G.984.3 O1->O5 ranging runs in
+ * hardware and post-probe servicing is purely interrupt-driven, so a boot that
+ * loses the cold-start analog lottery sits at O1 forever -- the upstream never
+ * bursts, the OLT reports "Laser out", and NO state-change event fires, so
+ * nothing re-runs.  Stock reaches O5 on 100% of cold boots, so this is ours.
+ *
+ * The stuck signature (captured live 2026-07-17): state O1, onu-id 0xff,
+ * us/t3_preamble = 0, ZERO MAC interrupts -- yet the downstream is LOCKED
+ * (rgb8 = 0x19c00, CKRDY_TX set, superframe advancing).  So the RX clock/PLL is
+ * fine; the metastable element is deeper (the gearbox/framer comes up such that
+ * frames sync but no DS PLOAM decodes, so the ONU never sees the ranging
+ * request and never bursts its serial number).  A CMU-only re-strobe does NOT
+ * clear it.  The reliable recovery is to re-run the WHOLE proven bring-up --
+ * cg_glb_reset() power-cycles the SerDes (POW_PCIX off->on) + re-asserts the
+ * GTC/gearbox resets, cg_psds_init() re-rolls the CMU/gearbox/framer from that
+ * clean state and re-fires the GTC sync edge -- then re-arm the MAC interrupts
+ * and re-assert the SN/ranging.  That is exactly the sequence that reaches O5 on
+ * ~71% of cold rolls, so each re-roll is a fresh independent attempt and a few
+ * converge to 100%.  A boot that has already left O1 (ranging is progressing) is
+ * never disturbed: the watchdog only re-rolls on the exact stuck signature
+ * (state O1 AND DS locked) and merely observes otherwise.  It does NOT stop at
+ * the first O5 -- cg_datapath_reset() re-arms it on every O5 exit so a LATER
+ * relapse into the stuck-O1 class is recovered too, and it NEVER gives up
+ * (past a fast-retry budget it just backs off; see below).
+ */
+/* Fast-retry budget per stuck-O1 EPISODE (resets whenever the FSM leaves O1):
+ * past it the watchdog WARNs once and backs off to a 60 s cadence — the RATE is
+ * bounded, the COUNT never is.  A re-roll at O1 is OLT-invisible (us=0, no
+ * laser before a grant), so retrying forever cannot hang or churn the PON, and
+ * the production bar (ship unattended for months, self-recover from ANY event
+ * with the OLT untouched) forbids a permanent stop: a transient that outlives
+ * any fixed cap — the OLT still in its ~150 s post-power-cycle settle, an
+ * admin-Inactive ONT, a churn-locked OLT opening no ranging window — must
+ * still recover the moment it clears (relock_rearm_test case [a]). */
+#define CG_COLD_FAST_TRIES	12
+static void cg_coldstart_work(struct work_struct *work)
+{
+	struct cortina_gpon *cg = container_of(to_delayed_work(work),
+					       struct cortina_gpon, coldstart_work);
+	u32 onu = cg_mac_rd(cg, CG_REG_GPON_ONU);
+	u32 rgb8 = readl(cg->pon + CG_PSDS_RGB8);
+	u8 state = CG_ONU_STATE(onu);
+	bool ds_locked = (rgb8 & 0x9c01) == 0x9c00;
+
+	if (state != 0) {			/* left O1: ranging is progressing */
+		cg->coldstart_tries = 0;	/* fresh episode = fresh fast budget */
+		if (state != CG_STATE_OPERATION)
+			schedule_delayed_work(&cg->coldstart_work, 5 * HZ);
+		/* O5 -> stop; cg_datapath_reset() re-arms this watchdog on any
+		 * O5 exit, so a LATER stuck-O1 (long-LOS laser cool-down, OLT
+		 * outage) is caught too (relock_rearm_test case [b]). */
+		return;
+	}
+	if (!ds_locked) {
+		/* No DS frame lock: the RX is still settling (cold boot) OR the
+		 * fiber is pulled / dark (LOS).  A re-roll helps NEITHER — there
+		 * is no downstream to frame — and would re-init the SerDes +
+		 * pulse the laser into a dark fiber and could disturb the proven
+		 * LOS/fiber-pull re-range.  The observed cold-start wedge ALWAYS
+		 * has DS LOCKED (rgb8=0x19c00), so only wait here: bounded rate,
+		 * never give up, until either light returns or DS locks. */
+		schedule_delayed_work(&cg->coldstart_work, 3 * HZ);
+		return;
+	}
+	/* state O1 with DS LOCKED = the stuck-O1 signature (no US PLOAM/burst). */
+	if (!cg_coldstart_wd) {
+		/* A/B baseline (coldstart_wd=0): observe the stuck-O1, never
+		 * re-roll — the pre-watchdog wedge.  Flipping the param live
+		 * (/sys/module/.../coldstart_wd) lets the SAME wedged boot then
+		 * recover, isolating the re-roll as the fix. */
+		schedule_delayed_work(&cg->coldstart_work, 16 * HZ);
+		return;
+	}
+	cg->coldstart_tries++;
+	cg->coldstart_rolls++;
+	if (cg->coldstart_tries == CG_COLD_FAST_TRIES)
+		dev_warn(cg->dev,
+			 "cold-start recovery: %d fast re-rolls, still O1 - backing off to 60s cadence, never stopping\n",
+			 cg->coldstart_tries);
+	dev_info(cg->dev,
+		 "cold-start stuck O1, DS locked but no PLOAM (onu=0x%08x rgb8=0x%08x us=0x%08x t3=0x%08x) - full SerDes re-roll #%u\n",
+		 onu, rgb8, cg_mac_rd(cg, CG_REG_US), cg_mac_rd(cg, CG_REG_T3_PREAMBLE),
+		 cg->coldstart_rolls);
+	/* re-run the whole proven bring-up = a fresh cold roll of the metastable
+	 * gearbox/framer + a clean SN/ranging re-arm.  Each attempt is
+	 * internally bounded (SerDes lock poll <=1 s, activate DS-wait <=8 s),
+	 * so the cadence below bounds the retry RATE; nothing bounds the count. */
+	cg_glb_reset(cg);
+	cg_psds_init(cg);
+	cg_mac_intr_arm(cg);	/* the GTC reset cleared the MAC int enables */
+	cg_mac_activate(cg);	/* re-config + re-assert onu_ctl.en (SN/ranging) */
+	schedule_delayed_work(&cg->coldstart_work,
+			      cg->coldstart_tries >= CG_COLD_FAST_TRIES ?
+			      60 * HZ : 16 * HZ);
+}
+
+/*
  * NOTE: do NOT read the TX-PLOAM MIB (indirect ACCESS/DATA pair at +0x184/
  * +0x188) from the driver.  Kicking that engine (go-bit write + busy-poll)
  * during activation wedges the PON PLOAM engine and pins the FSM at
@@ -1185,25 +1381,60 @@ static int cg_tbl_op(struct cortina_gpon *cg, u32 access_reg, u32 cmd)
 }
 
 /*
+ * Invalidate a stale T-CONT CAM entry: RMW-clear omci_en + ploam_en and zero
+ * the hw-T-CONT index for alloc-id `alloc` (vendor aal_gpon_tcont_set with
+ * en=0).  Read-modify-write so unrelated bits are preserved.  Called when a
+ * genuinely different alloc/onu-id REPLACES a live binding, so a grant now
+ * addressed to a reassigned alloc no longer makes this ONU burst.
+ */
+static void cg_tcont_unbind(struct cortina_gpon *cg, u32 alloc)
+{
+	u32 d;
+
+	alloc &= 0xfff;
+	if (cg_tbl_op(cg, CG_REG_TCONT_ACCESS, alloc))
+		return;
+	d = readl(cg->mac + CG_REG_TCONT_DATA);
+	d &= ~(CG_TCONT_OMCI_EN | CG_TCONT_PLOAM_EN | CG_TCONT_INDEX_MASK);
+	writel(d, cg->mac + CG_REG_TCONT_DATA);
+	if (cg_tbl_op(cg, CG_REG_TCONT_ACCESS, CG_TBL_WR | alloc))
+		return;
+	dev_info(cg->dev, "T-CONT CAM[alloc %u] invalidated (stale)\n", alloc);
+}
+
+/*
  * Bind the OMCC to the T-CONT table: entry[alloc-id = onu-id] -> hw T-CONT 0
  * with omci_en + ploam_en (the G.984.3 default alloc-id == onu-id carries the
  * OMCC).  Read-modify-write of the indirect entry, exactly the vendor
  * aal_gpon_omcc_tcont_enable -> aal_gpon_tcont_set sequence.
+ *
+ * Stale-CAM guard: if a genuinely DIFFERENT onu-id/alloc replaces the OMCC
+ * binding (an OLT-driven onu-id change), invalidate the stale predecessor
+ * FIRST so the old CAM entry can never burst into a reassigned grant slot once
+ * we re-enter O5.  This runs during ranging (Assign_ONU-ID is an O4 PLOAM), so
+ * the OMCC CAM is corrected BEFORE Operation.  A same-id re-range takes neither
+ * branch — the entry already carries this binding, and re-writing the same
+ * value is the existing proven idempotent path (no teardown, no churn).
  */
 static void cg_omcc_tcont_bind(struct cortina_gpon *cg, u32 alloc_id)
 {
+	u16 old = cg->omcc_alloc;
 	u32 d;
 
-	if (cg_tbl_op(cg, CG_REG_TCONT_ACCESS, alloc_id & 0xfff))
+	alloc_id &= 0xfff;
+	if (old != 0 && old != alloc_id)
+		cg_tcont_unbind(cg, old);	/* invalidate the stale OMCC entry */
+
+	if (cg_tbl_op(cg, CG_REG_TCONT_ACCESS, alloc_id))
 		return;
 	d = readl(cg->mac + CG_REG_TCONT_DATA);
 	d &= ~CG_TCONT_INDEX_MASK;			/* index = 0 (OMCC T-CONT) */
 	d |= CG_TCONT_OMCI_EN | CG_TCONT_PLOAM_EN;
 	writel(d, cg->mac + CG_REG_TCONT_DATA);
-	if (cg_tbl_op(cg, CG_REG_TCONT_ACCESS, CG_TBL_WR | (alloc_id & 0xfff)))
+	if (cg_tbl_op(cg, CG_REG_TCONT_ACCESS, CG_TBL_WR | alloc_id))
 		return;
 
-	cg->omcc_alloc = alloc_id & 0xfff;
+	cg->omcc_alloc = alloc_id;
 	dev_info(cg->dev, "OMCC: T-CONT[0] bound to alloc-id %u\n", cg->omcc_alloc);
 }
 
@@ -1241,6 +1472,63 @@ static int cg_ds_gem_bind(struct cortina_gpon *cg, u32 gem_id, u32 idx)
 	return cg_tbl_op(cg, CG_REG_DS_GEM_ACCESS, CG_TBL_WR | (gem_id & 0xfff));
 }
 
+/* Invalidate a DS GEM CAM entry: clear the valid bit (and index) for GEM
+ * port-id `gem_id` (vendor aal_gpon_ds_gem_port_set with vld=0), so a
+ * reassigned DS GEM no longer routes into this ONU's de-encap path. */
+static int cg_ds_gem_unbind(struct cortina_gpon *cg, u32 gem_id)
+{
+	if (cg_tbl_op(cg, CG_REG_DS_GEM_ACCESS, gem_id & 0xfff))
+		return -ETIMEDOUT;
+	writel(0, cg->mac + CG_REG_DS_GEM_DATA);	/* vld=0, index=0 */
+	return cg_tbl_op(cg, CG_REG_DS_GEM_ACCESS, CG_TBL_WR | (gem_id & 0xfff));
+}
+
+/*
+ * Tear down the currently-armed WAN data path in the vendor drain-then-clear
+ * order (aal_gpon_datapath_reset -> aal_puc_voq_flush drain_out): disable the
+ * data T-CONT's VoQs and flush them FIRST (so the scheduler stops draining
+ * before the CAM changes underneath it), THEN clear the US GEM port stamps, the
+ * DS GEM CAM (unicast + broadcast), and finally invalidate the data T-CONT CAM
+ * entry.  Keyed on the ARMED identity (hw_data_alloc / hw_data_gem); the CALLER
+ * decides WHEN this fires (only a genuine alloc/gem change or an OLT deprovision
+ * — never a same-{alloc,gem} re-range).  Runs in the isr_work context.
+ */
+static void cg_data_teardown(struct cortina_gpon *cg)
+{
+	u32 i;
+
+	/* 1. drain/disable the data T-CONT's VoQs before touching the CAM */
+	cg_puc_pvtbl_program(cg, CG_DATA_TCONT_IDX, false);
+	cg_puc_voq_flush(cg, CG_DATA_TCONT_IDX);
+
+	/* 2. clear the US GEM port stamps for the data VoQs (8..15) */
+	for (i = 0; i < CG_PUC_QUEUE_PER_TCONT; i++) {
+		u32 idx = CG_DATA_GEM_IDX + i;
+
+		if (cg_tbl_op(cg, CG_REG_US_PORT_ACCESS, idx))
+			break;
+		writel(0, cg->mac + CG_REG_US_PORT_DATA);
+		if (cg_tbl_op(cg, CG_REG_US_PORT_ACCESS, CG_TBL_WR | idx))
+			break;
+	}
+
+	/* 3. invalidate the DS GEM CAM (unicast data GEM + the broadcast GEM) */
+	if (cg->hw_data_gem)
+		cg_ds_gem_unbind(cg, cg->hw_data_gem);
+	cg_ds_gem_unbind(cg, CG_MCAST_GEM_ID);
+
+	/* 4. finally invalidate the data T-CONT CAM entry — but NEVER the OMCC's:
+	 * on a single-alloc OLT the data path rides the OMCC alloc and its
+	 * T-CONT (index 0) must stay armed for OMCI/PLOAM. */
+	if (cg->hw_data_alloc && cg->hw_data_alloc != cg->omcc_alloc)
+		cg_tcont_unbind(cg, cg->hw_data_alloc);
+
+	dev_info(cg->dev, "data path torn down (alloc %u, gem %u): VoQs drained, CAM cleared\n",
+		 cg->hw_data_alloc, cg->hw_data_gem);
+	cg->hw_data_alloc = 0;
+	cg->hw_data_gem = 0;
+}
+
 /*
  * Stage D — install the OLT-provisioned WAN data path (idempotent; runs in
  * the isr_work context so the indirect-table ops never race the OMCC binds).
@@ -1254,6 +1542,12 @@ static int cg_ds_gem_bind(struct cortina_gpon *cg, u32 gem_id, u32 idx)
  *   - PDC map[8]/map[9]  -> CPU port 0 (fe_bypass, no_drop; lspid = PON so
  *                           the NI CPU-RX delivers to gpon0)
  *   - PUC pvtbl[1] + valid VoQs 8..15, then the vendor voq_flush workaround
+ *
+ * Stale-CAM guard: if the OLT-provisioned {alloc, gem} shadow no longer matches
+ * what is ARMED (a WAN service reconfig, or a wipe via on-wire MIB-Reset), tear
+ * the stale HW path down FIRST so a reassigned alloc/gem can never burst; a
+ * same-{alloc,gem} state matches exactly and takes no branch (no HW writes ->
+ * no re-provision churn — the proven LOS/fiber-pull keep-path).
  */
 static void cg_data_try_install(struct cortina_gpon *cg)
 {
@@ -1261,7 +1555,17 @@ static void cg_data_try_install(struct cortina_gpon *cg)
 	u32 gem = READ_ONCE(cg->dg_gem);
 	u32 d, i;
 
-	if (cg->data_installed || !cg->omcc_up || !alloc || !gem)
+	if (!cg->omcc_up)
+		return;
+
+	if (cg->hw_data_alloc &&
+	    (cg->hw_data_alloc != (alloc & 0xfff) ||
+	     cg->hw_data_gem != (gem & 0xfff))) {
+		cg_data_teardown(cg);
+		cg->data_installed = false;
+	}
+
+	if (cg->data_installed || !alloc || !gem)
 		return;
 
 	if (alloc == cg->omcc_alloc) {
@@ -1321,6 +1625,8 @@ static void cg_data_try_install(struct cortina_gpon *cg)
 	cg_puc_voq_flush(cg, CG_DATA_TCONT_IDX);
 
 	cg->data_installed = true;
+	cg->hw_data_alloc = alloc & 0xfff;	/* record the armed identity so a */
+	cg->hw_data_gem = gem & 0xfff;		/* later reconfig can invalidate it */
 	dev_info(cg->dev,
 		 "DATA path UP: alloc %u -> T-CONT %u, gem %u (US VoQ %u, DS idx %u), bcast %u -> idx %u\n",
 		 alloc, CG_DATA_TCONT_IDX, gem, CG_DATA_GEM_IDX,
@@ -1330,13 +1636,28 @@ static void cg_data_try_install(struct cortina_gpon *cg)
 }
 
 /*
- * Datapath reset on O5 exit — STUB for this phase.  The vendor
- * aal_gpon_datapath_reset / drain_out flushes the GEM/T-CONT datapath so a
- * re-range doesn't burst stale frames; ours will do that when the data-plane
- * GEM/T-CONT phase lands.  For now just drop the OMCC-link state so the next
- * O5 re-binds cleanly.
+ * Datapath reset on O5 exit.  Drops the soft link state so the next O5 re-binds
+ * cleanly, and — crucially — does NOT tear the HW T-CONT/GEM CAM down here.
+ *
+ * WHY the CAM teardown is NOT unconditional at O5 exit:  the OLT does not
+ * re-send Assign_Alloc-ID on a plain LOS/fiber-pull re-range and keeps the ONU
+ * provisioned, so clearing the CAM on every exit would (a) force a needless
+ * re-provision = the LOAi churn the alloc-reuse path fixed, and (b) regress the
+ * proven 30/30 fiber-pull / 5/5 cold-boot keep-path.  At exit we also don't yet
+ * know whether the next O5 carries the SAME or a DIFFERENT alloc/gem/onu-id.
+ *
+ * So the stale-CAM invalidation is instead deferred to the exact point a
+ * genuinely DIFFERENT identity REPLACES the armed one (vendor
+ * aal_gpon_datapath_reset semantics, applied surgically):
+ *   - OMCC alloc / onu-id change  -> cg_omcc_tcont_bind invalidates the old
+ *     entry during ranging (Assign_ONU-ID is an O4 PLOAM, i.e. BEFORE O5);
+ *   - data alloc/gem change or an on-wire MIB-Reset wipe -> cg_data_try_install
+ *     detects the armed-vs-provisioned mismatch and runs cg_data_teardown
+ *     (drain-then-clear) before re-installing.
+ * A same-{alloc,gem,onu-id} re-range matches on both paths and writes no HW —
+ * byte-for-byte the proven keep-path.
  */
-static void cg_datapath_reset_stub(struct cortina_gpon *cg)
+static void cg_datapath_reset(struct cortina_gpon *cg)
 {
 	cg->omcc_up = false;
 	/* disarm the responder: the next O5 re-inits it with a fresh MIB
@@ -1345,12 +1666,22 @@ static void cg_datapath_reset_stub(struct cortina_gpon *cg)
 	cg->omci_active = false;
 	spin_unlock_bh(&cg->omci_lock);
 	cancel_delayed_work(&cg->veip_avc_work);
-	/* data path down; the dt_/dg_ shadow SURVIVES so the O5 re-entry
-	 * re-installs even when the OLT does not re-provision (LOS re-range) */
+	/* data path link down; the dt_/dg_ shadow AND the hw_data_* armed
+	 * identity SURVIVE so the O5 re-entry re-installs even when the OLT does
+	 * not re-provision (LOS re-range), and a genuine reconfig can still tell
+	 * armed-vs-new apart to invalidate only the stale entry. */
 	cg->data_installed = false;
 	if (cg->wan_ndev)
 		netif_carrier_off(cg->wan_ndev);
-	dev_warn(cg->dev, "O5 exit: datapath reset (OMCC + data down, shadow kept)\n");
+	/* Re-arm the stuck-O1 recovery watchdog: the analog lock can be LOST
+	 * mid-uptime (long-LOS laser cool-down, OLT outage, EMI) and the ensuing
+	 * re-range can then wedge at O1 with no further events — the same
+	 * cold-start signature, needing the same recovery (relock_rearm_test
+	 * case [b]).  Fresh episode = fresh fast-retry budget; 15 s grace so a
+	 * healthy re-range (which leaves O1 in seconds) is never disturbed. */
+	cg->coldstart_tries = 0;
+	schedule_delayed_work(&cg->coldstart_work, 15 * HZ);
+	dev_warn(cg->dev, "O5 exit: datapath reset (OMCC + data down, CAM shadow kept)\n");
 }
 
 /* Try to bring the OMCC link up: needs O5 + HW-filled omci_port.en. */
@@ -1573,14 +1904,19 @@ static void cg_rx_omci(const u8 *pdu, unsigned int len)
 			}
 		}
 
-		/* on-wire MIB-Reset: fresh provisioning follows — drop the
-		 * shadow so stale ids are never re-installed */
+		/* on-wire MIB-Reset: the OLT voided our provisioning.  Drop the
+		 * shadow so stale ids are never re-installed, and kick isr_work
+		 * so cg_data_try_install invalidates the now-stale HW data CAM
+		 * (armed hw_data_* != wiped shadow) in process context — closing
+		 * the window where a reassigned alloc could burst before fresh
+		 * provisioning arrives. */
 		if (m == 15) {
 			WRITE_ONCE(cg->dt_alloc, 0);
 			WRITE_ONCE(cg->dg_gem, 0);
 			cg->data_installed = false;
 			if (cg->wan_ndev)
 				netif_carrier_off(cg->wan_ndev);
+			schedule_work(&cg->isr_work);
 		}
 	}
 
@@ -1637,7 +1973,7 @@ static void cg_isr_work(struct work_struct *work)
 			    (last == CG_STATE_POPUP && ev.state != CG_STATE_OPERATION &&
 			     ev.state != CG_STATE_RANGING) ||
 			    ev.state == CG_STATE_ESTOP)
-				cg_datapath_reset_stub(cg);
+				cg_datapath_reset(cg);
 			cg->last_state = ev.state;
 		}
 
@@ -1768,14 +2104,8 @@ static irqreturn_t cg_isr(int irq, void *data)
  */
 static int cg_intr_setup(struct cortina_gpon *cg, struct platform_device *pdev)
 {
-	static const struct { u32 sts, en, mask; } grp[4] = {
-		{ CG_REG_INT,  CG_REG_INT_EN,  CG_INT_EN_DEFAULT },
-		{ CG_REG_INT2, CG_REG_INT2_EN, 0 },
-		{ CG_REG_INT3, CG_REG_INT3_EN, 0 },
-		{ CG_REG_INT4, CG_REG_INT4_EN, 0 },
-	};
 	u32 v;
-	int i, ret;
+	int ret;
 
 	spin_lock_init(&cg->evt_lock);
 	INIT_WORK(&cg->isr_work, cg_isr_work);
@@ -1794,14 +2124,7 @@ static int cg_intr_setup(struct cortina_gpon *cg, struct platform_device *pdev)
 		return ret;
 	}
 
-	writel(0, cg->mac + CG_REG_INT_TOP_EN);
-	(void)readl(cg->mac + CG_REG_INT_TOP);		/* read-clear stale */
-	for (i = 0; i < 4; i++) {
-		writel(0, cg->mac + grp[i].en);
-		writel(grp[i].mask, cg->mac + grp[i].sts);	/* W1C stale */
-		writel(grp[i].mask, cg->mac + grp[i].en);
-	}
-	writel(CG_INT_TOP_EN_ALL, cg->mac + CG_REG_INT_TOP_EN);
+	cg_mac_intr_arm(cg);	/* the four MAC int groups + int_top */
 
 	/* GLB aggregation: PON_MACe (level 1) + ne_ictl line 5 (level 2).
 	 * RMW set only our bits — other ne_ictl lines belong to the NI. */
@@ -1989,6 +2312,13 @@ static int cg_proc_show(struct seq_file *m, void *v)
 	/* serdes/gearbox/laser (PON-window raw offsets, for US-LOS diagnosis) */
 	seq_puts(m, "-- serdes/gbox/laser --\n");
 	seq_printf(m, "rgb8(a05c)     = 0x%08x  (DS-lock: (v&0x9c01)==0x9c00)\n", readl(cg->pon + 0xa05c));
+	/* PSDS internal CMU reg 0x400 (indirect read strobe -> a090; the re-lock
+	 * strobe target).  a08c shown too to disambiguate the read-data register. */
+	writel(CG_PSDS_IND_READ | CG_PSDS_CMU_IDX, cg->pon + CG_PSDS_IND_CMD);
+	udelay(10);
+	seq_printf(m, "cmu[0x400]     = a090=0x%08x a08c=0x%08x  (re-lock strobes [7:4]; coldstart re-rolls=%u episode=%d)\n",
+		   readl(cg->pon + CG_PSDS_IND_RDATA), readl(cg->pon + CG_PSDS_IND_WDATA),
+		   cg->coldstart_rolls, cg->coldstart_tries);
 	seq_printf(m, "gbox(a060)     = 0x%08x  (stock 0x454 rx/tx bit-order)\n", readl(cg->pon + 0xa060));
 	seq_printf(m, "reg(a064)      = 0x%08x  (stock 0)\n", readl(cg->pon + 0xa064));
 	seq_printf(m, "reg(a068)      = 0x%08x  (stock 1)\n", readl(cg->pon + 0xa068));
@@ -2057,6 +2387,12 @@ static ssize_t cg_proc_write(struct file *file, const char __user *ubuf,
 		cg_bosa_dump(cg->dev);
 		return len;
 	}
+	/* manual SerDes CMU re-lock (the cold-start recovery primitive) -- for
+	 * validating it is non-destructive on a good O5 boot before relying on it */
+	if (strcmp(p, "relock") == 0) {
+		cg_psds_relock(cg);
+		return len;
+	}
 	if (strncmp(p, "mib ", 4) != 0 || kstrtou32(strim(p + 4), 16, &sel))
 		return -EINVAL;
 
@@ -2101,6 +2437,7 @@ static int cortina_gpon_probe(struct platform_device *pdev)
 	 * ever initializes it, never allocates.  ~7 KB. */
 	spin_lock_init(&cg->omci_lock);
 	INIT_DELAYED_WORK(&cg->veip_avc_work, cg_veip_avc_work);
+	INIT_DELAYED_WORK(&cg->coldstart_work, cg_coldstart_work);
 	cg->omci = devm_kzalloc(dev, sizeof(*cg->omci), GFP_KERNEL);
 	if (!cg->omci)
 		dev_warn(dev, "no OMCI responder ctx - DS OMCI will not be answered\n");
@@ -2161,6 +2498,12 @@ static int cortina_gpon_probe(struct platform_device *pdev)
 				int i;
 
 				cg_mac_activate(cg);
+				/* Arm the cold-start US-lock recovery watchdog: if the
+				 * HW ranging FSM is still stuck at O1 after a grace
+				 * period (the cold TX-PLL metastability), re-lock the
+				 * SerDes CMU and re-arm ranging until it advances -- so
+				 * every cold boot reaches O5 (stock does, 100%). */
+				schedule_delayed_work(&cg->coldstart_work, 15 * HZ);
 				dev_info(dev, "activate: onu_cfg=0x%08x onu_ctl=0x%08x gpon_ds=0x%08x\n",
 					 cg_mac_rd(cg, CG_REG_ONU_CFG_REAL),
 					 cg_mac_rd(cg, CG_REG_ONU_CTL),
@@ -2218,6 +2561,7 @@ static void cortina_gpon_remove(struct platform_device *pdev)
 		cortina_ni_pon_rx_hook_set(NULL);
 	}
 	cancel_delayed_work_sync(&cg->veip_avc_work);
+	cancel_delayed_work_sync(&cg->coldstart_work);
 	cg_intr_teardown(cg);
 	if (cg->wan_ndev) {
 		unregister_netdev(cg->wan_ndev);
