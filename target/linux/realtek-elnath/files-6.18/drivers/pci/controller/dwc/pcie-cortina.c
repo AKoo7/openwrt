@@ -151,6 +151,8 @@ struct cortina_pcie {
 	struct cortina_serdes_cfg *cfg;
 	int cfg_cnt;
 
+	struct proc_dir_entry *dbg_pde;	/* per-controller /proc spy entry */
+
 	u32 idx;
 	u8 lanes;
 };
@@ -421,13 +423,14 @@ static int cortina_pcie_parse_serdes_cfg(struct cortina_pcie *cp)
 #define CA_PHY_ISO_POWER_GOLD	0xF0FD318Cu	/* 0x39c: lanes powered / de-isolated */
 
 /*
- * pcie0 / SerDes S0 (5 GHz) precondition.  Stock brings pcie0/S0 up BEFORE
- * pcie2; its 2-lane LONG RX-cal (k0 @0x91324c) warms the SHARED SerDes analog
+ * pcie0 / SerDes S0 (5 GHz) bring-up.  Stock brings pcie0/S0 up BEFORE pcie2;
+ * its 2-lane LONG RX-cal (k0 @0x91324c) warms the SHARED SerDes analog
  * (CMU/bias) so pcie2's minimal SHORT cal then converges (0x780f) instead of
- * stalling at 0x500e.  We replay it purely to precondition -- pcie0 has no DT
- * node, is not enumerated, no LTSSM/DWC link is trained.  S0 shares the rstmgr
- * (0xf4320000) + GPIO (0xf4329000) windows at DIFFERENT bits; only its serdes
- * lives in its own window (0xf4333000), scratch-mapped for the duration.
+ * stalling at 0x500e.  With the pcie0 DT node enabled this sequence IS pcie0's
+ * host reset (RTW8852CE 5 GHz enumerates behind it); without a node it still
+ * runs once as a pcie2 precondition (scratch-mapped serdes, not enumerated).
+ * S0 shares the rstmgr (0xf4320000) + GPIO (0xf4329000) windows at DIFFERENT
+ * bits; only its serdes lives in its own window (0xf4333000).
  * Masks from the k0 phy_power_on table (@0x99d890, phy idx0+idx1) + stock DTB.
  */
 #define CA_S0_SERDES_PHYS	0x4f4333000ULL	/* pcie0 serdes_phy window */
@@ -442,13 +445,16 @@ static int cortina_pcie_parse_serdes_cfg(struct cortina_pcie *cp)
 #define S0_PHY_PWR_OFF		0x00000003u	/* 0x39c isolate (power_off) */
 #define S0_PERST		BIT(9)		/* gpio bank4 pin9 (S2=pin12) */
 /*
- * FIXME(clock-gate): pcie0's controller + SerDes-refclk gates in 0x0c8 are not
- * RE'd.  If the bootloader leaves pcie0's refclk gated the LONG cal can't lock
- * (same 0x500e failure as pcie2).  Stock uses pcie0's 5 GHz radio so it may be
- * ungated already; 0 = rely on the bootloader.
+ * pcie0's controller + SerDes-refclk gates in 0x0c8, from the stock DTB clock
+ * nodes (gate_pcie0 operate-shift 0x0a, gate_pcie0_ps operate-shift 0x16).
+ * Two independent tiers agree: the SAME DTB table's pcie2 shifts (0x0e/0x18)
+ * match the live-verified CA_CLKEN_PCIE2/_PS bits, and both pcie0 bits are set
+ * in the live-stock golden 0xc8 = 0x076445F0.  Idempotent when the bootloader
+ * already ungated them (it does on this board -- the pcie0 LONG cal locked
+ * cold before this ungate existed); kept for cold-boot determinism.
  */
-#define CA_CLKEN_PCIE0		0x0u
-#define CA_CLKEN_PCIE0_PS	0x0u
+#define CA_CLKEN_PCIE0		BIT(10)	/* gate_pcie0   : controller clock */
+#define CA_CLKEN_PCIE0_PS	BIT(22)	/* gate_pcie0_ps: SerDes PHY / refclk */
 
 static inline void ca_rmw(void __iomem *base, u32 off, u32 clr, u32 set)
 {
@@ -641,22 +647,19 @@ static void cortina_pcie_long_cal(struct cortina_pcie *cp, void __iomem *s,
 	}
 }
 
-/*
- * Bring pcie0/S0 up ONCE, purely to precondition the SHARED SerDes analog for
- * pcie2 -- mirrors stock's pcie0-first order.  pcie0 is not enumerated.
- */
-static void cortina_pcie0_precondition(struct cortina_pcie *cp)
-{
-	void __iomem *s = ioremap(CA_S0_SERDES_PHYS, CA_S0_SERDES_SIZE);
+static bool cortina_pcie0_done;		/* S0 bring-up runs once, globally */
 
-	if (!s) {
-		dev_warn(cp->pci.dev, "pcie0 precondition: serdes ioremap failed\n");
-		return;
-	}
-	if (CA_CLKEN_PCIE0 | CA_CLKEN_PCIE0_PS) {
-		ca_rmw(cp->rstmgr, CA_GLOBAL_CONFIG, 0, CA_CLKEN_PCIE0 | CA_CLKEN_PCIE0_PS);
-		usleep_range(1000, 2000);
-	}
+/*
+ * The full, proven S0 sequence: PERST0 route+assert -> core/phy reset assert ->
+ * in-reset SerDes table (lane0 only; lane1 is shaped by the cal) -> phy power ->
+ * reset deassert -> 2-lane LONG RX-cal (locks the CMU to 0x7e76) -> PERST0
+ * deassert.  Shared by pcie0's own host reset (s = its DT-mapped serdes_phy)
+ * and by the pcie2-only fallback precondition (s = scratch-mapped).
+ */
+static void cortina_pcie0_bringup_seq(struct cortina_pcie *cp, void __iomem *s)
+{
+	ca_rmw(cp->rstmgr, CA_GLOBAL_CONFIG, 0, CA_CLKEN_PCIE0 | CA_CLKEN_PCIE0_PS);
+	usleep_range(1000, 2000);
 
 	ca_rmw(cp->rstmgr, CA_GLB_GPIO_MUX4, 0, S0_PERST);	/* GLB pinmux: route PERST0 pad -> GPIO */
 	ca_rmw(cp->gpio, CA_GPIO_B4_CFG, S0_PERST, 0);		/* PERST# assert (low) */
@@ -676,9 +679,46 @@ static void cortina_pcie0_precondition(struct cortina_pcie *cp)
 
 	ca_rmw(cp->gpio, CA_GPIO_B4_OUT, 0, S0_PERST);		/* PERST# deassert */
 
-	dev_info(cp->pci.dev, "pcie0 precondition done: 7c=%08x 17c=%08x\n",
-		 readl(s + 0x7c), readl(s + 0x17c)); /* DIAG revert */
+	dev_info(cp->pci.dev, "pcie0/S0 bring-up: 7c=%08x 17c=%08x 107c=%08x 117c=%08x\n",
+		 readl(s + 0x7c), readl(s + 0x17c),
+		 readl(s + 0x107c), readl(s + 0x117c));
+	cortina_pcie0_done = true;
+}
+
+/*
+ * Fallback when pcie0 has no (or a disabled) DT node: run the S0 sequence ONCE
+ * before pcie2, purely to precondition the SHARED SerDes analog -- mirrors
+ * stock's pcie0-first order.  pcie0 is not enumerated on this path.
+ */
+static void cortina_pcie0_precondition(struct cortina_pcie *cp)
+{
+	void __iomem *s = ioremap(CA_S0_SERDES_PHYS, CA_S0_SERDES_SIZE);
+
+	if (!s) {
+		dev_warn(cp->pci.dev, "pcie0 precondition: serdes ioremap failed\n");
+		return;
+	}
+	cortina_pcie0_bringup_seq(cp, s);
 	iounmap(s);
+}
+
+/*
+ * pcie0's own host reset (5 GHz RTW8852CE behind it).  The SAME proven S0
+ * sequence, on the controller's DT-mapped windows, plus the endpoint power-up
+ * wait (stock DTB ready-time = 0x96 = 150 ms) and the BER-notify poll.  The
+ * DT serdes-cfg-dataB table is carried for reference but the sequence applies
+ * the identical RE'd table via cortina_pcie0_serdes_table() -- lane0 only,
+ * exactly as proven (the generic per-lane-stride DT apply would also write
+ * lane1, diverging from the golden trace).
+ */
+static void cortina_pcie0_host_reset(struct cortina_pcie *cp)
+{
+	cortina_pcie0_bringup_seq(cp, cp->serdes);
+
+	msleep(150);						/* endpoint powers up (PCIe Tpvperl) */
+
+	if (!cortina_pcie_serdes_ber_notify(cp))
+		dev_err(cp->pci.dev, "SerDes BER-notify (CMU lock) not asserted\n");
 }
 
 /*
@@ -686,13 +726,16 @@ static void cortina_pcie0_precondition(struct cortina_pcie *cp)
  * requirements: the SerDes is reprogrammed while PHY+core are held in reset, PHY
  * reset releases before core, and BER-notify must be seen before PERST# releases.
  */
-static bool cortina_pcie0_done;		/* precondition runs once, globally */
-
 static void cortina_pcie_host_reset(struct cortina_pcie *cp)
 {
-	/* Only pcie2/S2 (2.4 GHz) is brought up here; pcie0/S0 (5 GHz) bits differ. */
+	if (cp->idx == 0) {
+		cortina_pcie0_host_reset(cp);
+		return;
+	}
+
+	/* pcie2/S2 (2.4 GHz) below; other ids have no reset sequence yet. */
 	if (cp->idx != 2) {
-		dev_warn(cp->pci.dev, "reset seq only implemented for pcie2 (id=%u)\n",
+		dev_warn(cp->pci.dev, "reset seq only implemented for pcie0/pcie2 (id=%u)\n",
 			 cp->idx);
 		return;
 	}
@@ -887,24 +930,34 @@ static void cortina_pcie_msi_ack(struct irq_data *d)
 	dw_pcie_writel_dbi(pci, PCIE_MSI_INTR0_STATUS + res, BIT(bit));
 }
 
-/* Muxed single-line MSI: per-vector CPU affinity is meaningless.  Provide a stub
- * so msi_domain_set_affinity has a non-NULL parent callback -- the PCIe port
- * service (pcie_bwnotif) requests an IRQ and sets its affinity at probe; a NULL
- * .irq_set_affinity crashed with a pc=0x0 Oops (mainline dw_pci_msi chip returns
- * -EINVAL here). */
-static int cortina_pcie_msi_set_affinity(struct irq_data *d,
-					 const struct cpumask *mask, bool force)
-{
-	return -EINVAL;
-}
+#ifdef CONFIG_SMP
+static void cortina_pcie_msi_noop_ack(struct irq_data *d) { }
+#endif
 
+/* Mirror the 6.18 mainline dw_pci_msi_bottom_irq_chip EXACTLY, including the
+ * CONFIG_SMP redirect model: on SMP the per-device PCI-MSI chip template
+ * (dw_pcie_init_dev_msi_info) forwards irq_pre_redirect into THIS parent
+ * chip - a missing .irq_pre_redirect here is a NULL call = pc=0x0 Oops on
+ * the FIRST device MSI (live-hit 2026-07-16: rtw89_core_start enabled the
+ * 8852CE's MSI -> cortina_pcie_irq_handler -> dw_handle_msi_irq ->
+ * irq_chip_pre_redirect_parent -> pc 0x0 -> panic-in-interrupt -> watchdog
+ * reboot into NAND).  On SMP the ack runs in .irq_pre_redirect (before the
+ * redirect to the target CPU) and .irq_ack must be a no-op; per-vector
+ * affinity goes through irq_chip_redirect_set_affinity (this also replaces
+ * the earlier -EINVAL affinity stub that papered over the same NULL-callback
+ * class for pcie_bwnotif). */
 static struct irq_chip cortina_pcie_msi_bottom_chip = {
 	.name			= "CA-PCIe-MSI",
-	.irq_ack		= cortina_pcie_msi_ack,
 	.irq_compose_msi_msg	= cortina_pcie_msi_compose,
-	.irq_set_affinity	= cortina_pcie_msi_set_affinity,
 	.irq_mask		= cortina_pcie_msi_mask,
 	.irq_unmask		= cortina_pcie_msi_unmask,
+#ifdef CONFIG_SMP
+	.irq_ack		= cortina_pcie_msi_noop_ack,
+	.irq_pre_redirect	= cortina_pcie_msi_ack,
+	.irq_set_affinity	= irq_chip_redirect_set_affinity,
+#else
+	.irq_ack		= cortina_pcie_msi_ack,
+#endif
 };
 
 /* Program the DWC built-in MSI controller: address + per-vector enable/mask. */
@@ -1169,18 +1222,19 @@ static int cortina_pcie_map_regions(struct platform_device *pdev,
 }
 
 /*
- * /proc/cortina_pcie_serdes -- live SerDes/glue register probe (spy tool, kept
- * as a first-class feature).  Commands (results go to dmesg):
+ * /proc/cortina_pcie_serdes<id> -- live SerDes/glue register probe (spy tool,
+ * kept as a first-class feature).  One entry PER controller (the id suffix
+ * keeps the two root complexes from colliding on a shared name); the owning
+ * cortina_pcie is carried as the PDE private data.  Commands (results go to
+ * dmesg):
  *   r <hex_off>          read serdes_phy + off
  *   w <hex_off> <hex>    write serdes_phy + off
  *   g <hex_off>          read glbl_regs + off
  */
-static struct cortina_pcie *cortina_pcie_dbg;
-
 static ssize_t cortina_pcie_dbg_write(struct file *f, const char __user *ubuf,
 				      size_t len, loff_t *ppos)
 {
-	struct cortina_pcie *cp = cortina_pcie_dbg;
+	struct cortina_pcie *cp = pde_data(file_inode(f));
 	char buf[64];
 	u32 o, v;
 
@@ -1231,6 +1285,7 @@ static int cortina_pcie_probe(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	struct device_node *np = dev->of_node;
 	struct cortina_pcie *cp;
+	char name[32];
 	u32 lanes;
 	int i, ret;
 
@@ -1289,8 +1344,6 @@ static int cortina_pcie_probe(struct platform_device *pdev)
 	reset_control_reset(cp->device_power);
 
 	for (i = 0; i < cp->lanes; i++) {
-		char name[16];
-
 		snprintf(name, sizeof(name), "pcie-phy%d", i);
 		cp->phy[i] = devm_phy_optional_get(dev, name);
 		if (IS_ERR(cp->phy[i]))
@@ -1298,8 +1351,12 @@ static int cortina_pcie_probe(struct platform_device *pdev)
 					     "failed to get %s\n", name);
 	}
 
-	cortina_pcie_dbg = cp;
-	proc_create("cortina_pcie_serdes", 0200, NULL, &cortina_pcie_dbg_ops);
+	/* Per-controller name so pcie0 and pcie2 don't collide on a shared /proc
+	 * entry (a duplicate proc_create WARNs at proc_register and leaves the
+	 * spy tool bound to whichever probed last). */
+	snprintf(name, sizeof(name), "cortina_pcie_serdes%u", cp->idx);
+	cp->dbg_pde = proc_create_data(name, 0200, NULL,
+				       &cortina_pcie_dbg_ops, cp);
 
 	return dw_pcie_host_init(&cp->pci.pp);
 }
@@ -1308,6 +1365,7 @@ static void cortina_pcie_remove(struct platform_device *pdev)
 {
 	struct cortina_pcie *cp = platform_get_drvdata(pdev);
 
+	proc_remove(cp->dbg_pde);
 	dw_pcie_host_deinit(&cp->pci.pp);
 }
 
