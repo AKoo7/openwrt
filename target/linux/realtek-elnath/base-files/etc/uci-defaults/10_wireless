@@ -1,0 +1,157 @@
+#!/bin/sh
+# X411AXF / RTL9607F "Elnath": per-board dual-band WiFi AP defaults (M3d).
+#
+# Runs from uci_apply_defaults, which /etc/init.d/boot invokes right AFTER
+# `/sbin/wifi config` generated /etc/config/wireless from the detected phys
+# (phy0 = RTL8192F 2.4G [10ec:0192], phy1 = RTW8852CE 5G [10ec:c852]); the
+# generated radios come up disabled with ssid 'OpenWrt' and no country, so
+# this script personalizes + enables them before netifd starts.
+#
+# SSID: ALWAYS ONU-<last-3-octets of the factory base MAC> uppercase
+# (98:c7:a4:6c:af:cb -> ONU-6CAFCB), IDENTICAL on both bands so a phone
+# band-steers 2.4G<->5G as one network. Per-board + fleet-portable (derived
+# at runtime from the board's own MAC, never a compiled-in constant); same
+# scheme as realtek-luna/X111W. Stock's HS-* / HS-*-5G names are NOT reused.
+#
+# key + country come from the board's own provisioning (never hardcoded):
+# the stock config volume (NAND UBI "ubi_Config" -> config.xml wpaPSK, and
+# config_hs.xml HW_WLAN0_COUNTRYSTR; this board: key 12345678, country "US").
+# Country is set explicitly on BOTH radios -- the 5G efuse has no RF-frontend
+# type (rfe_type 255) and without a country 5 GHz stays world-regdomain
+# no-IR = no beacon; and hostapd's device_country_code takes the LAST radio's
+# country, so a leftover '00' radio would clobber both. Lab key fallback
+# 12345678 (prod should provision a per-board key), country US.
+#
+# BSSIDs: the 5G phy reports macaddress ff:ff:ff:ff:ff:ff (blank efuse) and
+# the 2.4G phy's efuse MAC is not this board's, so pin per-board vif MACs
+# from the factory base MAC: 2.4G = base+2, 5G = base+3 (base = eth0/LAN,
+# base+1 = gpon0/WAN, per 05_factory_mac).
+#
+# 2.4G quirks carried over from the proven realtek-luna rtl8192fe AP (same
+# driver): legacy_rates=1 (CCK basic rates; without it strict phone scan
+# firmware never lists the AP) and multicast_to_unicast=1 (rtlwifi never
+# services the DTIM broadcast buffer, so a sleeping client's DHCP OFFER
+# would be buffered forever). HT20 = the luna-proven htmode.
+# 5G: channel 36 (stock's live auto-channel pick; UNII-1 non-DFS in US) +
+# HE80 (the 36-48 block, no DFS channel inside the 80 MHz width). Stock runs
+# ch36 @160MHz, but 160 spans DFS 52-64; HE80 keeps us in the DFS-free block.
+
+. /lib/functions.sh
+. /lib/functions/system.sh
+
+# wifi config must have generated the radios already; if not (phy probe
+# raced), exit non-zero so uci_apply_defaults keeps us for the next boot.
+[ -s /etc/config/wireless ] || exit 1
+
+mnt="/tmp/.factory_cfg"
+mac="" country="" pairs=""
+mkdir -p "$mnt"
+if mount -t ubifs -o ro ubi0:ubi_Config "$mnt" 2>/dev/null; then
+	mac=$(sed -n 's/.*Name="ELAN_MAC_ADDR"[^V]*Value="\([0-9a-fA-F]\{12\}\)".*/\1/p' \
+		"$mnt/config_hs.xml" 2>/dev/null | head -n1)
+	country=$(sed -n 's/.*Name="HW_WLAN0_COUNTRYSTR"[^V]*Value="\([A-Za-z][A-Za-z]\)".*/\1/p' \
+		"$mnt/config_hs.xml" 2>/dev/null | head -n1)
+	pairs=$(awk -F'"' '
+		$2 == "wpaPSK"       { psk = $4 }
+		$2 == "wlanDisabled" { dis = $4 }
+		$2 == "ssid"         { if (dis == "0" && $4 != "") print $4 "\t" psk; dis = "" }
+	' "$mnt/config.xml" 2>/dev/null | tr -d "'")
+	umount "$mnt"
+fi
+rmdir "$mnt" 2>/dev/null
+
+ssid_2g="" ssid_5g="" key_2g="" key_5g=""
+oldifs="$IFS"; IFS="$(printf '\t')"
+while read -r s k; do
+	case "$s" in
+	*-5[Gg]) [ -n "$ssid_5g" ] || { ssid_5g="$s"; key_5g="$k"; } ;;
+	*)       [ -n "$ssid_2g" ] || { ssid_2g="$s"; key_2g="$k"; } ;;
+	esac
+done <<EOF
+$pairs
+EOF
+IFS="$oldifs"
+
+# fallback scheme (per-board, derived at runtime - never hardcoded)
+[ "${#mac}" = "12" ] || mac=$(cat /sys/class/net/eth0/address 2>/dev/null | tr -d :)
+mac=$(echo "$mac" | tr 'A-F' 'a-f')
+suffix="${mac#??????}"
+[ "${#suffix}" = "6" ] || suffix="000000"
+[ "${#key_2g}" -ge 8 ] || key_2g="12345678"
+[ "${#key_5g}" -ge 8 ] || key_5g="12345678"
+# ONE SSID + ONE key on BOTH bands so a phone band-steers 2.4G<->5G as a
+# single network. SSID = ONU-<last-3-MAC-octets> uppercase
+# (98:c7:a4:6c:af:cb -> ONU-6CAFCB); stock's HS-* names are NOT reused, but
+# the stock volume still supplies the wpaPSK. A shared SSID needs a shared
+# key -- per-band PSKs would break band-steering (both stock keys match here).
+ssid="ONU-$(echo "$suffix" | tr 'a-f' 'A-F')"
+key="$key_2g"
+country=$(echo "$country" | tr 'a-z' 'A-Z')
+[ "${#country}" = "2" ] || country="US"
+
+# per-board vif MACs (see header); base comes from the same factory source
+base=$(echo "$mac" | sed 's/../&:/g;s/:$//')
+mac_2g=$(macaddr_add "$base" 2)
+mac_5g=$(macaddr_add "$base" 3)
+
+logger -t wireless-defaults \
+	"ssid='$ssid' 2g=$mac_2g 5g=$mac_5g country=$country"
+
+found_2g="" found_5g=""
+setup_iface() {
+	local s="$1" dev band
+	config_get dev "$s" device
+	band=$(uci -q get "wireless.$dev.band")
+	case "$band" in
+	2g)
+		[ -n "$found_2g" ] && return 0
+		found_2g=1
+		uci -q batch <<EOF2
+set wireless.$dev.channel='1'
+set wireless.$dev.htmode='HT20'
+set wireless.$dev.country='$country'
+set wireless.$dev.legacy_rates='1'
+set wireless.$dev.disabled='0'
+set wireless.$s.mode='ap'
+set wireless.$s.network='lan'
+set wireless.$s.ssid='$ssid'
+set wireless.$s.encryption='psk2'
+set wireless.$s.key='$key'
+set wireless.$s.macaddr='$mac_2g'
+set wireless.$s.multicast_to_unicast='1'
+set wireless.$s.disabled='0'
+EOF2
+		;;
+	5g|6g)
+		# The RTW8852CE phy registers a 6 GHz band too, and the generator
+		# prefers 6G (bands_order) -> the radio arrives as band='6g',
+		# country '00', disabled. This board's second radio IS the 5 GHz
+		# AP: force band 5g. (A '00'-country radio left behind would also
+		# clobber the other radio's country -- hostapd's
+		# device_country_code takes the LAST radio's country.)
+		[ -n "$found_5g" ] && return 0
+		found_5g=1
+		uci -q batch <<EOF5
+set wireless.$dev.band='5g'
+set wireless.$dev.channel='36'
+set wireless.$dev.htmode='HE80'
+set wireless.$dev.country='$country'
+set wireless.$dev.disabled='0'
+set wireless.$s.mode='ap'
+set wireless.$s.network='lan'
+set wireless.$s.ssid='$ssid'
+set wireless.$s.encryption='psk2'
+set wireless.$s.key='$key'
+set wireless.$s.macaddr='$mac_5g'
+set wireless.$s.disabled='0'
+EOF5
+		;;
+	esac
+}
+config_load wireless
+config_foreach setup_iface wifi-iface
+uci commit wireless
+
+# both bands must be present; retry on a later boot if one was missing
+[ -n "$found_2g" ] && [ -n "$found_5g" ] || exit 1
+exit 0

@@ -27,8 +27,22 @@ define Device/realtek_rtl9607f_x411axf
   #                              uci access and file reads for the UI
   #     luci-base luci-mod-admin-full luci-theme-bootstrap - the UI core,
   #       the standard admin pages (status/system/network) and the theme
+  #   WiFi AP userspace (M3d). mac80211/cfg80211 + both drivers are BUILT-IN
+  #   kernel (config-6.18), NOT kmod-mac80211, so nothing pulls the userspace
+  #   wifi plumbing implicitly -- list it all here:
+  #     wpad-basic-mbedtls - hostapd+wpa_supplicant, WPA2-PSK(psk2)+SAE, the
+  #                          same lean variant proven on realtek-luna/hsgq_x111w
+  #     wifi-scripts       - /sbin/wifi + the netifd wireless handlers +
+  #                          /etc/config/wireless generation (ucode variant)
+  #     wireless-regdb     - /lib/firmware/regulatory.db; without it cfg80211
+  #                          stays on the world regdomain and every 5 GHz
+  #                          channel is no-IR = the rtw8852ce AP cannot beacon
+  #                          (the 5G efuse has no RF-frontend type, rfe_type
+  #                          255, so the country comes from config, not HW)
+  #     iw                 - on-device verification (iw dev / iw reg get)
   DEVICE_PACKAGES := dnsmasq firewall4 \
 	luci-base luci-mod-admin-full luci-theme-bootstrap \
-	uhttpd uhttpd-mod-ubus rpcd rpcd-mod-file
+	uhttpd uhttpd-mod-ubus rpcd rpcd-mod-file \
+	wpad-basic-mbedtls wifi-scripts wireless-regdb iw
 endef
 TARGET_DEVICES += realtek_rtl9607f_x411axf

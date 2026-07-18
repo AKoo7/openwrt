@@ -4,11 +4,19 @@ config interface 'loopback'
 	option ipaddr '127.0.0.1'
 	option netmask '255.0.0.0'
 
-# M2c/M2d: eth0 = the clean-room Cortina-NI port0 (LAN1). Direct static IP
-# (no bridge) so the host can ping/ssh the ONU as soon as RX works, and to
-# avoid the br-lan-route-shadows-eth0 artifact seen during the M2b TX test.
+# M3d: LAN = br-lan bridging eth0 (Cortina-NI port0) with the WiFi APs
+# (wlan0 2.4G + wlan1 5G join via wifi-iface network 'lan'), mirroring the
+# stock br0 topology. The bring-up-era direct-eth0 config (used during M2
+# while RX was still dead, to dodge a br-lan-route-shadows-eth0 artifact of
+# the then-half-working datapath) is superseded now the NI datapath is solid.
+# br-lan inherits eth0's (factory) MAC, so the LAN identity matches stock br0.
+config device
+	option name 'br-lan'
+	option type 'bridge'
+	list ports 'eth0'
+
 config interface 'lan'
-	option device 'eth0'
+	option device 'br-lan'
 	option proto 'static'
 	option ipaddr '192.168.1.1'
 	option netmask '255.255.255.0'

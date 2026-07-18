@@ -22,13 +22,22 @@ define Package/wireless-regdb
   TITLE:=Wireless Regulatory Database
 endef
 
+# Ship the PRISTINE maintainer-signed pair from the tarball instead of
+# regenerating regulatory.db with db2fw.py: an in-kernel cfg80211 (built-in,
+# not the backports kmod - e.g. realtek-elnath) has
+# CFG80211_REQUIRE_SIGNED_REGDB forced =y (promptless "default y" without
+# CERTIFICATION_ONUS), so it only loads regulatory.db when the matching
+# regulatory.db.p7s signature (made by the wireless-regdb maintainer key the
+# kernel embeds via CFG80211_USE_KERNEL_REGDB_KEYS) verifies against the
+# EXACT file content - a regenerated db no longer matches the signature.
+# Backports-based targets load the pristine db just the same (no sig check).
 define Build/Compile
-	$(STAGING_DIR_HOST)/bin/$(PYTHON) $(PKG_BUILD_DIR)/db2fw.py $(PKG_BUILD_DIR)/regulatory.db $(PKG_BUILD_DIR)/db.txt
 endef
 
 define Package/wireless-regdb/install
 	$(INSTALL_DIR) $(1)/lib/firmware
 	$(CP) $(PKG_BUILD_DIR)/regulatory.db $(1)/lib/firmware/
+	$(CP) $(PKG_BUILD_DIR)/regulatory.db.p7s $(1)/lib/firmware/
 endef
 
 $(eval $(call BuildPackage,wireless-regdb))
