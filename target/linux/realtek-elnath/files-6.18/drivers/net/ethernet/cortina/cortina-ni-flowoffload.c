@@ -899,6 +899,64 @@ module_param(hw_l3_fwd, bool, 0644);
 MODULE_PARM_DESC(hw_l3_fwd,
 	"enable HW L3-forwarding into the L3FE main hash, miss->CPU (default OFF; needs zero-flow no-regression proof)");
 
+/*
+ * ★★ STATUS (2026-07-20): the L3FE HW flow-offload does NOT yet forward in
+ * silicon end-to-end - it is WORK IN PROGRESS.  hw_l3_fwd is default OFF, so
+ * shipped behaviour is the SW flow-table fastpath, which forwards WAN/NAT
+ * (and PPPoE) correctly; nothing below is on the shipped datapath.
+ *
+ * The earlier "IPoE HW-offload complete / 1000-connection soak / 400-sample
+ * no-regression" claims (this file's history) were a MIS-MEASUREMENT: an
+ * installed entry sets the conntrack [HW_OFFLOAD] flag and bypasses the CPU
+ * on the hit, but the traffic actually stays on the SW fastpath, and the
+ * "CPU counter flat" witness that gated the soak was non-counting (phantom).
+ * Airtight re-verification (sink throughput vs a real CPU counter, both the
+ * IPoE commit and its pre-PPPoE parent) showed the offloaded flow blackholes.
+ *
+ * Root cause, being fixed (the reliable witness is sink-throughput + a real
+ * CPU counter, never the [HW_OFFLOAD] flag):
+ *   A1 (DONE - see cn_l3e_set_us_egress): the hit-action left chk_msk_ptr /
+ *       cache_ctrl 0, so on a match the HW re-checked the entry under mask 0,
+ *       FAILED, and the double-check-fail disposition (CPU_0, bypass_next)
+ *       diverted every matched frame off egress - the entry forwarded
+ *       nothing.  Now set to {mask_id=8, 1} as stock's aal_hash_add does;
+ *       board-confirmed to reach silicon (FIB readback) and remove the divert.
+ *   A2 (PENDING): with the check passing, matched frames take the real
+ *       hit-action but egress with the WRONG dst MAC (the ONU's own) and are
+ *       reflected/hairpinned - the next-hop L2 rewrite (GROUP_20 mac_da_idx =
+ *       WAN gateway MAC + smac_trans/l3_if_vld/egr_l3_if_idx = egress SMAC) is
+ *       missing.  mac_da_idx's HW backing is the L3 NextHop/LPM engine (not a
+ *       register SRAM), so resolving it needs a live stock-firmware dump
+ *       (bisect-from-working).  Until A2 lands, enabling hw_l3_fwd FREEZES an
+ *       offloaded flow instead of forwarding it - keep it OFF.
+ */
+
+/*
+ * ★ PPPoE-WAN auto-flow gate (default OFF = refuse; board-proven 2026-07-20).
+ * Installing the US SNAT+PPPoE-push hash entry disturbs the very flow it is
+ * meant to accelerate: from the install instant the DS (WAN->LAN) CPU-punt
+ * frames of that 5-tuple can arrive MANGLED (TCP header bytes shifted by ~8 =
+ * the PPPoE header size, IP header still checksum-valid - a PE rewrite
+ * applied at offsets that mis-account the DS 0x8864 encap), while the armed
+ * entry was never observed to capture the US traffic (conntrack counted the
+ * full packet rate through the CPU with the entry live).  Two failure
+ * flavours, one source:
+ *   - a one-off mangled DS frame right after install carries garbage FIN/RST
+ *     bits -> nf_flow_state_check sets NF_FLOW_CLOSING -> the 1 Hz GC deletes
+ *     the HW rule (the sticky HW->SW "flap"); or
+ *   - the DS ACK stream dies entirely -> the sender stalls -> aborts (RST).
+ * Until the DS-side mis-rewrite is root-caused and fixed, REFUSE the PPPoE US
+ * rule (-EOPNOTSUPP, before any HW write): nf_flow_table keeps the flow on
+ * the SW fastpath with no retry churn (flow_offload_work_add just skips
+ * IPS_HW_OFFLOAD).  IPoE flows (no session) are untouched and keep full HW
+ * offload.  Flip via bootarg `cortina_ni.hw_pppoe=1` to resume the HW-PPPoE
+ * bring-up work.
+ */
+static bool hw_pppoe;
+module_param(hw_pppoe, bool, 0644);
+MODULE_PARM_DESC(hw_pppoe,
+	"install HW hash entries for PPPoE-WAN US flows (default OFF: PPPoE rides the SW fastpath; IPoE HW offload unaffected)");
+
 /* # of installed nf_flow_table flows (the /proc auto_flows counter); defined
  * here so the PPPoE session-set path below can gate its BUG-B flush on it. */
 static atomic_t cn_flow_installed = ATOMIC_INIT(0);
@@ -1038,6 +1096,18 @@ static int cn_l3e_set_us_egress(struct cn_l3e *l3e, struct cn_l3e_act *act,
 	act->deepq = (tcont <= CN_L3E_PON_DEEPQ_TCONT_MAX);
 	act->t2_ctrl = tcont & 0xf;	/* GROUP_20 t2_ctrl1 = T-CONT selector */
 	act->pop_l3_vld = 1;		/* gemMapMode-1 marker (bit0) */
+
+	/* Point the entry's "double check" at THIS flow's mask (8).  On a
+	 * matched hit the HW re-validates the entry against the mask named by
+	 * chk_msk_ptr; left 0 it rechecks under mask 0 (which folds
+	 * mac/lspid/dscp/vlan - all different from our sparse 5-tuple install),
+	 * so the recheck FAILS and the double-check-fail disposition
+	 * (HS_CHK_FAIL_CTRL = CPU_0, bypass_next) diverts the matched frame
+	 * from egress - the entry forwards nothing.  Stock's aal_hash_add sets
+	 * chk_msk_ptr=mask_id + cache_ctrl (TYPE0=1) on every G18|G20 action
+	 * ("set chk_msk_ptr to avoid double check fail"). */
+	act->chk_msk_ptr = CN_L3E_WAN_MASK_ID;
+	act->cache_ctrl = 1;		/* TYPE0 */
 
 	/* PPPoE WAN egress: ADD the 8-byte 0x8864 session header on the hit.
 	 * GROUP_20 inline pppoe_set1=1 + pppoe_vld1=1 = ADD/replace; the
@@ -1301,15 +1371,32 @@ static int cn_flow_replace(struct flow_cls_offload *f, struct net_device *dev)
 		return -EOPNOTSUPP;
 	}
 
-	/* US hit-action - EXACTLY the silicon-proven manual-install shape
-	 * (GROUP_18 WAN-forward via the live PON data GEM/T-CONT + GROUP_20
-	 * TTL dec + inline SNAT).  No l3_if/smac/mac_da indexed rewrite: those
-	 * aux tables are not programmed, and the proven forward does not need
-	 * them (the PON US egress needs no neighbour-MAC rewrite).  Runs
-	 * AFTER the action loop so a FLOW_ACTION_PPPOE_PUSH sid (collected
-	 * above) drives the PPPoE encap; sid 0 = IPoE, byte-identical action.
-	 * If no data path is armed yet, refuse - the flow stays on the SW
-	 * path. */
+	/* ★ PPPoE-WAN flow (live push sid on the rule, or the /proc bring-up
+	 * fallback armed): refuse unless hw_pppoe opts in - BEFORE any HW
+	 * write, so no L3-IF program and no hash entry exists to disturb the
+	 * DS punt path (see the hw_pppoe param comment: the armed entry
+	 * mangles DS frames of its own 5-tuple -> NF_FLOW_CLOSING flap or a
+	 * full stall).  The flow stays on the SW fastpath, which forwards
+	 * PPPoE correctly at full rate.  IPoE (sid 0) proceeds unchanged. */
+	if (!hw_pppoe &&
+	    (pppoe_sid || READ_ONCE(cn_l3e->data_pppoe_session))) {
+		cn_rep_dbg("refuse: PPPoE-WAN flow, hw_pppoe=0 (SW fastpath; sid=%#x)\n",
+			   pppoe_sid);
+		return -EOPNOTSUPP;
+	}
+
+	/* US hit-action - GROUP_18 WAN-forward via the live PON data GEM/T-CONT
+	 * + GROUP_20 TTL dec + inline SNAT + the chk_msk_ptr fix (A1, below in
+	 * cn_l3e_set_us_egress).  ★ INCOMPLETE (A2, see the STATUS banner): the
+	 * next-hop L2 rewrite (GROUP_20 mac_da_idx = the WAN gateway MAC +
+	 * smac_trans/l3_if_vld/egr_l3_if_idx = the egress SMAC) is NOT set here,
+	 * so a matched frame currently egresses with the WRONG dst MAC (the
+	 * ONU's own) and is reflected/hairpinned instead of forwarded upstream.
+	 * The earlier "the PON US egress needs no neighbour-MAC rewrite" claim
+	 * was wrong - it does; that is the remaining defect.  Runs AFTER the
+	 * action loop so a FLOW_ACTION_PPPOE_PUSH sid (collected above) drives
+	 * the PPPoE encap; sid 0 = IPoE.  If no data path is armed yet, refuse -
+	 * the flow stays on the SW path. */
 	err = cn_l3e_set_us_egress(cn_l3e, &act, pppoe_sid);
 	if (err) {
 		cn_rep_dbg("refuse: no PON data path armed (set_us_egress %d)\n",
