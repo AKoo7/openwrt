@@ -1527,6 +1527,8 @@ static void cg_data_teardown(struct cortina_gpon *cg)
 		 cg->hw_data_alloc, cg->hw_data_gem);
 	cg->hw_data_alloc = 0;
 	cg->hw_data_gem = 0;
+	/* the L3FE US hit-action must stop targeting the stale GEM */
+	cortina_ni_gpon_data_path_set(0, 0);
 }
 
 /*
@@ -1606,16 +1608,31 @@ static void cg_data_try_install(struct cortina_gpon *cg)
 		return;
 
 	/* PDC: both intern indices -> CPU port 0, forwarding-engine bypass,
-	 * lspid = PON (the NI CPU-RX WAN-delivery key) */
+	 * lspid = PON (the NI CPU-RX WAN-delivery key).
+	 * ★ HW-L3-forward staging (gated, default OFF): with
+	 * cortina_ni.hw_l3_fwd=1 the UNICAST data GEM instead takes the
+	 * vendor-default DS route LDPID = L3_WAN (0x18), no FE bypass - the
+	 * PDPID map hands it to the L3FE WAN ingress (l3fe_rx counts it),
+	 * STG0 maps 0x18 -> WAN LPB profile -> T1 classifier -> T2 main-hash
+	 * consult; a MISS punts to CPU_0 via the internal default action, so
+	 * DHCP/ARP/unmatched traffic still reaches Linux.  The broadcast GEM
+	 * (i == 1, DHCP OFFER rides it) keeps the proven CPU delivery. */
 	for (i = 0; i < 2; i++) {
 		u32 idx = CG_DATA_GEM_IDX + i;
+		u32 d0 = CG_PDC_D0_COS(0) |
+			 CG_PDC_D0_LDPID(CG_LPORT_CPU_0) |
+			 CG_PDC_D0_LSPID(CG_LPORT_PON) |
+			 CG_PDC_D0_FE_BYPASS | CG_PDC_D0_NO_DROP;
 
-		if (cg_pdc_map_write(cg, idx,
-				     CG_PDC_D0_COS(0) |
-				     CG_PDC_D0_LDPID(CG_LPORT_CPU_0) |
-				     CG_PDC_D0_LSPID(CG_LPORT_PON) |
-				     CG_PDC_D0_FE_BYPASS | CG_PDC_D0_NO_DROP,
-				     CG_PDC_D1_POL_ID(idx)))
+		if (i == 0 && cortina_ni_hw_l3_fwd_active()) {
+			d0 = CG_PDC_D0_LDPID(CG_LPORT_L3_WAN) |
+			     CG_PDC_D0_LSPID(CG_LPORT_PON);
+			dev_info(cg->dev,
+				 "PDC: data GEM idx %u -> L3_WAN (HW L3-forward armed)\n",
+				 idx);
+		}
+
+		if (cg_pdc_map_write(cg, idx, d0, CG_PDC_D1_POL_ID(idx)))
 			return;
 	}
 
@@ -1627,6 +1644,9 @@ static void cg_data_try_install(struct cortina_gpon *cg)
 	cg->data_installed = true;
 	cg->hw_data_alloc = alloc & 0xfff;	/* record the armed identity so a */
 	cg->hw_data_gem = gem & 0xfff;		/* later reconfig can invalidate it */
+	/* report the LIVE data-path identity to the L3FE offload backend (the
+	 * US hit-action's mcgid/T-CONT source - never a compiled-in constant) */
+	cortina_ni_gpon_data_path_set(cg->hw_data_gem, CG_DATA_TCONT_IDX);
 	dev_info(cg->dev,
 		 "DATA path UP: alloc %u -> T-CONT %u, gem %u (US VoQ %u, DS idx %u), bcast %u -> idx %u\n",
 		 alloc, CG_DATA_TCONT_IDX, gem, CG_DATA_GEM_IDX,
@@ -2194,6 +2214,15 @@ static const struct net_device_ops cg_wan_ops = {
 	.ndo_start_xmit		= cg_wan_xmit,
 	.ndo_validate_addr	= eth_validate_addr,
 	.ndo_set_mac_address	= eth_mac_addr,
+	/* nf_flow_table HW offload: an nft flowtable with `flags offload`
+	 * BINDs a flow block on EVERY hooked device - gpon0 included - so the
+	 * WAN netdev must expose the same setup_tc entry as eth0 (cortina-ni).
+	 * Without it the flowtable offload setup fails (-EOPNOTSUPP) and fw4
+	 * falls back to software offloading.  Flow installs stay gated by
+	 * hw_l3_fwd inside the backend; a plain BIND writes no hardware. */
+#if IS_REACHABLE(CONFIG_CORTINA_NI)
+	.ndo_setup_tc		= cortina_ni_setup_tc,
+#endif
 };
 
 /* Register gpon0.  MAC = a locally-administered FALLBACK one above eth0's

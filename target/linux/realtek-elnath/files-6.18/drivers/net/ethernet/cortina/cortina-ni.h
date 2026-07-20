@@ -122,11 +122,17 @@ struct cortina_ni_rx {
 	u32			last_fault;	/* last GPHY fault-latch read */
 	u64			irq_hits[CA_NI_RX_NUM_IRQS];
 	u64			polls;
+	/* per-voq delivered frames: a single flow must land on ONE voq; two
+	 * or more climbing during a unidirectional bench = the HW spreads the
+	 * flow across voqs and the fixed 0..7 drain order can reorder it (the
+	 * packet-order live check on the board) */
+	u64			voq_frames[CA_NI_RX_VOQ_COUNT];
 	u64			frames;
 	u64			bytes;
 	u64			swid_frames;	/* headerless (sw_id != 0) frames */
 	u64			pon_frames;	/* DS PON control frames (0xfff1) handed to the GPON hook */
 	u64			wan_frames;	/* DS PON data frames (lspid=PON) delivered to the WAN netdev */
+	u64			wan_l3_frames;	/* HW-L3 miss-punt DS frames (lspid=L3_WAN) delivered to the WAN netdev */
 	u64			drop_nosop;	/* descriptor without SOP */
 	u64			drop_badpa;	/* PA not in our map */
 	u64			drop_len;	/* bad frame length */
@@ -206,6 +212,56 @@ netdev_tx_t cortina_ni_pon_data_tx(struct sk_buff *skb,
 
 int cortina_ni_tx_probe(struct cortina_ni *ni);
 int cortina_ni_rx_probe(struct cortina_ni *ni);
+
+/*
+ * L3FE main-hash flow engine (nf_flow_table HW offload backend,
+ * cortina-ni-flowoffload.c + cortina-l3fe.c).  The probe arms + verifies
+ * the engine; any failure is non-fatal - the offload stays disabled and
+ * every request falls back to the software path.
+ */
+#if IS_ENABLED(CONFIG_CORTINA_NI_FLOWOFFLOAD)
+int cortina_ni_flowoffload_probe(struct cortina_ni *ni);
+int cortina_ni_setup_tc(struct net_device *dev, enum tc_setup_type type,
+			void *type_data);
+/* true only when the hw_l3_fwd experiment is armed AND the L3FE engine init
+ * succeeded; the GPON driver keys the DS data-GEM PDC route on it (LDPID
+ * L3_WAN into the L3FE vs the proven CPU_0 + FE-bypass delivery). */
+bool cortina_ni_hw_l3_fwd_active(void);
+/* per-L3-interface T2 admission (CAM + LPB an-mask + pri-6 routed CLS rules,
+ * cortina-l3fe.c); re-applied from the link-up cls_init re-run under the
+ * hw_l3_fwd gate because the my-MAC/STG0 re-init rewrites the LPB words. */
+int cortina_l3fe_intf_add(void __iomem *ne, const u8 *lan_mac);
+/*
+ * LIVE PON data-path identity push (GPON -> offload backend): the GPON driver
+ * reports the OLT-provisioned data GEM port-id + the hw T-CONT index whenever
+ * it arms the WAN data path (cg_data_try_install) and clears them on teardown
+ * (gem_id 0 = no data path).  The L3FE US hit-action needs the LIVE values
+ * (GROUP_18 mcgid = gem_id with mc=1; the T-CONT rides the action's t2_ctrl
+ * ldpid offset) - never a compiled-in constant.
+ */
+void cortina_ni_gpon_data_path_set(u16 gem_id, u8 tcont_idx);
+#else
+static inline int cortina_ni_flowoffload_probe(struct cortina_ni *ni)
+{
+	return 0;
+}
+static inline int cortina_ni_setup_tc(struct net_device *dev,
+				      enum tc_setup_type type, void *type_data)
+{
+	return -EOPNOTSUPP;
+}
+static inline bool cortina_ni_hw_l3_fwd_active(void)
+{
+	return false;
+}
+static inline int cortina_l3fe_intf_add(void __iomem *ne, const u8 *lan_mac)
+{
+	return 0;
+}
+static inline void cortina_ni_gpon_data_path_set(u16 gem_id, u8 tcont_idx)
+{
+}
+#endif
 void cortina_ni_rx_open(struct cortina_ni *ni);
 void cortina_ni_rx_stop(struct cortina_ni *ni);
 void cortina_ni_rx_link_up(struct cortina_ni *ni);	/* phylib link-up hook */

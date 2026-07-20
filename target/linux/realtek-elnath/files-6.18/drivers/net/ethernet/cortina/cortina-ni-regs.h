@@ -977,8 +977,18 @@ enum cortina_ni_win {
 
 #define CA_NI_TX_RING_SIZE		1024	/* descriptors per queue */
 #define CA_NI_TX_RING_DEPTH		10	/* log2(1024), HW encoding */
-#define CA_NI_TX_NUM_VPS		4	/* CPU 0..3 -> VP 2..5 */
+#define CA_NI_TX_NUM_VPS		4	/* rings on VP 2..5 (vendor: one per CPU) */
 #define CA_NI_TX_VP_BASE		2
+/*
+ * ★ PACKET-ORDER fix: each netdev owns exactly ONE fixed ring.  txq[0] (VP2)
+ * = PON US (OMCI + WAN data, gpon0); txq[CA_NI_TX_ETH_RING] (VP3) = eth0.
+ * The old per-CPU pick (txq[smp_processor_id() % 4]) split one flow across
+ * rings whenever the transmitting CPU changed; the DMA-LSO engine fetches
+ * the VP rings independently, so same-flow frames overtook each other on
+ * egress (the measured downstream OOO that collapsed TCP).  txq[2]/txq[3]
+ * stay initialized but idle (their /proc enq counters must read 0).
+ */
+#define CA_NI_TX_ETH_RING		1
 #define CA_NI_TX_MIN_DMA_SIZE		34	/* engine minimum */
 #define CA_NI_TX_MAX_FRAME		2047	/* 11-bit len field */
 #define CA_NI_TX_RESERVE_DESC		2	/* stock keeps 2 in hand */
@@ -1041,6 +1051,16 @@ enum cortina_ni_win {
  *     ours keeps the proven OMCI-inject convention: fe_bypass=1, no policer.)
  *     lspid stays the CPU logical port. --- */
 #define CA_NI_LSPID_PON			0x07	/* PON logical port (AAL_LPORT_PON); DS RX lspid key */
+/* AAL_LPORT_L3_WAN: when HW L3-forwarding is armed the PON PDC stamps DS data
+ * GEMs with ldpid = L3_WAN so they enter the L3FE.  A terminating / not-yet-
+ * offloaded frame MISSES the T2 hash and the CLS default action punts it to
+ * CPU_0 (mcgid 0x10) - but STG0's LPB profile has already rewritten HDR_I.lspid
+ * from PON to L3_WAN, so the frame reaches the CPU carrying lspid = L3_WAN, not
+ * PON.  This is still WAN-ingress terminating traffic (the DHCP OFFER, ICMP to
+ * the router, etc.) that belongs on the GPON WAN netdev.  LAN traffic never
+ * carries this lspid (LAN ingress = NI ports 0..6 bridged or L3_LAN 0x19 routed),
+ * so it is an unambiguous WAN-side key. */
+#define CA_NI_LSPID_L3_WAN		0x18	/* AAL_LPORT_L3_WAN; DS RX lspid after L3FE miss-punt */
 #define CA_NI_PON_DATA_TCONT		1	/* hw data T-CONT (0 = OMCC) */
 #define CA_NI_PON_DATA_COS		0	/* data queue 0 -> VoQ 8 */
 #define CA_NI_PON_DATA_LDPID		(0x20 + CA_NI_PON_DATA_TCONT)
@@ -1944,6 +1964,7 @@ enum cortina_ni_win {
  * classifier outputs (broadcast/DLF->0x32, my-MAC/ARP->0x19) then reach the
  * CPU through QM -> DeepQ -> ES7 -> RMU. */
 #define CA_NI_RX_L3LAN_LDPID		0x19
+#define CA_NI_RX_L3WAN_LDPID		0x18	/* AAL_LPORT_L3_WAN: PON-DS routed-frame classifier output (HW L3-fwd) */
 /* ★ PDPID_MAP: the "logical dest LDPID -> physical dest port" table (indirect).
  * Stock: [0x10-0x17]=0x09(CPU), [0x1d]=0x09, [0x19]=0x0d(L3_LAN), [0-6]=0x08(QM).
  * Our driver NEVER programmed it - so a redir dest never resolved to the CPU.

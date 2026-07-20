@@ -714,7 +714,8 @@ static int cortina_ni_peek_show(struct seq_file *m, void *v)
 		seq_puts(m,
 			 "usage: echo '[win] <hex_off> [count]' > /proc/cortina_ni_peek\n"
 			 "  win = ni|dma|glb|gphy|wrap|reo|mdio|intr|sgmii|peri (default ni)\n"
-			 "  gphy off is raw in the 1M window (port p bank = p*0x40000)\n");
+			 "  gphy off is raw in the 1M window (port p bank = p*0x40000)\n"
+			 "  poke: echo 'poke [win] <hex_off> <hex_val>' (SPB/SPKTP holes refused)\n");
 		return 0;
 	}
 
@@ -756,6 +757,52 @@ static ssize_t cortina_ni_peek_write(struct file *file, const char __user *ubuf,
 	tok = strsep(&p, " \t");
 	if (!tok || !*tok)
 		return -EINVAL;
+
+	/* 'poke' verb: WRITE a register for fast live RE iteration (a boot is
+	 * ~200s; a poke is instant).  usage:
+	 *   echo 'poke [win] <hex_off> <hex_val>' > /proc/cortina_ni_peek
+	 * The read-back is armed to the poked reg, so a follow-up cat shows it.
+	 * (project rule: dump/spy/poke stays a first-class, always-on feature.) */
+	if (!strcmp(tok, "poke")) {
+		void __iomem *base;
+		size_t size;
+		u32 val;
+
+		tok = p ? strsep(&p, " \t") : NULL;
+		if (!tok || !*tok)
+			return -EINVAL;
+		for (i = 0; i < ARRAY_SIZE(cortina_ni_peek_wins); i++)
+			if (!strcmp(tok, cortina_ni_peek_wins[i].name)) {
+				win = cortina_ni_peek_wins[i].win;
+				tok = p ? strsep(&p, " \t") : NULL;
+				break;
+			}
+		if (!tok || !*tok || kstrtou32(tok, 16, &off))
+			return -EINVAL;
+		tok = p ? strsep(&p, " \t") : NULL;
+		if (!tok || !*tok || kstrtou32(tok, 16, &val))
+			return -EINVAL;
+		if (off & 3)
+			return -EINVAL;			/* 32-bit aligned only */
+		/* crash-hole guard: the L3 special-packet block (SPKTP 0x333c/40,
+		 * SPB 0x3440/44) is UNMAPPED on RTL9607F silicon - a write there
+		 * hangs the CPU and async-SErrors the board (proven on live stock).
+		 * Refuse those four; every other 0x32xx-0x33xx reg is real.  */
+		if (win == CA_NI_WIN_NI &&
+		    (off == 0x333c || off == 0x3340 ||
+		     off == 0x3440 || off == 0x3444))
+			return -EPERM;
+		base = cortina_ni_peek_base(ni, win, &size);
+		if (!base)
+			return -ENODEV;
+		if (off + 4 > size)
+			return -ERANGE;
+		writel(val, base + off);
+		ni->peek.win = win;
+		ni->peek.off = off;
+		ni->peek.count = 1;
+		return len;
+	}
 
 	/* optional leading window name (non-hex first token) */
 	for (i = 0; i < ARRAY_SIZE(cortina_ni_peek_wins); i++)
@@ -1031,6 +1078,13 @@ static int cortina_ni_probe(struct platform_device *pdev)
 	ret = cortina_ni_rx_probe(ni);
 	if (ret)
 		return ret;
+
+	/* L3FE flow-engine arm + verify (nf_flow_table HW offload, phase 1).
+	 * Non-fatal: on any error the offload stays disabled and the normal
+	 * datapath is untouched. */
+	ret = cortina_ni_flowoffload_probe(ni);
+	if (ret)
+		dev_warn(dev, "L3FE flow offload disabled (%d)\n", ret);
 
 	/* arbitrary-register peek (good-vs-bad-boot diff tool) */
 	proc_create_data("cortina_ni_peek", 0644, NULL, &cortina_ni_peek_pops,

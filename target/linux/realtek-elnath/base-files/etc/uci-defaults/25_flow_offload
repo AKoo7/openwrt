@@ -1,0 +1,19 @@
+#!/bin/sh
+# Datapath fastpath defaults:
+#  - flow_offloading:    the SOFTWARE flowtable fastpath (nftables flow
+#    offload) so forwarded LAN<->WAN flows bypass the full netfilter slow
+#    path after the first packet.
+#  - flow_offloading_hw: adds `flags offload` to the fw4 flowtable so
+#    nf_flow_table pushes flows to the Cortina L3FE engine through the
+#    cortina-ni ndo_setup_tc backend (fw4 then resolves the flowtable
+#    devices to the real ports, eth0 + gpon0).  The backend only installs
+#    HW entries when booted with cortina_ni.hw_l3_fwd=1 AND the engine
+#    armed; otherwise every request is refused and flows simply stay on
+#    the software flowtable path (and fw4 falls back to software offload
+#    by itself if the kernel rejects the offload flowtable).
+uci -q batch <<-EOF
+	set firewall.@defaults[0].flow_offloading='1'
+	set firewall.@defaults[0].flow_offloading_hw='1'
+	commit firewall
+EOF
+exit 0

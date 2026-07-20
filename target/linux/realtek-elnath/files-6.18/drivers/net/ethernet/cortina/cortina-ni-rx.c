@@ -356,6 +356,28 @@ static void cortina_ni_rx_frame(struct cortina_ni *ni, u64 desc)
 	}
 
 	/*
+	 * DS-WAN delivery spy (rx_debug): a DHCP frame (UDP src/dst 67/68) is
+	 * the one DS-terminating packet we must trace when the HW-L3 miss-punt
+	 * path is under test.  Log its lspid + swid so we can see exactly what
+	 * the L3FE miss-punt hands the CPU (PON 7 vs L3_WAN 0x18 vs a LAN lspid)
+	 * and which delivery branch it will take.  Ratelimited; off by default.
+	 */
+	if (unlikely(rx_debug && !swid && off + 38 <= buf_max &&
+		     buf[off + 12] == 0x08 && buf[off + 13] == 0x00 &&
+		     buf[off + 23] == 0x11)) {
+		u16 dport = ((u16)buf[off + 36] << 8) | buf[off + 37];
+		u16 sport = ((u16)buf[off + 34] << 8) | buf[off + 35];
+
+		if (dport == 67 || dport == 68 || sport == 67 || sport == 68)
+			net_info_ratelimited(
+			  "%s: DHCP DS frame lspid=%lu swid=%u sport=%u dport=%u DA=%02x:%02x:%02x:%02x:%02x:%02x len=%d\n",
+			  netdev_name(ndev),
+			  FIELD_GET(CA_NI_HDRA_W1_LSPID, hdra_lo), swid,
+			  sport, dport, buf[off], buf[off+1], buf[off+2],
+			  buf[off+3], buf[off+4], buf[off+5], len);
+	}
+
+	/*
 	 * DS PON control frame (GPON OMCI): the PDC steers the OMCC DS GEM to
 	 * CPU port 0 with a HW-prepended 16-byte PON header — DA 00:13:25:00:
 	 * 00:00, SA 00:13:25:00:00:01, ethertype bytes [12:13] = 0xff,0xf1
@@ -380,27 +402,48 @@ static void cortina_ni_rx_frame(struct cortina_ni *ni, u64 desc)
 	 * HEADER_A.lspid = PON (7) — the lspid our PDC map entry stamps —
 	 * while LAN frames carry an NI-port lspid (0..6) and the headerless
 	 * swid format parses lspid 0.  Deliver to the GPON WAN netdev.
+	 *
+	 * ★ HW-L3-forward miss-punt (gated, cortina_ni.hw_l3_fwd=1): once the
+	 * DS data GEM is routed through the L3FE (ldpid L3_WAN), a terminating
+	 * / not-yet-offloaded frame MISSES the T2 hash and the CLS default
+	 * action punts it to CPU_0 — but STG0's LPB profile has already
+	 * rewritten HDR_I.lspid PON -> L3_WAN, so it reaches the CPU as
+	 * lspid = L3_WAN, not PON.  Deliver that to the same WAN netdev so
+	 * DHCP/ICMP-to-router terminating traffic still reaches gpon0 (the
+	 * zero-flow no-regression path).  L3_WAN is a WAN-only lspid, so this
+	 * cannot steal a LAN frame; it is additionally gated on the armed
+	 * engine so gate-off behaviour is byte-identical.
 	 */
-	if (unlikely(!swid &&
-		     FIELD_GET(CA_NI_HDRA_W1_LSPID, hdra_lo) == CA_NI_LSPID_PON)) {
-		struct net_device *wan = READ_ONCE(cortina_ni_pon_wan_ndev);
+	if (unlikely(!swid)) {
+		u32 lspid = FIELD_GET(CA_NI_HDRA_W1_LSPID, hdra_lo);
+		bool is_pon = (lspid == CA_NI_LSPID_PON);
+		bool is_l3wan = (lspid == CA_NI_LSPID_L3_WAN) &&
+				cortina_ni_hw_l3_fwd_active();
 
-		if (wan) {
-			rx->wan_frames++;
-			skb = napi_alloc_skb(&rx->napi, len);
-			if (unlikely(!skb)) {
-				rx->drop_nobuf++;
-				wan->stats.rx_dropped++;
+		if (is_pon || is_l3wan) {
+			struct net_device *wan =
+				READ_ONCE(cortina_ni_pon_wan_ndev);
+
+			if (wan) {
+				if (is_l3wan)
+					rx->wan_l3_frames++;
+				else
+					rx->wan_frames++;
+				skb = napi_alloc_skb(&rx->napi, len);
+				if (unlikely(!skb)) {
+					rx->drop_nobuf++;
+					wan->stats.rx_dropped++;
+					return;
+				}
+				skb_put_data(skb, buf + off, len);
+				skb->protocol = eth_type_trans(skb, wan);
+				napi_gro_receive(&rx->napi, skb);
+				wan->stats.rx_packets++;
+				wan->stats.rx_bytes += len;
 				return;
 			}
-			skb_put_data(skb, buf + off, len);
-			skb->protocol = eth_type_trans(skb, wan);
-			napi_gro_receive(&rx->napi, skb);
-			wan->stats.rx_packets++;
-			wan->stats.rx_bytes += len;
-			return;
+			/* no WAN netdev registered: fall through to eth0 */
 		}
-		/* no WAN netdev registered: fall through to eth0 (diagnosable) */
 	}
 
 	skb = napi_alloc_skb(&rx->napi, len);
@@ -456,6 +499,7 @@ static int cortina_ni_rx_poll_voq(struct cortina_ni *ni, unsigned int voq,
 	writel(rptr, ni_base(ni) +
 	       CA_NI_QM_EPP64_RDPTR(CA_NI_RX_CPU_PORT, voq));
 	rx->rptr[voq] = rptr;
+	rx->voq_frames[voq] += work;	/* spy: flow→voq spread (order check) */
 	return work;
 }
 
@@ -1046,37 +1090,24 @@ static void cortina_ni_rx_mc_group_init(struct cortina_ni *ni)
  * the same proven L3FE route.
  * The L2FE hashes {DA,fid} into a bucket on APPEND; we supply the full key+action.
  */
-static void cortina_ni_rx_fdb_add_cpu(struct cortina_ni *ni)
+
+/* Stage one static FDB entry {mac, vid/scind/dot1p=0} -> {ldpid, valid,
+ * static, DA/SA permit}, APPEND it, then READ-verify (status 0x5 = HIT). */
+static void cortina_ni_rx_fdb_append(struct cortina_ni *ni, const u8 *mac,
+				     u32 ldpid)
 {
-	static const u8 def_mac[ETH_ALEN] = { 0x02, 0x96, 0x07, 0xf0, 0x00, 0x01 };
-	const u8 *mac = (ni->tx && ni->tx->netdev) ?
-			ni->tx->netdev->dev_addr : def_mac;
 	u32 d0, d1, d2, d3, acc;
-	int ret;
 
 	/* key: MAC -> DATA1/2/3 (aal __aal_mac_2_fdb_data); vid/scind/dot1p = 0 */
 	d3 = (mac[0] >> 5) & 0x7;
 	d2 = ((u32)(mac[0] & 0x1f) << 27) | ((u32)mac[1] << 19) |
 	     ((u32)mac[2] << 11) | ((u32)mac[3] << 3) | ((mac[4] >> 5) & 0x7);
 	d1 = (u32)(((mac[4] & 0x1f) << 8) | mac[5]) << 19;
-	/* action: forward to L3_LAN (stock my-MAC route), valid + static +
-	 * DA/SA permit */
-	d0 = FIELD_PREP(CA_NI_L2FE_FDB_LPID, CA_NI_RX_L3LAN_LDPID) |
+	d0 = FIELD_PREP(CA_NI_L2FE_FDB_LPID, ldpid) |
 	     CA_NI_L2FE_FDB_VALID | CA_NI_L2FE_FDB_STATIC |
 	     CA_NI_L2FE_FDB_DA_PERMIT | CA_NI_L2FE_FDB_SA_PERMIT;
 
-	/* (0) ★ one-time FDB engine INIT (opcode 0) - the hash table must be built
-	 * before the first APPEND, else APPEND silently no-ops.  No DATA; longer poll
-	 * (it clears the whole table).  (APPEND itself has "nothing feedback" - the
-	 * vendor never reads cmd_return for it - so the earlier cmd_return=0 was NOT
-	 * the failure; the missing INIT was.) */
-	writel(0, ni_base(ni) + CA_NI_L2FE_FDB_CMD_RETURN);
-	writel(CA_NI_L2FE_FDB_GO | CA_NI_L2FE_FDB_OP_INIT,
-	       ni_base(ni) + CA_NI_L2FE_FDB_ACCESS);
-	ret = readl_poll_timeout(ni_base(ni) + CA_NI_L2FE_FDB_ACCESS, acc,
-				 !(acc & CA_NI_L2FE_FDB_GO), 10, 20000);
-
-	/* (1) APPEND {MAC -> DeepQ_0} */
+	/* APPEND (no cmd_return feedback - the vendor never reads it here) */
 	writel(0, ni_base(ni) + CA_NI_L2FE_FDB_CMD_RETURN);
 	writel(d3, ni_base(ni) + CA_NI_L2FE_FDB_DATA3);
 	writel(d2, ni_base(ni) + CA_NI_L2FE_FDB_DATA2);
@@ -1088,7 +1119,7 @@ static void cortina_ni_rx_fdb_add_cpu(struct cortina_ni *ni)
 			   !(acc & CA_NI_L2FE_FDB_GO), CA_NI_TX_POLL_US,
 			   CA_NI_TX_POLL_TIMEOUT_US);
 
-	/* (2) READ-back the key to VERIFY the entry installed: READ returns
+	/* READ-back the key to VERIFY the entry installed: READ returns
 	 * cmd_return.status[3:0]=0x5 (HIT) + the action in DATA0 if found. */
 	writel(0, ni_base(ni) + CA_NI_L2FE_FDB_CMD_RETURN);
 	writel(d3, ni_base(ni) + CA_NI_L2FE_FDB_DATA3);
@@ -1100,12 +1131,67 @@ static void cortina_ni_rx_fdb_add_cpu(struct cortina_ni *ni)
 			   !(acc & CA_NI_L2FE_FDB_GO), CA_NI_TX_POLL_US,
 			   CA_NI_TX_POLL_TIMEOUT_US);
 	dev_info(ni->dev,
-		 "fdb-add: %pM -> L3_LAN(0x19) : init%s readback cmd_return=0x%08x (status=0x%lx, want 0x5 HIT) data0=0x%08x\n",
-		 mac, ret ? "-timeout" : "-ok",
+		 "fdb-add: %pM -> ldpid 0x%02x : readback cmd_return=0x%08x (status=0x%lx, want 0x5 HIT) data0=0x%08x\n",
+		 mac, ldpid,
 		 readl(ni_base(ni) + CA_NI_L2FE_FDB_CMD_RETURN),
 		 FIELD_GET(GENMASK(3, 0),
 			   readl(ni_base(ni) + CA_NI_L2FE_FDB_CMD_RETURN)),
 		 readl(ni_base(ni) + CA_NI_L2FE_FDB_DATA0));
+}
+
+static void cortina_ni_rx_fdb_add_cpu(struct cortina_ni *ni)
+{
+	static const u8 def_mac[ETH_ALEN] = { 0x02, 0x96, 0x07, 0xf0, 0x00, 0x01 };
+	const u8 *mac = (ni->tx && ni->tx->netdev) ?
+			ni->tx->netdev->dev_addr : def_mac;
+	u32 acc;
+	int ret;
+
+	/* (0) ★ one-time FDB engine INIT (opcode 0) - the hash table must be built
+	 * before the first APPEND, else APPEND silently no-ops.  No DATA; longer poll
+	 * (it clears the whole table).  (APPEND itself has "nothing feedback" - the
+	 * vendor never reads cmd_return for it - so the earlier cmd_return=0 was NOT
+	 * the failure; the missing INIT was.) */
+	writel(0, ni_base(ni) + CA_NI_L2FE_FDB_CMD_RETURN);
+	writel(CA_NI_L2FE_FDB_GO | CA_NI_L2FE_FDB_OP_INIT,
+	       ni_base(ni) + CA_NI_L2FE_FDB_ACCESS);
+	ret = readl_poll_timeout(ni_base(ni) + CA_NI_L2FE_FDB_ACCESS, acc,
+				 !(acc & CA_NI_L2FE_FDB_GO), 10, 20000);
+	if (ret)
+		dev_warn(ni->dev, "fdb-add: engine INIT GO stuck\n");
+
+	/* (1) router (LAN) MAC -> L3_LAN (0x19): stock's my-MAC route */
+	cortina_ni_rx_fdb_append(ni, mac, CA_NI_RX_L3LAN_LDPID);
+
+	/* (2) ★ WAN MAC (= base+1, the stock-confirmed per-board derivation) ->
+	 * L3_WAN (0x18), gated on HW L3-forwarding.  THE terminating DS-WAN
+	 * delivery: the Venus-family design keeps L2 MY-MAC detection OFF and
+	 * "use[s] STATIC FDB to forward MyMAC packets to L3FE" (vendor
+	 * special-packet layer), i.e. stock's FDB holds its WAN MAC -> L3_WAN.
+	 * Without this entry a PON DS unicast to the WAN MAC (PDC ldpid stamp
+	 * notwithstanding) is a DLF in the L2FE and gets FLOODED OUT instead of
+	 * delivered (proven live 2026-07-19: 0/200 hades pings, l2fe_ni +200
+	 * with bm_tx +200, l3fe_rx 0; with the entry: 200/200 + DHCP lease +
+	 * WAN 0% loss).  Gate-off = byte-identical behavior (DS data then rides
+	 * the PDC CPU_0+FE_BYPASS route and never consults the FDB).
+	 * cortina_l3fe_hw_l3_forward_enable() installs the same entry at
+	 * probe-time (this path runs before the engine arms; re-arms on
+	 * link-up re-run it here with the gate true). */
+	if (cortina_ni_hw_l3_fwd_active()) {
+		u8 wan_mac[ETH_ALEN];
+		u64 v = ((u64)mac[0] << 40) | ((u64)mac[1] << 32) |
+			((u64)mac[2] << 24) | ((u64)mac[3] << 16) |
+			((u64)mac[4] << 8) | mac[5];
+
+		v++;
+		wan_mac[0] = v >> 40;
+		wan_mac[1] = v >> 32;
+		wan_mac[2] = v >> 24;
+		wan_mac[3] = v >> 16;
+		wan_mac[4] = v >> 8;
+		wan_mac[5] = v;
+		cortina_ni_rx_fdb_append(ni, wan_mac, CA_NI_RX_L3WAN_LDPID);
+	}
 }
 
 /*
@@ -1123,7 +1209,7 @@ static void cortina_ni_rx_mymac_trap(struct cortina_ni *ni)
 	static const u8 def_mac[ETH_ALEN] = { 0x02, 0x96, 0x07, 0xf0, 0x00, 0x01 };
 	const u8 *mac = (ni->tx && ni->tx->netdev) ?
 			ni->tx->netdev->dev_addr : def_mac;
-	u32 det, ctrl;
+	u32 det, ctrl, hi_p0;
 
 	/* (A) NI-global my-MAC: CFG0=bytes0-3, CFG1[7:0]=byte4, PT[31:24]=byte5 */
 	dev_emerg(ni->dev, "MYMAC 1: comparator A (0xa024/a028/a5c0)\n");
@@ -1143,17 +1229,28 @@ static void cortina_ni_rx_mymac_trap(struct cortina_ni *ni)
 	 * unmapped on Elnath so stock's SPB writes drop -> the route lives here in the
 	 * LPB vector.  Direct registers (0x3408-3434). */
 	dev_emerg(ni->dev, "MYMAC 3: STG0 LPB match (0x3404-3434)\n");
+	/* ★ WAN LPB profiles (prof0 @HIGH0, prof2 @HIGH2) = stock 0x18100190
+	 * verbatim, spcl_pkt_en (bit20) INCLUDED.  An earlier build cleared
+	 * bit20 under hw_l3_fwd on the theory the L3FE special-packet handler
+	 * diverted terminating DS-WAN frames — REFUTED 2026-07-19: the L3
+	 * special-packet behavior table behind that bit does not exist on this
+	 * die (stock ca-ne.ko stubs aal_l3_specpkt_ctrl_set/get to `mov w0,#0;
+	 * ret`, matching the 0x3440 SError), the bit is inert, and a live A/B
+	 * (bit20 0 vs 1 under hw_l3_fwd) showed identical 0%-loss DS delivery.
+	 * The real DS-WAN delivery is the static FDB WAN-MAC -> L3_WAN entry
+	 * (cortina_ni_rx_fdb_add_cpu).  Byte-match stock. */
+	hi_p0 = CA_NI_L3FE_LPB_HIGH_P0;
 	writel(CA_NI_L3FE_STG0_LDPID_MAP_VAL,
 	       ni_base(ni) + CA_NI_L3FE_STG0_LDPID_MAP);
 	writel(0, ni_base(ni) + CA_NI_L3FE_STG0_LPB_LOW0);
 	writel(CA_NI_L3FE_LPB_MID_SEL0, ni_base(ni) + CA_NI_L3FE_STG0_LPB_MID0);
-	writel(CA_NI_L3FE_LPB_HIGH_P0, ni_base(ni) + CA_NI_L3FE_STG0_LPB_HIGH0);
+	writel(hi_p0, ni_base(ni) + CA_NI_L3FE_STG0_LPB_HIGH0);
 	writel(0, ni_base(ni) + CA_NI_L3FE_STG0_LPB_LOW1);
 	writel(CA_NI_L3FE_LPB_MID_SEL1, ni_base(ni) + CA_NI_L3FE_STG0_LPB_MID1);
 	writel(CA_NI_L3FE_LPB_HIGH_P1, ni_base(ni) + CA_NI_L3FE_STG0_LPB_HIGH1);
 	writel(0, ni_base(ni) + CA_NI_L3FE_STG0_LPB_LOW2);
 	writel(CA_NI_L3FE_LPB_MID_SEL0, ni_base(ni) + CA_NI_L3FE_STG0_LPB_MID2);
-	writel(CA_NI_L3FE_LPB_HIGH_P0, ni_base(ni) + CA_NI_L3FE_STG0_LPB_HIGH2);
+	writel(hi_p0, ni_base(ni) + CA_NI_L3FE_STG0_LPB_HIGH2);
 	writel(0, ni_base(ni) + CA_NI_L3FE_STG0_LPB_LOW3);
 	writel(CA_NI_L3FE_LPB_MID_SEL1, ni_base(ni) + CA_NI_L3FE_STG0_LPB_MID3);
 	writel(CA_NI_L3FE_LPB_HIGH_P3, ni_base(ni) + CA_NI_L3FE_STG0_LPB_HIGH3);
@@ -1851,6 +1948,70 @@ static void cortina_ni_rx_cls_init(struct cortina_ni *ni)
 			       (CA_NI_L3FE_CLS_KEY_WORDS - i) * 4);
 		cortina_ni_rx_ind_store(ni, CA_NI_L3FE_CLS_KEY_ACCESS,
 					cls_key_golden[e].idx);
+	}
+
+	/*
+	 * ★ P3 T2 ADMISSION re-apply (gated hw_l3_fwd): the router-MAC CAM +
+	 * STG0 LPB mac_da_an_mask + the dedicated pri-6 routed CLS rules
+	 * (cortina_l3fe_intf_add - stock's ca_l3_intf_add scheme).  Must
+	 * re-run on every link-up because cortina_ni_rx_mymac_trap (above)
+	 * rewrites the LPB HIGH words with the stock constants, wiping the
+	 * an-mask bits.  The trap/golden rows stay byte-identical to stock:
+	 * an EARLIER build instead stamped t2_ctrl onto the catch-all FIBs
+	 * (256/257/260/264 + default 1028) - PROVEN INERT on-board
+	 * (HS_CACHE_CNT flat): a row carrying a full forwarding disposition
+	 * suppresses the T2 lookup; the admission needs the dedicated
+	 * clean-action pri-6 rule keyed on mac_da_an_sel != 0.
+	 */
+	if (cortina_ni_hw_l3_fwd_active() && ni->tx && ni->tx->netdev) {
+		int ret = cortina_l3fe_intf_add(ni_base(ni),
+						ni->tx->netdev->dev_addr);
+
+		dev_info(ni->dev,
+			 "cls: T2 admission re-applied (CAM+LPB+pri-6 routed rules) %s; lpb hi0/1/2=0x%08x/0x%08x/0x%08x\n",
+			 ret ? "FAILED" : "ok",
+			 readl(ni_base(ni) + CA_NI_L3FE_STG0_LPB_HIGH0),
+			 readl(ni_base(ni) + CA_NI_L3FE_STG0_LPB_HIGH1),
+			 readl(ni_base(ni) + CA_NI_L3FE_STG0_LPB_HIGH2));
+
+		/*
+		 * ★ P4 T2-RUN stamp on the rows a transit LAN unicast ACTUALLY
+		 * matches - the LAN cls-trap catch-alls (FIB 256/257/260/264;
+		 * the pri-6 mac_da_an_sel rules above do not key it yet).  Two
+		 * silicon facts (both proven the hard way last cycle) shape
+		 * this: (1) dpid_vld=0 DROPS at T1 on this die (it does NOT
+		 * defer to HS_DEF - clearing it black-holed SSH), so the FULL
+		 * CPU disposition is KEPT: words 0-5 stay golden {dpid_vld,
+		 * permit, mcgid=CPU_0}; a T2 HIT overrides the disposition and
+		 * forwards, a MISS leaves the CPU punt standing (stock's own
+		 * scheme - its WAN default row carries a disposition AND
+		 * t2_ctrl_vld).  (2) word6 bits [11]=t2_ctrl_vld, [15:12]=
+		 * t2_ctrl (RMW-anchor-verified on-board); profile 3 = the hash
+		 * profile the catch-all class feeds on stock (its live routed
+		 * rows carry t2_ctrl=3), and our gated enable re-points
+		 * profile 3's tuple at the 5-tuple mask 8 + traps its miss to
+		 * CPU_0.  Runs on every link-up cls re-init, so the stamp
+		 * survives the 17/21/26 s classify re-runs that reverted the
+		 * earlier probe-only pokes.
+		 */
+		for (e = 0; e < ARRAY_SIZE(cls_fib_golden); e++) {
+			u32 w6;
+
+			if (cls_fib_golden[e].idx < 256)
+				continue;	/* LAN partition rows only (US leg) */
+			w6 = (cls_fib_golden[e].w[6] & ~GENMASK(15, 11)) |
+			     BIT(11) | (3u << 12);
+			for (i = 0; i < CA_NI_L3FE_CLS_FIB_WORDS - 1; i++)
+				writel(cls_fib_golden[e].w[i],
+				       ni_base(ni) + CA_NI_L3FE_CLS_FIB_ACCESS +
+				       (CA_NI_L3FE_CLS_FIB_WORDS - i) * 4);
+			writel(w6, ni_base(ni) + CA_NI_L3FE_CLS_FIB_ACCESS + 1 * 4);
+			cortina_ni_rx_ind_store(ni, CA_NI_L3FE_CLS_FIB_ACCESS,
+						cls_fib_golden[e].idx);
+			dev_info(ni->dev,
+				 "cls: t2-run stamp FIB %u w6 0x%04x -> 0x%04x (CPU disposition kept)\n",
+				 cls_fib_golden[e].idx, cls_fib_golden[e].w[6], w6);
+		}
 	}
 
 	/* read back the broadcast row (KEY[2]) for the boot log */
@@ -3660,6 +3821,21 @@ static int cortina_ni_rx_proc_show(struct seq_file *m, void *v)
 		p19 = readl(ni_base(ni) + CA_NI_L2FE_PDPID_MAP_DATA) &
 		      CA_NI_L2FE_PDPID_MAP_PDPID;
 
+		/* PDPID_MAP[0x18] (L3_WAN): the HW-L3 DS ingress admission - a PON
+		 * PDC frame stamped ldpid L3_WAN must resolve to pdpid 0x0a (the
+		 * L3FE WAN physical ingress).  0 here = the DS data GEM's L3_WAN
+		 * frames never enter the L3FE (stock live [0x18]=0xA). */
+		{
+			u32 p18;
+
+			cortina_ni_rx_ind_read(ni, CA_NI_L2FE_PDPID_MAP_ACCESS,
+					       CA_NI_RX_L3WAN_LDPID);
+			p18 = readl(ni_base(ni) + CA_NI_L2FE_PDPID_MAP_DATA) &
+			      CA_NI_L2FE_PDPID_MAP_PDPID;
+			seq_printf(m, "fwd-chain: pdpid[0x18]=0x%x (L3_WAN; stock 0x0a = L3FE WAN ingress; 0 = DS never enters L3FE)\n",
+				   p18);
+		}
+
 		/* ★ pdpid[0x19]=0x0d (L3_LAN) is STOCK-CORRECT (vendor aal_port.h: 0x0d=L3_LAN,
 		 * 0x08=QM, 0x09=CPU).  The old "(want 0x8)" was WRONG - 0x08=QM egresses a wire
 		 * via L2TM, NOT the CPU.  On stock the CLS trap overrides L2 fwd -> dest CPU_0
@@ -4246,9 +4422,15 @@ static int cortina_ni_rx_proc_show(struct seq_file *m, void *v)
 	seq_printf(m, "gphy: fault=0x%04x last=0x%04x recoveries=%llu rearms=%llu\n",
 		   cortina_ni_rx_gphy_fault(ni), rx->last_fault,
 		   rx->recoveries, rx->rearms);
-	seq_printf(m, "frames=%llu bytes=%llu polls=%llu swid=%llu pon=%llu wan=%llu\n",
+	seq_printf(m, "frames=%llu bytes=%llu polls=%llu swid=%llu pon=%llu wan=%llu wan_l3=%llu\n",
 		   rx->frames, rx->bytes, rx->polls, rx->swid_frames,
-		   rx->pon_frames, rx->wan_frames);
+		   rx->pon_frames, rx->wan_frames, rx->wan_l3_frames);
+	/* packet-order spy: one flow must stay on ONE voq (>=2 climbing under a
+	 * unidirectional bench = HW spreads the flow, drain order can reorder) */
+	seq_puts(m, "voq_frames:");
+	for (i = 0; i < CA_NI_RX_VOQ_COUNT; i++)
+		seq_printf(m, " %d:%llu", i, rx->voq_frames[i]);
+	seq_puts(m, "\n");
 	seq_printf(m, "drops: nosop=%llu badpa=%llu len=%llu nobuf=%llu dead=%llu\n",
 		   rx->drop_nosop, rx->drop_badpa, rx->drop_len,
 		   rx->drop_nobuf, rx->slot_dead);

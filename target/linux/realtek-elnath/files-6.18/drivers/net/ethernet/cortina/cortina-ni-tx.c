@@ -15,10 +15,12 @@
  * TX model (the "direct TX to LAN" descriptor mode of this chip generation):
  * the 8-byte ring descriptor itself carries the destination port and CoS
  * (mode=1/direct=0), the buffer is a plain Ethernet frame - no prepended
- * header.  CPU n rings DMA-LSO virtual port n+2, TX queue 0.  Completion is
- * reported through a HW read pointer which we reclaim opportunistically at
- * xmit time plus from a periodic timer (the engine has no TX-done IRQ wired
- * in this minimal bring-up).
+ * header.  Ring assignment is FIXED per netdev for packet order (see the
+ * comment in cortina_ni_start_xmit): eth0 -> txq[CA_NI_TX_ETH_RING] (VP3),
+ * PON US OMCI + WAN data -> txq[0] (VP2); TX queue 0 within each VP.
+ * Completion is reported through a HW read pointer which we reclaim
+ * opportunistically at xmit time plus from a periodic timer (the engine has
+ * no TX-done IRQ wired in this minimal bring-up).
  */
 
 #include <linux/bitfield.h>
@@ -618,9 +620,29 @@ static netdev_tx_t cortina_ni_start_xmit(struct sk_buff *skb,
 		return NETDEV_TX_OK;
 	}
 
-	/* CPU n owns VP n+2; ndo_start_xmit runs with BH off so the CPU id
-	 * is stable and each CPU has a private ring (vendor scheme) */
-	q = &tx->txq[raw_smp_processor_id() % CA_NI_TX_NUM_VPS];
+	/*
+	 * ★ PACKET ORDER (the downstream OOO/TCP-collapse root cause): eth0 is
+	 * a SINGLE-queue netdev, so it must feed exactly ONE HW ring.  The old
+	 * per-CPU pick here — q = &txq[raw_smp_processor_id() % NUM_VPS], the
+	 * vendor scheme (stock __ca_ni_start_xmit @0x1ae230 selects its DMA-LSO
+	 * VP via ca_ni_dmalso_vp_sel[cpu % 7] = {8,1,2,3,9,10,11}) — split one
+	 * flow across up to 4 VP rings whenever the transmitting CPU changed
+	 * (IRQ/NAPI migration across the 8 RX SPIs, qdisc-runner handoff, RPS).
+	 * The DMA-LSO engine fetches the VP rings independently, so same-flow
+	 * frames overtake each other on the port-0 wire: OOO scaling with rate
+	 * (7@100M → 25%@600M), which TCP reads as loss → spurious-retransmit
+	 * storms.  Stock gets away with the per-CPU scheme because its bulk
+	 * traffic is HW-forwarded (CPU TX is slow-path only) and its netdevs
+	 * are 8-queue mq (flow→queue pinned by the stack); we CPU-forward
+	 * everything, so wire order must equal qdisc order: one netdev queue →
+	 * one ring.  The qdisc already serializes xmit for a single-queue
+	 * netdev (one CPU in qdisc_run at a time, in-order dequeue), so a
+	 * fixed ring restores strict per-flow order with no new locking;
+	 * q->lock still guards against the reclaim timer.  eth0 rides its OWN
+	 * ring (VP3), leaving txq[0] (VP2) to the PON OMCI/WAN-data path, so
+	 * the two in-order streams neither share a lock nor stall each other.
+	 */
+	q = &tx->txq[CA_NI_TX_ETH_RING];
 
 	spin_lock(&q->lock);
 
@@ -1082,6 +1104,10 @@ static const struct net_device_ops cortina_ni_netdev_ops = {
 	.ndo_start_xmit		= cortina_ni_start_xmit,
 	.ndo_set_mac_address	= eth_mac_addr,
 	.ndo_validate_addr	= eth_validate_addr,
+#if IS_ENABLED(CONFIG_CORTINA_NI_FLOWOFFLOAD)
+	/* L3FE flow-engine nf_flow_table offload (cortina-ni-flowoffload.c) */
+	.ndo_setup_tc		= cortina_ni_setup_tc,
+#endif
 };
 
 /* ------------------------------------------------------------------ */

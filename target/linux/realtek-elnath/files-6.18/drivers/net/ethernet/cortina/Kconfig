@@ -30,6 +30,18 @@ config CORTINA_NI
 	  the Realtek RTL9607F "Elnath" GPON SoC, including its internal
 	  MDIO bus and quad GbE PHYs.
 
+config CORTINA_NI_FLOWOFFLOAD
+	bool "Cortina-Access NI L3FE nf_flow_table hardware flow offload"
+	depends on CORTINA_NI
+	help
+	  Drive the NE L3FE "main hash" flow engine (64K-entry NAPT
+	  accelerator, mtk_ppe class) as an nf_flow_table hardware offload
+	  backend on the RTL9607F "Elnath": ndo_setup_tc(TC_SETUP_FT/BLOCK)
+	  flow_block glue, the software-computed CRC32/CRC16 install path,
+	  age-based go-live/teardown and the batch liveness sweep.  When
+	  disabled (or when the engine fails bring-up) every offload request
+	  is refused and traffic stays on the normal software path.
+
 config CORTINA_GPON
 	tristate "Cortina-Access RTL9607F GPON MAC"
 	depends on OF
