@@ -40,9 +40,17 @@ define Device/realtek_rtl9607f_x411axf
   #                          (the 5G efuse has no RF-frontend type, rfe_type
   #                          255, so the country comes from config, not HW)
   #     iw                 - on-device verification (iw dev / iw reg get)
+  #   PPPoE WAN client (runtime-selectable; the default WAN stays DHCP/IPoE -
+  #   flip with `uci set network.wan.proto='pppoe'` + username/password):
+  #     ppp ppp-mod-pppoe - pppd + the rp-pppoe plugin (PADI/PADO/PADR/session)
+  #       and the netifd ppp/pppoe proto handlers
+  #     kmod-ppp kmod-pppox kmod-pppoe - PPP core + PPPoE socket/session kernel
+  #       modules (their package KCONFIG brings CONFIG_PPP/PPPOE=m into the
+  #       kernel build; the lean per-model config-6.18 needs no hand edit)
   DEVICE_PACKAGES := dnsmasq firewall4 \
 	luci-base luci-mod-admin-full luci-theme-bootstrap \
 	uhttpd uhttpd-mod-ubus rpcd rpcd-mod-file \
-	wpad-basic-mbedtls wifi-scripts wireless-regdb iw
+	wpad-basic-mbedtls wifi-scripts wireless-regdb iw \
+	ppp ppp-mod-pppoe kmod-ppp kmod-pppox kmod-pppoe
 endef
 TARGET_DEVICES += realtek_rtl9607f_x411axf

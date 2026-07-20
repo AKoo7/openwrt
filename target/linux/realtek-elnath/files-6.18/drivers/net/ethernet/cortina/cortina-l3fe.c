@@ -114,6 +114,37 @@
 #define L3FE_PE_CFG_GEMID_MAP		BIT(10)
 #define L3FE_LDPID_PON_US_0		0x20	/* AAL_LPORT_PON_US_0 */
 
+/*
+ * L3FE PE PPPoE encap globals (direct MMIO, one-time; tier-2 disasm-confirmed
+ * on the shipped ca-ne.ko: aal_l3pe_pppoe_cfg_set writes base+0x3500,
+ * aal_l3pe_pppoe_ipv4/ipv6_prot_set write base+0x3504).  Consumed by the PE
+ * only when a hit-action carries the PPPoE ADD encap (pppoe_set=1 +
+ * pppoe_vld=1): CFG supplies the header's code/version/type, PROT_CFG the
+ * PPP protocol number per inner IP version.  The 0x8864 ethertype is fixed/
+ * implicit and the PPPoE payload length is HW-computed per packet.
+ * Facts: scratchpad RE_pppoe_aal77c.md section 3d / PPPoE_DRIVER_SPEC.md 2a.
+ */
+#define L3FE_PE_PPPOE_CFG		0x3500	/* [15:8]=code 0 (session), [7:4]=ver 1, [3:0]=type 1 */
+#define L3FE_PE_PPPOE_CFG_VAL		0x00000011u
+#define L3FE_PE_PPPOE_PROT_CFG		0x3504	/* [15:0]=v4 PPP-proto 0x0021, [31:16]=v6 0x0057 */
+#define L3FE_PE_PPPOE_PROT_CFG_VAL	0x00570021u
+
+/*
+ * Egress L3-IF table (fe_l3e_if_tbl): 32 x 32-bit entries, GLB indirect
+ * access (same GO|WRITE protocol as the mask table) - tier-2 binary-confirmed
+ * descriptor {access=0xf4303000, 1 data reg, 32 entries}.  Entry, LSB-first:
+ * pppoe_set:1(b0) pppoe_vld:1(b1) pppoe_session_id:16(b2-17) mac_sa_vld:1(b18)
+ * mac_sa_an_sel:4(b19-22) pppoe_len_control:1(b23).  A hit-action selects an
+ * entry via GROUP_20 l3_if_vld1 + egr_l3_if_idx1; with pppoe_set+pppoe_vld the
+ * PE inserts the 8-byte PPPoE session header (mac_sa_vld=0: SMAC untouched).
+ */
+#define L3FE_L3IF_ACCESS		0x3000
+#define L3FE_L3IF_DATA			0x3004
+#define L3FE_L3IF_ENTRIES		32
+#define L3FE_L3IF_PPPOE_SET		BIT(0)
+#define L3FE_L3IF_PPPOE_VLD		BIT(1)
+#define L3FE_L3IF_PPPOE_SESSION		GENMASK(17, 2)
+
 /* HW ager cadence for the gated experiment: non-zero so the on-chip ager
  * runs and the lookup's HIT age-re-arm is observable (the SECONDARY hit
  * witness - with granularity 0 the ager block is off and the age slot reads
@@ -232,6 +263,9 @@
  * partition; sub-slot 0. */
 #define L3FE_CLS_KEY_ROW_WAN		3
 #define L3FE_CLS_KEY_ROW_LAN		67
+/* The pri-8 WAN non-IP control trap (PPPoE LCP/IPCP/PAP/CHAP etc) - next
+ * free row of the WAN partition. */
+#define L3FE_CLS_KEY_ROW_WAN_CTL	4
 #define L3FE_CLS_FIB_IDX(key_row)	((key_row) << 2)
 
 /*
@@ -366,8 +400,13 @@ static const u32 l3fe_mask_lo[9][4] = {
 	{ 0xffffffff, 0x027fffff, 0xfffff000, 0xc0ffffff },
 	{ 0xffffffff, 0x027fffff, 0xff7ff000, 0xffffffff },
 	{ 0x000003ff, 0x0221f000, 0x15001402, 0xc0f03fe1 },
-	/* mask 8: 5-tuple only (mask0 | ~mask1, swolearn-verified) */
-	{ 0x000003ff, 0xffa1f000, 0xf5bfdfff, 0xffffffff },
+	/* mask 8: 5-tuple only (mask0 | ~mask1, swolearn-verified).  DATA2 also
+	 * excludes the PPPoE session fields (pppoe_session_id @ mask-bit 89,
+	 * pppoe_type @ 91) so a PPPoE-session frame's parsed key (session != 0)
+	 * still matches the sparse install key on the inner 5-tuple; a no-op for
+	 * IPoE (those fields are 0 either way).  ppp_protocol_enc/pppoe_code_enc
+	 * (bits 88/90) are already excluded. */
+	{ 0x000003ff, 0xffa1f000, 0xffbfdfff, 0xffffffff },
 };
 static const u32 l3fe_mask_hi[9][4] = {
 	{ 0xffff807f, 0xffffffff, 0xfeffffff, 0xffffffff },
@@ -632,6 +671,41 @@ static const struct { u16 idx; u32 w[L3FE_CLS_KEY_WORDS]; } l3fe_cls_routed_key[
 	/* LAN ingress: an_sel=1 (LAN gateway MAC, CAM idx 0), lspid=0x19, pri 6 */
 	{ L3FE_CLS_KEY_ROW_LAN, { 0xFFFFFFFF, 0xFFFFFFFF, 0x00032FE2, 0, 0,
 				  0, 0, 0, 0, 0, 0x08180000 } },
+	/*
+	 * ★ WAN NON-IP CONTROL TRAP (the PPPoE LCP un-mangle fix).  Key:
+	 * {ip_vld == 0 EXACT}, everything else don't-care; pri 8 (= stock
+	 * CL_RUL_PRIO_L3_TUNNEL_PPPOE - above the pri-6 routed rule, below the
+	 * pri-9 IP-multicast traps); slot 0 only.  This row lives in the WAN
+	 * partition (KEY[0..63]) so it is searched only by WAN-ingress frames.
+	 *
+	 * WHY: with hw_l3_fwd on, a DS 0x8864 PPPoE frame whose inner PPP proto
+	 * is a CONTROL proto (LCP 0xc021 / IPCP 0x8021 / IPV6CP 0x8057 / PAP
+	 * 0xc023 / CHAP 0xc223) rode the pri-6 routed row into T2, missed, and
+	 * the HS_DEF CPU punt re-emerged from the PE with the PPP proto
+	 * mangled / the frame decapsulated, so pppd never saw the LCP frame and
+	 * the session could not establish (BOARD-PROVEN 2026-07-20: DS LCP
+	 * Conf-Req/Ack left hades on-wire but reached pppd 0/0; a keep_orig CPU
+	 * trap delivered them and LCP+IPCP completed to a 10.99.99.x lease).
+	 * All control protos parse ip_vld=0 (no inner IP) while 0x0021/0x0057
+	 * session DATA parses ip_vld=1 - so ip_vld==0 is exactly the control-
+	 * vs-data split and this row steals NOTHING from the L3FE data path
+	 * (IPoE and PPPoE DATA both carry ip_vld=1 and keep the routed pri-6 ->
+	 * T2 path).  Mirrors the stock LCP/IPCP scheme (cortina-api
+	 * classifier.c cls_rule_add aal_customize CA_CLASSIFIER_AAL_L3_PPP_LCP/
+	 * _IPCP/_IP6CP: trap to CPU with keep_orig_pkt=1) WITHOUT the PPP-proto
+	 * CAM: ip_vld==0 covers every control proto in one row.  Non-IP non-
+	 * PPPoE WAN frames (ARP, 0x8863 Discovery) also land here - they were
+	 * already CPU-bound (T2 can never hit a frame with no 5-tuple), now
+	 * just delivered with original bytes (no PE edit).  ★ lspid==0x18 was
+	 * NOT added to the key: board-proven, these DS control frames do NOT
+	 * carry lspid 0x18 at the CLS (adding it dropped every match); ip_vld==0
+	 * in the WAN partition is already WAN-scoped and sufficient.  Word
+	 * build: word0 0xFFFFFCFF = msk_ip_vld=0/ip_vld=0 (bits 8/9), rest
+	 * don't-care (word2 0x0007FFFF like the WAN all-wildcard trap); trailer
+	 * pri=8 valid=slot0 (0x08200000).
+	 */
+	{ L3FE_CLS_KEY_ROW_WAN_CTL, { 0xFFFFFCFF, 0xFFFFFFFF, 0x0007FFFF, 0, 0,
+				      0, 0, 0, 0, 0, 0x08200000 } },
 };
 static const struct { u16 idx; u32 w[L3FE_CLS_FIB_WORDS]; } l3fe_cls_routed_fib[] = {
 	/* WAN: run T2 profile 0, stage2(NAT)=UPDATE+vld, no fwd disposition */
@@ -640,6 +714,19 @@ static const struct { u16 idx; u32 w[L3FE_CLS_FIB_WORDS]; } l3fe_cls_routed_fib[
 	/* LAN: run T2 profile 1 */
 	{ L3FE_CLS_FIB_IDX(L3FE_CLS_KEY_ROW_LAN),
 	  { 0, 0, 0, 0, 0, 0x04000000, 0x00001A00 } },
+	/*
+	 * WAN non-IP control trap action: the stock unicast->CPU_0 disposition
+	 * bytes (golden FIB[4]: w4 0x1C000000 = dpid_vld|dpid_pri|permit @bits
+	 * 154-156, w5 mcgid=0x10 CPU_0 @158-167 + stage3_ctrl_vld @184, w6
+	 * 0x200) PLUS keep_orig_pkt_vld|keep_orig_pkt (w5 bits 22/23 = abs bits
+	 * 182/183, cls_fib_mod_0/1_t msk_ctrl run - offsets anchored tier-1 by
+	 * dpid @154-156, mcgid @162 and stage2_ctrl_vld @186 in the same run):
+	 * deliver the ORIGINAL frame bytes, no PE re-encap - so the punted LCP
+	 * keeps its real PPP proto.  No t2_ctrl: a dispositioned frame gets no
+	 * T2 lookup (control frames need none).
+	 */
+	{ L3FE_CLS_FIB_IDX(L3FE_CLS_KEY_ROW_WAN_CTL),
+	  { 0, 0, 0, 0, 0x1C000000, 0x01C00004, 0x00000200 } },
 };
 
 /* WAN MAC = LAN/base MAC + 1 (per-board rule, stock-verified). */
@@ -796,6 +883,15 @@ int cortina_l3fe_hw_l3_forward_enable(void __iomem *ne, const u8 *router_mac)
 		writel(v, ne + L3FE_PE_CFG);
 	}
 
+	/* 2c-bis. PPPoE PE encap globals (one-time): header code/version/type
+	 * + the v4/v6 PPP protocol numbers the PE stamps when a hit-action
+	 * requests the PPPoE ADD encap.  Inert until an action carries
+	 * pppoe_set/pppoe_vld - which only happens when a PPPoE WAN session is
+	 * armed (cortina_ni_wan_pppoe_session_set); zero-flow and IPoE
+	 * behaviour unchanged. */
+	writel(L3FE_PE_PPPOE_CFG_VAL, ne + L3FE_PE_PPPOE_CFG);
+	writel(L3FE_PE_PPPOE_PROT_CFG_VAL, ne + L3FE_PE_PPPOE_PROT_CFG);
+
 	/* 2d. Slow HW ager ON (SECONDARY hit witness): with granularity 0 the
 	 * ager block never runs and the age slot reads stale, so the age
 	 * re-arm could never witness a hit (that broke the last cycle's
@@ -859,4 +955,29 @@ int cortina_l3fe_hw_l3_forward_enable(void __iomem *ne, const u8 *router_mac)
 	}
 
 	return 0;
+}
+
+/*
+ * Program (or clear, @session == 0) one egress L3-IF entry as a pure PPPoE
+ * ADD-header entry: {pppoe_set=1, pppoe_vld=1, pppoe_session_id=@session},
+ * mac_sa_vld=0 (SMAC untouched), pppoe_len_control=0 (HW auto-length).  A US
+ * hit-action that sets GROUP_20 {pppoe_set1, pppoe_vld1, l3_if_vld1,
+ * egr_l3_if_idx1=@idx} then HW-inserts the 8-byte 0x8864 session header on
+ * egress (the PE globals 0x3500/0x3504 supply code/ver/type + PPP-proto).
+ * Called only under the hw_l3_fwd gate; an unreferenced entry is inert.
+ */
+int cortina_l3fe_pppoe_l3if_set(void __iomem *ne, u32 idx, u16 session)
+{
+	u32 entry = 0;
+
+	if (idx >= L3FE_L3IF_ENTRIES)
+		return -EINVAL;
+	if (session)
+		entry = L3FE_L3IF_PPPOE_SET | L3FE_L3IF_PPPOE_VLD |
+			FIELD_PREP(L3FE_L3IF_PPPOE_SESSION, session);
+
+	writel(entry, ne + L3FE_L3IF_DATA);
+	writel(L3FE_GO | L3FE_WRITE | (idx & (L3FE_L3IF_ENTRIES - 1)),
+	       ne + L3FE_L3IF_ACCESS);
+	return l3fe_poll_clear(ne, L3FE_L3IF_ACCESS, L3FE_GO);
 }

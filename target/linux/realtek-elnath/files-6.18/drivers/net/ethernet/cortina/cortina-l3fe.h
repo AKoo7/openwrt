@@ -117,4 +117,14 @@ int cortina_l3fe_intf_add(void __iomem *ne, const u8 *lan_mac);
 int cortina_l3fe_swo_crc(void __iomem *ne, const u32 *words, int nwords,
 			 u32 mask_id, u32 *crc32_out, u16 *crc16_out);
 
+/*
+ * PPPoE WAN egress encap: program (or clear, @session == 0) egress L3-IF
+ * table entry @idx as a pure PPPoE ADD-header entry {pppoe_set, pppoe_vld,
+ * pppoe_session_id=@session} (SMAC untouched, HW auto-length).  A US
+ * hit-action selects it via GROUP_20 l3_if_vld1/egr_l3_if_idx1 to HW-insert
+ * the 8-byte 0x8864 session header.  hw_l3_fwd-gated caller only; caller
+ * serializes (reg_lock).  Returns 0 or -EINVAL/-ETIMEDOUT.
+ */
+int cortina_l3fe_pppoe_l3if_set(void __iomem *ne, u32 idx, u16 session);
+
 #endif /* _CORTINA_L3FE_H */

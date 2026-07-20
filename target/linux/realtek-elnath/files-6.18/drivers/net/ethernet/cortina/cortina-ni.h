@@ -240,6 +240,14 @@ int cortina_l3fe_intf_add(void __iomem *ne, const u8 *lan_mac);
  * ldpid offset) - never a compiled-in constant.
  */
 void cortina_ni_gpon_data_path_set(u16 gem_id, u8 tcont_idx);
+/*
+ * LIVE PPPoE WAN session push (offload backend): report the negotiated PPPoE
+ * session id when the WAN runs PPPoE (0 = torn down / IPoE WAN).  US
+ * hit-actions then HW-insert the 8-byte PPPoE header via the dedicated egress
+ * L3-IF entry; session 0 keeps the proven IPoE action shape byte-identical.
+ * First bring-up feeds it via /proc/cortina_l3fe ("pppoe <sess>").
+ */
+int cortina_ni_wan_pppoe_session_set(u16 session);
 #else
 static inline int cortina_ni_flowoffload_probe(struct cortina_ni *ni)
 {
@@ -260,6 +268,10 @@ static inline int cortina_l3fe_intf_add(void __iomem *ne, const u8 *lan_mac)
 }
 static inline void cortina_ni_gpon_data_path_set(u16 gem_id, u8 tcont_idx)
 {
+}
+static inline int cortina_ni_wan_pppoe_session_set(u16 session)
+{
+	return -EOPNOTSUPP;
 }
 #endif
 void cortina_ni_rx_open(struct cortina_ni *ni);

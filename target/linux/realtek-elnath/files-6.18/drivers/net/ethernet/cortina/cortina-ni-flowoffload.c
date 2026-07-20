@@ -436,6 +436,12 @@ struct cn_l3e {
 	 * data path armed (US forward action is left CPU-only). */
 	u16		data_gem;
 	u8		data_tcont;
+	/* LIVE PPPoE WAN session id (0 = IPoE WAN / no session - the default;
+	 * US hit-actions then stay byte-identical to the proven IPoE shape).
+	 * Set via cortina_ni_wan_pppoe_session_set (or /proc "pppoe <sess>")
+	 * when the WAN negotiates a PPPoE session; a US hit-action then adds
+	 * the 8-byte PPPoE header via the dedicated egress L3-IF entry. */
+	u16		data_pppoe_session;
 };
 
 static struct cn_l3e *cn_l3e;
@@ -635,6 +641,7 @@ static int cn_l3e_age_set(struct cn_l3e *l3e, u32 idx, u32 age)
 	u32 data_reg = (idx & 0x10) ? CN_L3E_HS_AGE_DATA_HI
 				    : CN_L3E_HS_AGE_DATA_LO;
 	u32 shift = (idx & 0xf) * 2;
+	const char *phase = "latch";
 	unsigned long flags;
 	u32 w;
 	int ret;
@@ -649,10 +656,17 @@ static int cn_l3e_age_set(struct cn_l3e *l3e, u32 idx, u32 age)
 	w = (w & ~(3u << shift)) | ((age & 3) << shift);
 	writel(w, l3e->ne_base + data_reg);
 
+	phase = "commit";
 	ret = cn_l3e_go(l3e, CN_L3E_HS_AGE_ACCESS,
 			bucket | CN_L3E_WRITE | CN_L3E_GO, CN_L3E_GO);
 out:
 	spin_unlock_irqrestore(&l3e->reg_lock, flags);
+	/* which GO timed out matters: a "commit" timeout means the age write
+	 * WAS issued and may land late - the entry can go live after an error
+	 * return, so the caller must fully undo (blackhole-safety). */
+	if (ret)
+		pr_err("cortina-l3fe: age_set idx=%u age=%u: %s GO timeout (%d)\n",
+		       idx, age, phase, ret);
 	return ret;
 }
 
@@ -747,6 +761,9 @@ static int cn_l3e_cache_invalidate(struct cn_l3e *l3e, u32 idx, u16 crc16)
 				readl(l3e->ne_base + CN_L3E_HS_CACHE_CTRL_REQ) | 1,
 				BIT(0));
 	spin_unlock_irqrestore(&l3e->reg_lock, flags);
+	if (ret)
+		pr_err("cortina-l3fe: cache_invalidate idx=%u crc16=%04x FAILED (%d) - a stale cached action may keep matching\n",
+		       idx, crc16, ret);
 	return ret;
 }
 
@@ -763,22 +780,33 @@ static int cn_l3e_flow_add(struct cn_l3e *l3e, const struct cn_l3e_key *key,
 	int way, ret;
 
 	ret = cn_l3e_key_hash(l3e, key, profile, mask_id, &crc32, &crc16);
-	if (ret)
+	if (ret) {
+		pr_err("cortina-l3fe: flow_add: SWO key-hash timeout (%d)\n",
+		       ret);
 		return ret;	/* SWO timeout: refuse, flow stays on the sw path */
+	}
 
 	/* SW way-pick inside the 8-way hash bucket (stock hb_size = 1);
 	 * guard: keep entry 0 free (its {crc16, slot} cache tag is all-zero
 	 * and aliases an empty cache way) */
 	base = crc16 & ~(u32)(CN_L3E_HASH_WAYS - 1);
 	for (way = 0; way < CN_L3E_HASH_WAYS; way++)
-		if (l3e->shadow_crc32[base + way] == crc32)
+		if (l3e->shadow_crc32[base + way] == crc32) {
+			/* normal dup-key (not an error): flow already installed */
+			pr_debug("cortina-l3fe: flow_add: EEXIST idx=%u crc32=%08x crc16=%04x\n",
+				 base + way, crc32, crc16);
 			return -EEXIST;
+		}
 	way = (base == 0) ? 1 : 0;
 	for (; way < CN_L3E_HASH_WAYS; way++)
 		if (!l3e->shadow_crc32[base + way])
 			break;
-	if (way == CN_L3E_HASH_WAYS)
-		return -ENOSPC;	/* bucket full: flow stays on the sw path */
+	if (way == CN_L3E_HASH_WAYS) {
+		/* bucket full: the flow simply stays on the sw path (not an error) */
+		pr_debug("cortina-l3fe: flow_add: bucket FULL base=%u crc16=%04x\n",
+			 base, crc16);
+		return -ENOSPC;
+	}
 	idx = base + way;
 
 	/* 1. action FIB, 2. key word, 3. age = go-live (order matters) */
@@ -791,9 +819,19 @@ static int cn_l3e_flow_add(struct cn_l3e *l3e, const struct cn_l3e_key *key,
 
 	ret = cn_l3e_age_set(l3e, idx, CN_L3E_AGE_START);
 	if (ret) {
+		/* ★ Blackhole-safety: a "commit" GO timeout means the age
+		 * write WAS issued and can land late - the entry may go LIVE
+		 * after this error return.  Fully undo: kill the key first
+		 * (no new matches), zero the action, then best-effort force
+		 * the age back to FREE and invalidate the action cache so a
+		 * transient hit can never leave a stale cached action
+		 * matching {crc16, slot} with an all-zero (= discard) FIB. */
 		l3e->key_tbl[idx] = 0;
 		memset(l3e->fib_tbl + (size_t)idx * CN_L3E_FIB_BYTES, 0,
 		       CN_L3E_FIB_BYTES);
+		wmb();
+		cn_l3e_age_set(l3e, idx, CN_L3E_AGE_FREE);
+		cn_l3e_cache_invalidate(l3e, idx, crc16);
 		return ret;
 	}
 
@@ -806,19 +844,25 @@ static int cn_l3e_flow_add(struct cn_l3e *l3e, const struct cn_l3e_key *key,
 
 static int cn_l3e_flow_del(struct cn_l3e *l3e, u32 idx, u16 crc16)
 {
-	int ret;
+	int age_ret, inv_ret;
 
-	ret = cn_l3e_age_set(l3e, idx, CN_L3E_AGE_FREE);
-	if (ret)
-		return ret;
+	/* ★ Blackhole-safety: run EVERY teardown step even when one fails.
+	 * The old early-return on an age timeout left the full entry (key +
+	 * action + live age) orphaned and matching forever.  Kill the key
+	 * FIRST (no new lookups can match an entry whose CRC is 0), zero the
+	 * action, then the age and the action cache; report the first error
+	 * but never skip a step because of it. */
+	l3e->key_tbl[idx] = 0;
 	memset(l3e->fib_tbl + (size_t)idx * CN_L3E_FIB_BYTES, 0,
 	       CN_L3E_FIB_BYTES);
-	l3e->key_tbl[idx] = 0;
 	wmb();
 	l3e->shadow_crc32[idx] = 0;
 	l3e->shadow_crc16[idx] = 0;
 
-	return cn_l3e_cache_invalidate(l3e, idx, crc16);
+	age_ret = cn_l3e_age_set(l3e, idx, CN_L3E_AGE_FREE);
+	inv_ret = cn_l3e_cache_invalidate(l3e, idx, crc16);
+
+	return age_ret ? age_ret : inv_ret;
 }
 
 /* ------------------------------------------------------------------ */
@@ -854,6 +898,14 @@ static bool hw_l3_fwd;
 module_param(hw_l3_fwd, bool, 0644);
 MODULE_PARM_DESC(hw_l3_fwd,
 	"enable HW L3-forwarding into the L3FE main hash, miss->CPU (default OFF; needs zero-flow no-regression proof)");
+
+/* # of installed nf_flow_table flows (the /proc auto_flows counter); defined
+ * here so the PPPoE session-set path below can gate its BUG-B flush on it. */
+static atomic_t cn_flow_installed = ATOMIC_INIT(0);
+
+/* Flush every installed nf_flow_table flow (defined after the flow table
+ * below); used on a PPPoE sid change - see BUG-B. */
+static void cn_l3e_flush_auto_flows(struct cn_l3e *l3e);
 
 /*
  * Cross-module gate probe for the WAN-side ingress admission: the GPON
@@ -892,6 +944,65 @@ EXPORT_SYMBOL_GPL(cortina_ni_gpon_data_path_set);
  * a T-CONT <= 7 rides the deep queue (vendor flow.c:1116). */
 #define CN_L3E_PON_DEEPQ_TCONT_MAX	7
 
+/* The dedicated egress L3-IF entry carrying the PPPoE WAN session header
+ * (entry 1; 0 is left free so an all-zero egr_l3_if_idx never aliases it). */
+#define CN_L3E_PPPOE_L3IF_IDX		1
+
+/*
+ * LIVE PPPoE WAN session push (0 = torn down / IPoE).  Same push model as
+ * cortina_ni_gpon_data_path_set above: called when the WAN (re)negotiates a
+ * PPPoE session - for the first bring-up via /proc/cortina_l3fe
+ * ("pppoe <sess>"), later from the WAN-config plumbing.  Programs the
+ * dedicated egress L3-IF entry {pppoe_set, pppoe_vld, session} that US
+ * hit-actions select (cn_l3e_set_us_egress); session 0 clears it.  The HW
+ * write only happens under the hw_l3_fwd gate (matching every other L3FE
+ * datapath write); gate-off is byte-identical.
+ */
+int cortina_ni_wan_pppoe_session_set(u16 session)
+{
+	struct cn_l3e *l3e = cn_l3e;
+	unsigned long flags;
+	int ret = 0;
+
+	if (!l3e)
+		return -ENODEV;
+
+	/* ★ BUG-B: a REAL session-id change invalidates every offloaded flow -
+	 * they all ride the SINGLE shared L3-IF[1] entry, so once it is
+	 * reprogrammed with the new sid the old flows would emit the new (or,
+	 * on a clear, an absent) header on the wire.  Flush them so
+	 * nf_flow_table reinstalls the still-live conntracks against the new
+	 * sid; never leave a live flow carrying a stale sid.  Cheap + rare;
+	 * the entry_by_idx scan avoids an rhashtable-walk use-after-free.
+	 * ★ Caller MUST hold cn_flow_offload_mutex (both in-tree callers do:
+	 * the /proc "pppoe" write and cn_l3e_set_us_egress via cn_flow_replace). */
+	if (session != READ_ONCE(l3e->data_pppoe_session) &&
+	    atomic_read(&cn_flow_installed))
+		cn_l3e_flush_auto_flows(l3e);
+
+	if (hw_l3_fwd) {
+		spin_lock_irqsave(&l3e->reg_lock, flags);
+		ret = cortina_l3fe_pppoe_l3if_set(l3e->ne_base,
+						  CN_L3E_PPPOE_L3IF_IDX,
+						  session);
+		spin_unlock_irqrestore(&l3e->reg_lock, flags);
+	}
+	/* ★ BUG-A: commit the shadow ONLY after the HW L3-IF entry is actually
+	 * programmed.  On a failed/timed-out write leave data_pppoe_session
+	 * unchanged so (a) cn_l3e_set_us_egress sees the error and REFUSES the
+	 * offload (no live flow pointing at a stale/zero L3-IF entry), and (b)
+	 * the next install retries the reprogram instead of trusting a
+	 * never-written entry (the old code advanced the shadow first, so a
+	 * later same-sid flow skipped the retry forever). */
+	if (!ret)
+		WRITE_ONCE(l3e->data_pppoe_session, session);
+	pr_info("cortina-l3fe: PPPoE WAN session %#x %s (L3-IF[%u] ret=%d)\n",
+		session, session ? "armed" : "cleared",
+		CN_L3E_PPPOE_L3IF_IDX, ret);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(cortina_ni_wan_pppoe_session_set);
+
 /*
  * Stamp the US (LAN->WAN) PON egress into a hit-action: gemMapMode-1
  * encoding (vendor flow.c FORWARD_PORT / CN2 mode[1]) -
@@ -900,11 +1011,20 @@ EXPORT_SYMBOL_GPL(cortina_ni_gpon_data_path_set);
  *             pop_l3_vld=1 (the sole gemMapMode-1 reuse bit; t2_ctrl_vld=0).
  * With PE_CFG.gemid_map=1 (set in cortina_l3fe_hw_l3_forward_enable) this
  * egresses at the SAME PON US ldpid the proven CPU data-TX path injects with.
- * Returns 0, or -ENODEV if no data path is armed yet.
+ *
+ * @live_sid: the LIVE PPPoE session id carried by the flow rule's
+ * FLOW_ACTION_PPPOE_PUSH entry (fa->pppoe.sid, u16 host-order - the kernel
+ * resolves it from the pppoe socket via pppoe_fill_forward_path ->
+ * nft_flow_offload -> nf_flow_rule_route_common, the mtk_ppe precedent), or
+ * 0 when the caller has none (manual /proc install) - then the /proc-set
+ * data_pppoe_session bring-up fallback applies.  Returns 0, or -ENODEV if
+ * no data path is armed yet.
  */
-static int cn_l3e_set_us_egress(struct cn_l3e *l3e, struct cn_l3e_act *act)
+static int cn_l3e_set_us_egress(struct cn_l3e *l3e, struct cn_l3e_act *act,
+				u16 live_sid)
 {
 	u16 gem = READ_ONCE(l3e->data_gem);
+	u16 pppoe = live_sid ? live_sid : READ_ONCE(l3e->data_pppoe_session);
 	u8 tcont = READ_ONCE(l3e->data_tcont);
 
 	if (!gem)
@@ -918,6 +1038,43 @@ static int cn_l3e_set_us_egress(struct cn_l3e *l3e, struct cn_l3e_act *act)
 	act->deepq = (tcont <= CN_L3E_PON_DEEPQ_TCONT_MAX);
 	act->t2_ctrl = tcont & 0xf;	/* GROUP_20 t2_ctrl1 = T-CONT selector */
 	act->pop_l3_vld = 1;		/* gemMapMode-1 marker (bit0) */
+
+	/* PPPoE WAN egress: ADD the 8-byte 0x8864 session header on the hit.
+	 * GROUP_20 inline pppoe_set1=1 + pppoe_vld1=1 = ADD/replace; the
+	 * session id rides the egress L3-IF entry selected by l3_if_vld1 +
+	 * egr_l3_if_idx1 (programmed by cortina_ni_wan_pppoe_session_set;
+	 * mac_sa_vld=0 there, SMAC untouched) and the PE globals 0x3500/0x3504
+	 * supply code/ver/type + the PPP protocol.  This indexed path IS the
+	 * vendor per-flow PPPoE mechanism in flow-normal mode (a_mask G18|G20,
+	 * L3FE_NAPT_ACTION_SERIALIZATION.md section 8): the inline GROUP_07
+	 * session field is not fetched under this a_mask, and widening the
+	 * a_mask would repack the whole FIB layout.  session==0 (IPoE) leaves
+	 * all four fields 0 - the action stays byte-identical to the proven
+	 * IPoE shape.  Only reachable under hw_l3_fwd.
+	 *
+	 * A LIVE sid that differs from the armed one (first offloaded flow of
+	 * a session, or a re-dial with a new sid) re-programs the L3-IF entry
+	 * so the on-wire header always carries the negotiated id - never a
+	 * stale or constant one. */
+	if (pppoe) {
+		if (pppoe != READ_ONCE(l3e->data_pppoe_session)) {
+			/* ★ BUG-A: PROPAGATE the L3-IF write result.  If the HW
+			 * L3-IF program fails/times out, REFUSE the offload - do
+			 * NOT stamp l3_if_vld/egr_l3_if_idx into a live action
+			 * that would then point at a stale/zero L3-IF[1] and
+			 * blackhole (the header would be absent / sid 0 on the
+			 * wire).  The flow stays on the SW path, which forwards
+			 * PPPoE correctly. */
+			int r = cortina_ni_wan_pppoe_session_set(pppoe);
+
+			if (r)
+				return r;
+		}
+		act->pppoe_set = 1;
+		act->pppoe_vld = 1;
+		act->l3_if_vld = 1;
+		act->egr_l3_if_idx = CN_L3E_PPPOE_L3IF_IDX;
+	}
 	return 0;
 }
 
@@ -978,7 +1135,12 @@ static void cn_l3e_sweep_work(struct work_struct *work)
 	schedule_delayed_work(&cn_l3e_sweep, msecs_to_jiffies(CN_L3E_SWEEP_MS));
 }
 
-static atomic_t cn_flow_installed = ATOMIC_INIT(0);
+/* Names every cn_flow_replace refusal branch so a rejected/silently-erroring
+ * REPLACE localises itself.  At pr_debug (dynamic-debug): first-class dump/spy
+ * per project policy, but silent at the default loglevel so the shipped tree
+ * is not info-spammy under a many-flow load. */
+#define cn_rep_dbg(fmt, ...) \
+	pr_debug("cn_flow_replace: " fmt, ##__VA_ARGS__)
 
 static int cn_flow_replace(struct flow_cls_offload *f, struct net_device *dev)
 {
@@ -991,12 +1153,16 @@ static int cn_flow_replace(struct flow_cls_offload *f, struct net_device *dev)
 	bool lan_ingress = false, snat_port = false;
 	int profile, i, err;
 	u16 addr_type = 0;
+	u16 pppoe_sid = 0;
 
 	if (!cn_l3e || !cn_l3e_install_ok)
 		return -EOPNOTSUPP;
 	if (rhashtable_lookup_fast(&cn_flow_table, &f->cookie,
-				   cn_flow_ht_params))
+				   cn_flow_ht_params)) {
+		cn_rep_dbg("cookie %lx already installed (other direction)\n",
+			   f->cookie);
 		return -EEXIST;
+	}
 
 	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_CONTROL)) {
 		struct flow_match_control m;
@@ -1059,20 +1225,11 @@ static int cn_flow_replace(struct flow_cls_offload *f, struct net_device *dev)
 			dev_put(idev);
 		}
 	}
-	if (!lan_ingress)
+	if (!lan_ingress) {
+		cn_rep_dbg("refuse: not LAN ingress (reply/DS leg keeps the CPU path)\n");
 		return -EOPNOTSUPP;
+	}
 	profile = CN_L3E_PROFILE_ROUTED;
-
-	/* US hit-action - EXACTLY the silicon-proven manual-install shape
-	 * (GROUP_18 WAN-forward via the live PON data GEM/T-CONT + GROUP_20
-	 * TTL dec + inline SNAT).  No l3_if/smac/mac_da indexed rewrite: those
-	 * aux tables are not programmed, and the proven forward does not need
-	 * them (the PON US egress needs no neighbour-MAC rewrite).  If no data
-	 * path is armed yet, refuse - the flow stays on the SW path. */
-	err = cn_l3e_set_us_egress(cn_l3e, &act);
-	if (err)
-		return -EOPNOTSUPP;
-	act.ip_ttl_dec = 1;
 
 	flow_action_for_each(i, fa, &rule->action) {
 		switch (fa->id) {
@@ -1086,8 +1243,11 @@ static int cn_flow_replace(struct flow_cls_offload *f, struct net_device *dev)
 				 * daddr rewrite (16, DNAT) is not the US
 				 * transit shape - leave it to software. */
 				if (fa->mangle.offset !=
-				    offsetof(struct iphdr, saddr))
+				    offsetof(struct iphdr, saddr)) {
+					cn_rep_dbg("refuse: IP4 mangle off=%u (not SNAT saddr)\n",
+						   fa->mangle.offset);
 					return -EOPNOTSUPP;
+				}
 				act.ip_addr_vld = 1;
 				act.ip_type = 0;	/* rewrite SA */
 				act.ip_addr = ntohl(fa->mangle.val);
@@ -1100,8 +1260,12 @@ static int cn_flow_replace(struct flow_cls_offload *f, struct net_device *dev)
 				 * the lower (mask ~0xffff).  Only the source
 				 * rewrite belongs to the US SNAT shape. */
 				if (fa->mangle.offset != 0 ||
-				    fa->mangle.mask == ~htonl(0xffff))
+				    fa->mangle.mask == ~htonl(0xffff)) {
+					cn_rep_dbg("refuse: L4 mangle off=%u mask=%08x (not sport SNAT)\n",
+						   fa->mangle.offset,
+						   ntohl(fa->mangle.mask));
 					return -EOPNOTSUPP;
+				}
 				act.l4_port = ntohl(fa->mangle.val) >> 16;
 				snat_port = true;
 				break;
@@ -1115,28 +1279,68 @@ static int cn_flow_replace(struct flow_cls_offload *f, struct net_device *dev)
 			break;
 		case FLOW_ACTION_CSUM:
 			break;		/* implicit in the HW rewrite */
+		case FLOW_ACTION_PPPOE_PUSH:
+			/* PPPoE WAN: the kernel emits this on the US rule with
+			 * the LIVE negotiated session id (host-order u16, from
+			 * the reply tuple's encap - nf_flow_table_offload
+			 * nf_flow_rule_route_common; mtk_ppe precedent).  Feed
+			 * it into the US egress encap below - NEVER the /proc
+			 * constant. */
+			pppoe_sid = fa->pppoe.sid;
+			break;
 		default:
+			cn_rep_dbg("refuse: unsupported flow action id=%d\n",
+				   fa->id);
 			return -EOPNOTSUPP;
 		}
 	}
 	/* keep to the proven shape: a full inline SNAT + a WAN redirect */
-	if (!odev || !act.ip_addr_vld || !snat_port)
+	if (!odev || !act.ip_addr_vld || !snat_port) {
+		cn_rep_dbg("refuse: not the US SNAT shape (odev=%d ip=%d port=%d)\n",
+			   !!odev, (int)act.ip_addr_vld, snat_port);
 		return -EOPNOTSUPP;
+	}
+
+	/* US hit-action - EXACTLY the silicon-proven manual-install shape
+	 * (GROUP_18 WAN-forward via the live PON data GEM/T-CONT + GROUP_20
+	 * TTL dec + inline SNAT).  No l3_if/smac/mac_da indexed rewrite: those
+	 * aux tables are not programmed, and the proven forward does not need
+	 * them (the PON US egress needs no neighbour-MAC rewrite).  Runs
+	 * AFTER the action loop so a FLOW_ACTION_PPPOE_PUSH sid (collected
+	 * above) drives the PPPoE encap; sid 0 = IPoE, byte-identical action.
+	 * If no data path is armed yet, refuse - the flow stays on the SW
+	 * path. */
+	err = cn_l3e_set_us_egress(cn_l3e, &act, pppoe_sid);
+	if (err) {
+		cn_rep_dbg("refuse: no PON data path armed (set_us_egress %d)\n",
+			   err);
+		return -EOPNOTSUPP;
+	}
+	act.ip_ttl_dec = 1;
 
 	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
-	if (!entry)
+	if (!entry) {
+		pr_err("cn_flow_replace: entry alloc failed\n");
 		return -ENOMEM;
+	}
 	entry->cookie = f->cookie;
 	entry->last_hit = jiffies;
 
 	err = cn_l3e_flow_add(cn_l3e, &key, &act, profile, CN_L3E_WAN_MASK_ID,
 			      &entry->hash_idx, &entry->crc16);
-	if (err)
+	if (err) {
+		pr_err("cn_flow_replace: install FAILED (%d) %pI4h:%u->%pI4h:%u proto=%u pppoe=%#x\n",
+		       err, &(u32){ key.ip_sa_0 }, (u16)key.l4_sport,
+		       &(u32){ key.ip_da_0 }, (u16)key.l4_dport,
+		       (u8)key.ip_protocol, pppoe_sid);
 		goto free;
+	}
 
 	err = rhashtable_insert_fast(&cn_flow_table, &entry->node,
 				     cn_flow_ht_params);
 	if (err) {
+		pr_err("cn_flow_replace: rhashtable insert FAILED (%d) - undoing idx=%u\n",
+		       err, entry->hash_idx);
 		cn_l3e_flow_del(cn_l3e, entry->hash_idx, entry->crc16);
 		goto free;
 	}
@@ -1145,6 +1349,13 @@ static int cn_flow_replace(struct flow_cls_offload *f, struct net_device *dev)
 	cn_l3e->entry_by_idx[entry->hash_idx] = entry;
 	cn_l3e->bucket_occ[entry->hash_idx / CN_L3E_AGE_SLOTS]++;
 	atomic_inc(&cn_flow_installed);
+	/* per-flow install witness; pr_debug so a 1000-flow soak stays quiet */
+	pr_debug("cn_flow_replace: INSTALLED idx=%u crc16=%04x %pI4h:%u->%pI4h:%u proto=%u pppoe=%#x snat=%pI4h:%u\n",
+		 entry->hash_idx, entry->crc16,
+		 &(u32){ key.ip_sa_0 }, (u16)key.l4_sport,
+		 &(u32){ key.ip_da_0 }, (u16)key.l4_dport,
+		 (u8)key.ip_protocol, pppoe_sid,
+		 &(u32){ act.ip_addr }, (u16)act.l4_port);
 	return 0;
 free:
 	kfree(entry);
@@ -1167,7 +1378,44 @@ static int cn_flow_destroy(struct flow_cls_offload *f)
 			       cn_flow_ht_params);
 	kfree(entry);
 	atomic_dec(&cn_flow_installed);
+	pr_debug("cn_flow_destroy: removed idx (flows=%d)\n",
+		 atomic_read(&cn_flow_installed));
 	return 0;
+}
+
+/*
+ * ★ BUG-B: tear down EVERY installed offloaded flow.  Called (under
+ * cn_flow_offload_mutex) when the live PPPoE session id CHANGES: all US flows
+ * share the single L3-IF[1] entry, so a stale flow would emit the wrong/absent
+ * session header once L3-IF[1] is reprogrammed.  nf_flow_table reinstalls the
+ * still-live conntracks against the new sid on their next packet.  Iterates the
+ * entry_by_idx reverse map (not the rhashtable) to remove-and-free safely
+ * without an rhashtable-walk use-after-free.
+ */
+static void cn_l3e_flush_auto_flows(struct cn_l3e *l3e)
+{
+	u32 idx;
+	int n = 0;
+
+	if (!cn_flow_table_ready)
+		return;
+	for (idx = 0; idx < CN_L3E_ENTRIES; idx++) {
+		struct cn_flow_entry *e = l3e->entry_by_idx[idx];
+
+		if (!e)
+			continue;
+		l3e->entry_by_idx[idx] = NULL;
+		l3e->bucket_occ[idx / CN_L3E_AGE_SLOTS]--;
+		cn_l3e_flow_del(l3e, idx, e->crc16);
+		rhashtable_remove_fast(&cn_flow_table, &e->node,
+				       cn_flow_ht_params);
+		kfree(e);
+		atomic_dec(&cn_flow_installed);
+		n++;
+	}
+	if (n)
+		pr_info("cortina-l3fe: flushed %d offloaded flow(s) on PPPoE sid change\n",
+			n);
 }
 
 static int cn_flow_stats(struct flow_cls_offload *f)
@@ -1627,12 +1875,14 @@ static int cn_l3e_proc_show(struct seq_file *m, void *v)
 	mutex_lock(&cn_flow_offload_mutex);
 	cache_cnt = readl(l3e->ne_base + CN_L3E_HS_CACHE_CNT);
 	seq_printf(m,
-		   "install_ok=%d auto_flows=%d HS_CACHE_CNT(0x38c0)=%u live_pon{gem=%u tcont=%u} gran(0x3924)=0x%08x\n",
+		   "install_ok=%d auto_flows=%d HS_CACHE_CNT(0x38c0)=%u live_pon{gem=%u tcont=%u} pppoe_sess=%#x gran(0x3924)=0x%08x\n",
 		   cn_l3e_install_ok, atomic_read(&cn_flow_installed),
 		   cache_cnt,
 		   READ_ONCE(l3e->data_gem), READ_ONCE(l3e->data_tcont),
+		   READ_ONCE(l3e->data_pppoe_session),
 		   readl(l3e->ne_base + CN_L3E_HS_AGING_GRANULARITY));
 	seq_puts(m, "usage: echo 'install <sa> <da> <sp> <dp> <proto> <profile> [mcgid] [new_sa] [new_sp]' > /proc/cortina_l3fe\n");
+	seq_puts(m, "       echo 'pppoe <session_id>' (0 = clear/IPoE) > /proc/cortina_l3fe\n");
 	for (i = 0; i < CN_L3E_PROC_MAX_MANUAL; i++) {
 		struct cn_l3e_manual *e = &cn_l3e_manual[i];
 		u32 age = 0, key = 0, fib0 = 0;
@@ -1696,6 +1946,19 @@ static ssize_t cn_l3e_proc_write(struct file *file, const char __user *ubuf,
 		err = 0;	/* the readout is `cat` (show) */
 		goto out;
 	}
+	if (!strcmp(cmd, "pppoe")) {
+		/* first-bring-up path for the live session id (dec or 0x hex);
+		 * 0 = clear back to IPoE */
+		int sess;
+
+		if (sscanf(buf, "%*s %i", &sess) != 1 ||
+		    sess < 0 || sess > 0xffff) {
+			err = -EINVAL;
+			goto out;
+		}
+		err = cortina_ni_wan_pppoe_session_set(sess);
+		goto out;
+	}
 
 	if (strcmp(cmd, "install")) {
 		err = -EINVAL;
@@ -1741,7 +2004,7 @@ static ssize_t cn_l3e_proc_write(struct file *file, const char __user *ubuf,
 		 * age-only, non-forwarding hit probe).  Plus optional inline
 		 * SNAT of the SA (shipping normal-mode FIB carries the NAT
 		 * address inline, no aux table). */
-		if (mcgid == 0 && cn_l3e_set_us_egress(l3e, &act) == 0) {
+		if (mcgid == 0 && cn_l3e_set_us_egress(l3e, &act, 0) == 0) {
 			act.ip_ttl_dec = 1;
 		} else {
 			act.permit = 1;
