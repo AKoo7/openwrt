@@ -83,7 +83,7 @@
     };
 
     chosen {
-        bootargs = "console=ttyS0,115200n8 earlycon=uart8250,mmio32,0x18020000 ignore_loglevel maxcpus=1 no_console_suspend";
+        bootargs = "console=ttyS0,115200n8 ignore_loglevel maxcpus=1";
         stdout-path = &uart0;
     };
 };
