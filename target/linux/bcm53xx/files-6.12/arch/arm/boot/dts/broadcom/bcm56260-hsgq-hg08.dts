@@ -1,0 +1,89 @@
+// SPDX-License-Identifier: GPL-2.0-or-later OR MIT
+/* BCM56260 HSGQ HG08 — minimal DTS for boot debugging.
+ * Stripped to just the essentials: UART, GIC, SCU, timer, memory.
+ * No I2C, GPIO, PCIe, watchdog — just enough to boot to a shell. */
+
+/dts-v1/;
+
+#include <dt-bindings/interrupt-controller/arm-gic.h>
+
+/ {
+    model = "HSGQ HG08 GPON OLT";
+    compatible = "hsgq,hg08", "brcm,bcm56260";
+    interrupt-parent = <&gic>;
+    #address-cells = <1>;
+    #size-cells = <1>;
+
+    aliases {
+        serial0 = &uart0;
+    };
+
+    cpus {
+        #address-cells = <1>;
+        #size-cells = <0>;
+        cpu@0 {
+            device_type = "cpu";
+            compatible = "arm,cortex-a9";
+            reg = <0>;
+            next-level-cache = <&L2>;
+        };
+    };
+
+    L2: l2-cache@19022000 {
+        compatible = "arm,pl310-cache";
+        reg = <0x19022000 0x1000>;
+        cache-unified;
+        cache-level = <2>;
+    };
+
+    memory@60000000 {
+        device_type = "memory";
+        reg = <0x60000000 0x20000000>; /* 512 MB */
+    };
+
+    uart0: serial@18020000 {
+        compatible = "ns16550a";
+        reg = <0x18020000 0x1000>;
+        reg-shift = <2>;
+        reg-io-width = <4>;
+        clock-frequency = <62500000>;
+        interrupts = <GIC_SPI 105 IRQ_TYPE_LEVEL_HIGH>;
+        status = "okay";
+    };
+
+    scu@19020000 {
+        compatible = "arm,cortex-a9-scu";
+        reg = <0x19020000 0x100>;
+    };
+
+    gic: interrupt-controller@19021000 {
+        compatible = "arm,cortex-a9-gic";
+        #interrupt-cells = <3>;
+        interrupt-controller;
+        reg = <0x19021000 0x1000>,
+              <0x19020100 0x0100>;
+    };
+
+    timer@19020200 {
+        compatible = "arm,cortex-a9-global-timer";
+        reg = <0x19020200 0x20>;
+        interrupts = <GIC_PPI 11 IRQ_TYPE_EDGE_RISING>;
+    };
+
+    twd-timer@19020600 {
+        compatible = "arm,cortex-a9-twd-timer";
+        reg = <0x19020600 0x20>;
+        interrupts = <GIC_PPI 13 (GIC_CPU_MASK_SIMPLE(1) | IRQ_TYPE_EDGE_RISING)>;
+    };
+
+    twd-wdt@19020620 {
+        compatible = "arm,cortex-a9-twd-wdt";
+        reg = <0x19020620 0x20>;
+        interrupts = <GIC_PPI 14 (GIC_CPU_MASK_SIMPLE(1) | IRQ_TYPE_EDGE_RISING)>;
+    };
+
+    chosen {
+        bootargs = "console=ttyS0,115200n8 earlycon=uart8250,mmio32,0x18020000 ignore_loglevel maxcpus=1 no_console_suspend";
+        stdout-path = &uart0;
+    };
+};

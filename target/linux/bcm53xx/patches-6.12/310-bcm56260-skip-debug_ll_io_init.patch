@@ -1,0 +1,21 @@
+--- a/arch/arm/kernel/setup.c
++++ b/arch/arm/kernel/setup.c
+@@ -1140,6 +1140,8 @@ void __init setup_arch(char **cmdline_p)
+ 
+ 	early_fixmap_init();
+ 	early_ioremap_init();
++	/* Skip debug_ll_io_init() — crashes on BCM56260 because VMALLOC PMD
++	 * doesn't exist until paging_init(). earlycon uses early_ioremap. */
+ 
+ 	parse_early_param();
+ 
+@@ -1163,9 +1165,6 @@ void __init setup_arch(char **cmdline_p)
+ 	early_ioremap_reset();
+ 
+ 	paging_init(mdesc);
+-#ifdef CONFIG_DEBUG_LL
+-	debug_ll_io_init();
+-#endif
+ 	kasan_init();
+ 	request_standard_resources(mdesc);
+ 

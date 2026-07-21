@@ -174,7 +174,7 @@ define Device/asus_rt-ac3100
   DEVICE_PACKAGES := $(BRCMFMAC_4366B1) $(BRCMFMAC_4366C0) $(USB3_PACKAGES)
   ASUS_PRODUCTID := RT-AC3100
 endef
-TARGET_DEVICES += asus_rt-ac3100
+#TARGET_DEVICES += asus_rt-ac3100
 
 define Device/asus_rt-ac3200
   $(call Device/asus)
@@ -182,7 +182,7 @@ define Device/asus_rt-ac3200
   DEVICE_PACKAGES := $(BRCMFMAC_43602A1) $(USB3_PACKAGES)
   ASUS_PRODUCTID := RT-AC3200
 endef
-TARGET_DEVICES += asus_rt-ac3200
+#TARGET_DEVICES += asus_rt-ac3200
 
 define Device/asus_rt-ac5300
   $(call Device/asus)
@@ -190,7 +190,7 @@ define Device/asus_rt-ac5300
   DEVICE_PACKAGES := $(BRCMFMAC_4366C0) $(USB3_PACKAGES)
   ASUS_PRODUCTID := RT-AC5300
 endef
-TARGET_DEVICES += asus_rt-ac5300
+#TARGET_DEVICES += asus_rt-ac5300
 
 define Device/asus_rt-ac56u
   $(call Device/asus)
@@ -291,28 +291,28 @@ define Device/dlink
   IMAGE/bin := append-ubi | seama-nand
 endef
 
-define Device/dlink_dir-885l
-  DEVICE_MODEL := DIR-885L
-  DEVICE_PACKAGES := $(BRCMFMAC_4366B1) $(USB3_PACKAGES)
-  $(Device/dlink)
-  SIGNATURE := wrgac42_dlink.2015_dir885l
-endef
-TARGET_DEVICES += dlink_dir-885l
+#DISABLED# define Device/dlink_dir-885l
+#DISABLED#   DEVICE_MODEL := DIR-885L
+#DISABLED#   DEVICE_PACKAGES := $(BRCMFMAC_4366B1) $(USB3_PACKAGES)
+#DISABLED#   $(Device/dlink)
+#DISABLED#   SIGNATURE := wrgac42_dlink.2015_dir885l
+#DISABLED# endef
+#TARGET_DEVICES += dlink_dir-885l
 
-define Device/dlink_dir-890l
-  DEVICE_VENDOR := D-Link
-  DEVICE_MODEL := DIR-890L
-  DEVICE_PACKAGES := $(BRCMFMAC_43602A1) $(USB2_PACKAGES) $(USB3_PACKAGES)
-  # Layout: U-boot (128kb max) followed by kernel and appended DTB.
-  # This is done because the boot loader will only read the first 2 MB
-  # from the flash and decompress the LZMA it finds there after the
-  # SEAMA header. Since the compressed kernel will not fit in 2 MB,
-  # we put U-Boot there and let U-Boot read and execute the kernel.
-  KERNEL := dlink-uboot-bin | pad-to 128k | append-kernel | append-dtb
-  $(Device/dlink)
-  SIGNATURE := wrgac36_dlink.2013gui_dir890
-endef
-TARGET_DEVICES += dlink_dir-890l
+#DISABLED# define Device/dlink_dir-890l
+#DISABLED#   DEVICE_VENDOR := D-Link
+#DISABLED#   DEVICE_MODEL := DIR-890L
+#DISABLED#   DEVICE_PACKAGES := $(BRCMFMAC_43602A1) $(USB2_PACKAGES) $(USB3_PACKAGES)
+#DISABLED#   # Layout: U-boot (128kb max) followed by kernel and appended DTB.
+#DISABLED#   # This is done because the boot loader will only read the first 2 MB
+#DISABLED#   # from the flash and decompress the LZMA it finds there after the
+#DISABLED#   # SEAMA header. Since the compressed kernel will not fit in 2 MB,
+#DISABLED#   # we put U-Boot there and let U-Boot read and execute the kernel.
+#DISABLED#   KERNEL := dlink-uboot-bin | pad-to 128k | append-kernel | append-dtb
+#DISABLED#   $(Device/dlink)
+#DISABLED#   SIGNATURE := wrgac36_dlink.2013gui_dir890
+#DISABLED# endef
+#TARGET_DEVICES += dlink_dir-890l
 
 define Device/dlink_dwl-8610ap
   DEVICE_VENDOR := D-Link
@@ -440,7 +440,7 @@ TARGET_DEVICES += meraki_mr32
 
 define Device/meraki_mx6x
   KERNEL_IN_UBI := 1
-  KERNEL_LOADADDR := 0x60008000
+  KERNEL_LOADADDR := 0x61008000
   DEVICE_PACKAGES := -oseama kmod-leds-pwm kmod-usb-ehci \
 	kmod-usb-ohci kmod-usb2
   DEVICE_VENDOR := Cisco Meraki
@@ -514,7 +514,7 @@ define Device/netgear_r7900
   $(Device/netgear)
   NETGEAR_BOARD_ID := U12H315T30_NETGEAR
 endef
-TARGET_DEVICES += netgear_r7900
+# TARGET_DEVICES += netgear_r7900  # DTS removed from mainline 6.12; needs bcm4709-netgear-r7900.dts
 
 define Device/netgear_r8000
   DEVICE_MODEL := R8000
@@ -588,5 +588,20 @@ define Device/tplink_archer-c9-v1
   BROKEN := y
 endef
 #TARGET_DEVICES += tplink_archer-c9-v1
+
+define Device/hsgq_hg08
+  DEVICE_VENDOR := HSGQ
+  DEVICE_MODEL := HG08
+  DEVICE_TITLE := HSGQ HG08 GPON OLT
+  DEVICE_DTS := bcm56260-hsgq-hg08
+  DEVICE_PACKAGES := kmod-maple maple-tools uboot-envtools
+  KERNEL_LOADADDR := 0x61008000
+  KERNEL_INITRAMFS_SUFFIX := .bin
+  KERNEL_INITRAMFS = kernel-bin | append-dtb | libdeflate-gzip | uImage gzip
+  IMAGES := initramfs.bin sysupgrade.bin
+  IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata
+  SUPPORTED_DEVICES := hsgq,hg08
+endef
+TARGET_DEVICES += hsgq_hg08
 
 $(eval $(call BuildImage))

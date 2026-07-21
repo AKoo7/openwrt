@@ -1,0 +1,13 @@
+# Maple GPON driver configuration.
+#
+# The kernel module (kmod-maple) auto-loads at boot via /etc/modules.d/80-maple.
+# This file configures the userspace tools (maplectl, maple_snmp).
+
+config main 'main'
+	# Number of PON ports on this device (HG08 = 8, HG16 = 16).
+	option pon_ports 8
+	# Enable the SNMP pass_persist subagent (requires snmpd installed & configured
+	# with: pass_persist .1.3.6.1.4.1.99999.1 /usr/sbin/maple_snmp).
+	option snmp 0
+	# Polling interval for background stat collection (seconds; 0 = disabled).
+	option poll_interval 0
