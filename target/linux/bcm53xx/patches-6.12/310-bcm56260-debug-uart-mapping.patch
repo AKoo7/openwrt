@@ -1,0 +1,31 @@
+--- a/arch/arm/mm/mmu.c
++++ b/arch/arm/mm/mmu.c
+@@ -1456,8 +1456,16 @@ static void __init devicemaps_init(const struct machine_desc *mdesc)
+ 	if (mdesc->map_io)
+ 		mdesc->map_io();
+ 	else
+-		debug_ll_io_init();
++		/* BCM56260: manually map debug UART instead of debug_ll_io_init.
++		 * debug_ll_io_init → vm_area_add_early → BUG() because static VM
++		 * list isn't ready. Direct create_mapping works and survives
++		 * the local_flush_tlb_all() below. */
++		{
++			struct map_desc uart_map = {
++				.virtual = 0xf8020000,
++				.pfn = __phys_to_pfn(0x18020000),
++				.length = PAGE_SIZE,
++				.type = MT_DEVICE,
++			};
++			create_mapping(&uart_map);
++		}
+ 	fill_pmd_gaps();
+--- a/arch/arm/kernel/setup.c
++++ b/arch/arm/kernel/setup.c
+@@ -1140,8 +1140,6 @@ void __init setup_arch(char **cmdline_p)
+ 	early_fixmap_init();
+ 	early_ioremap_init();
+-#ifdef CONFIG_DEBUG_LL
+-	debug_ll_io_init();
+-#endif
++	/* debug_ll_io_init disabled — moved to devicemaps_init above */
+ 	parse_early_param();
