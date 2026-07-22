@@ -89,15 +89,6 @@
         interrupts = <GIC_PPI 14 (GIC_CPU_MASK_SIMPLE(1) | IRQ_TYPE_EDGE_RISING)>;
     };
 
-    wdt: watchdog@18021000 {
-        compatible = "arm,sp805", "arm,primecell";
-        reg = <0x18021000 0x1000>;
-        interrupts = <GIC_SPI 106 IRQ_TYPE_LEVEL_HIGH>;
-        clocks = <&clk_periph>, <&clk_periph>;
-        clock-names = "wdogclk", "apb_pclk";
-        status = "okay";
-    };
-
     chosen {
         bootargs = "console=ttyS0,115200n8 earlyprintk ignore_loglevel maxcpus=1";
         stdout-path = &uart0;
