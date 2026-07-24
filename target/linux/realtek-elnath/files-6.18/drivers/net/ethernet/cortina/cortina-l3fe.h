@@ -126,5 +126,8 @@ int cortina_l3fe_swo_crc(void __iomem *ne, const u32 *words, int nwords,
  * serializes (reg_lock).  Returns 0 or -EINVAL/-ETIMEDOUT.
  */
 int cortina_l3fe_pppoe_l3if_set(void __iomem *ne, u32 idx, u16 session);
+/* A2 next-hop L2 rewrite: mac_da_idx MAC table + IPoE egress-SMAC L3-IF entry */
+int cortina_l3fe_macda_idx_set(void __iomem *ne, u32 idx, const u8 *mac);
+int cortina_l3fe_ipoe_l3if_set(void __iomem *ne, u32 idx, u8 an_sel);
 
 #endif /* _CORTINA_L3FE_H */

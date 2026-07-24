@@ -115,7 +115,8 @@ struct cortina_ni_rx {
 	int			irq[CA_NI_RX_NUM_IRQS];	/* <0 = not mapped */
 	/* GPHY fault poll + reinit (stock aal_internal_phy_recovery, 1 Hz) */
 	struct delayed_work	recovery_work;
-	u16			gphy_cal[CA_NI_RX_GPHY_CAL_REGS]; /* probe snapshot */
+	u16			gphy_cal[CA_NI_GPHY_COUNT][CA_NI_RX_GPHY_CAL_REGS]; /* per-bank probe snapshot */
+	bool			intf_done;	/* per-port GPHY->MAC interface established (once) */
 	/* spy counters (project rule: dump/probe capability is first-class) */
 	u64			rearms;		/* link-up RX re-arms */
 	u64			recoveries;	/* GPHY reinits fired */
@@ -140,6 +141,13 @@ struct cortina_ni_rx {
 	u64			slot_dead;	/* buffer lost (remap failed) */
 	u64			last_desc;	/* last non-empty descriptor */
 	u64			last_hdra;	/* last HEADER_A (host order) */
+	/* ★ TEMPORARY DIAGNOSTIC (P3 crc_ntfy tap, rx_crc_tap gate - REVERT
+	 * once the T2 hash divergence is pinned): the HW lookup CRC read from
+	 * the last matching punted frame's HEADER_CPU meta (+0x48/+0x4C). */
+	u64			tap_hits;	/* matching punted frames seen */
+	u32			tap_crc32;	/* HEADER_CPU +0x48 (BE) last match */
+	u16			tap_crc16;	/* HEADER_CPU +0x4c (BE16) last match */
+	u8			tap_cpuflg;	/* HEADER_A cpu_flg of last match */
 };
 
 /* /proc/cortina_ni_peek query state (single-user debug tool) */
@@ -214,6 +222,14 @@ int cortina_ni_tx_probe(struct cortina_ni *ni);
 int cortina_ni_rx_probe(struct cortina_ni *ni);
 
 /*
+ * Program a static L2FE FDB entry {mac -> ldpid} and return its 13-bit entry
+ * index (= the L3FE forward action mac_da_idx / aal-77c egr_lutidx), or -1.
+ * Used by the flow-offload next-hop path to resolve the egress DMAC by
+ * reference (cortina-ni-rx.c).  `base` = the NI/NE window (cn_l3e->ne_base).
+ */
+int cortina_ni_l2fe_fdb_add_idx(void __iomem *base, const u8 *mac, u32 ldpid);
+
+/*
  * L3FE main-hash flow engine (nf_flow_table HW offload backend,
  * cortina-ni-flowoffload.c + cortina-l3fe.c).  The probe arms + verifies
  * the engine; any failure is non-fatal - the offload stays disabled and
@@ -248,6 +264,10 @@ void cortina_ni_gpon_data_path_set(u16 gem_id, u8 tcont_idx);
  * First bring-up feeds it via /proc/cortina_l3fe ("pppoe <sess>").
  */
 int cortina_ni_wan_pppoe_session_set(u16 session);
+/* refresh the backend's probe-time router-MAC shadow when the netdev MAC
+ * changes (the HW consumers - FDB/comparator/FIELD-CAM - are re-programmed
+ * by cortina_ni_rx_mac_rearm, which is the only caller) */
+void cortina_ni_flowoffload_router_mac_set(const u8 *mac);
 #else
 static inline int cortina_ni_flowoffload_probe(struct cortina_ni *ni)
 {
@@ -273,10 +293,18 @@ static inline int cortina_ni_wan_pppoe_session_set(u16 session)
 {
 	return -EOPNOTSUPP;
 }
+static inline void cortina_ni_flowoffload_router_mac_set(const u8 *mac)
+{
+}
 #endif
 void cortina_ni_rx_open(struct cortina_ni *ni);
 void cortina_ni_rx_stop(struct cortina_ni *ni);
 void cortina_ni_rx_link_up(struct cortina_ni *ni);	/* phylib link-up hook */
+/* re-key the MAC-keyed admission/offload tables (L2FE FDB, my-MAC comparator,
+ * PP FIELD-CAM, offload router-MAC shadow) from the current dev_addr; called
+ * from .ndo_set_mac_address (netifd applies the factory MAC after the last
+ * link-up re-arm).  hw_l3_fwd-gated no-op otherwise. */
+void cortina_ni_rx_mac_rearm(struct cortina_ni *ni);
 /* internal-GPHY SRAM firmware patch + uC resume; called at link-up (the uC is
  * only held/writable then, not at probe) */
 void cortina_ni_gphy_patch_and_resume(struct cortina_ni *ni);

@@ -717,6 +717,19 @@ static bool cg_coldstart_wd = true;
 module_param_named(coldstart_wd, cg_coldstart_wd, bool, 0644);
 MODULE_PARM_DESC(coldstart_wd, "stuck-O1 recovery watchdog: re-roll the SerDes/laser bring-up while the FSM sits at O1 (default on; 0 = observe-only A/B baseline — flip live via /sys/module to recover a wedged boot in place)");
 
+/* ★ 2026-07-23 bisection/US-offload-first knob: under hw_l3_fwd, route the DS
+ * unicast data GEM into the L3FE (LDPID L3_WAN) so the DS direction can HW-
+ * forward.  Default OFF because that DS route BREAKS the wired LAN once the WAN
+ * data-path installs (host->ONU ping 100% loss; offload-OFF baseline 0% loss) -
+ * a still-open dynamic bug.  With it OFF, DS keeps the proven CPU_0+FE_BYPASS
+ * delivery (SW fastpath) while only the US (LAN->WAN) direction attempts HW
+ * offload; flip =1 to resume the DS-into-L3FE bring-up. */
+static bool cg_hw_l3_ds;	/* default OFF: DS-into-L3FE is premature - DS CPU-punts (no HW-forward
+				 * until A2) and starves the shared L3QM CPU pool under sustained load,
+				 * killing LAN even with the dest-port fix. Flip =1 only after DS HW-forward. */
+module_param_named(hw_l3_ds, cg_hw_l3_ds, bool, 0644);
+MODULE_PARM_DESC(hw_l3_ds, "route DS data GEM into the L3FE under hw_l3_fwd (default OFF: DS stays on the CPU path, only US HW-offloads; =1 breaks LAN, WIP)");
+
 /*
  * Enable the upstream laser.
  *
@@ -1624,11 +1637,11 @@ static void cg_data_try_install(struct cortina_gpon *cg)
 			 CG_PDC_D0_LSPID(CG_LPORT_PON) |
 			 CG_PDC_D0_FE_BYPASS | CG_PDC_D0_NO_DROP;
 
-		if (i == 0 && cortina_ni_hw_l3_fwd_active()) {
+		if (i == 0 && cortina_ni_hw_l3_fwd_active() && cg_hw_l3_ds) {
 			d0 = CG_PDC_D0_LDPID(CG_LPORT_L3_WAN) |
 			     CG_PDC_D0_LSPID(CG_LPORT_PON);
 			dev_info(cg->dev,
-				 "PDC: data GEM idx %u -> L3_WAN (HW L3-forward armed)\n",
+				 "PDC: data GEM idx %u -> L3_WAN (HW L3-forward DS armed)\n",
 				 idx);
 		}
 

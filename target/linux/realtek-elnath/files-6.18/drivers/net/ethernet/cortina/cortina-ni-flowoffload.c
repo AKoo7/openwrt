@@ -101,6 +101,12 @@
 #define CN_L3E_HS_MASK_DATA(n)		(0x3920 - (n) * 4) /* MASK0..3 = 0x3920,191c,1918,1914 */
 #define CN_L3E_HS_AGING_GRANULARITY	0x3924	/* 30-bit; = age_time_s * core_clk / 0x2000 */
 #define CN_L3E_HS_AGE_ACCESS		0x3928	/* bucket[10:0] | (1<<11 = overflow age) | bit30 wr | bit31 GO */
+/* ★ MAIN-HASH age SRAM on THIS die = 2 DATA words, 16 slots/word, 2 BITS per
+ * slot (board-proven 2026-07-23: DATA2/DATA3 at 0x3930/0x392c read back 0 =
+ * not present; only DATA0=0x3938 slots 0-15 and DATA1=0x3934 slots 16-31 are
+ * writable).  The aal-77c *source* shows a 4-bit/4-word layout, but the shipped
+ * silicon here is 2-bit/2-word (matches the shipping ca-ne.ko aal_hash_age_set
+ * disasm `bfi #2`).  bit = (idx & 0xf)*2 within the word. */
 #define CN_L3E_HS_AGE_DATA_HI		0x3934	/* slots 16..31, 2 bit each */
 #define CN_L3E_HS_AGE_DATA_LO		0x3938	/* slots  0..15, 2 bit each */
 #define CN_L3E_HS_MEM_INI		0x393c	/* bit0 req_sts: engine SRAM self-init */
@@ -127,7 +133,8 @@
 #define CN_L3E_FIB_BYTES		32	/* ha_width = 3 (256-bit, normal mode) */
 #define CN_L3E_KEY_BYTES		92	/* packed key = CRC input */
 
-/* 2-bit age codes (this chip; flow_entry_show on stock prints STATIC at 3) */
+/* 2-bit MAIN-HASH age codes (this die): 0=free/invalid, 1..2 = valid+aging (HW
+ * re-arms on hit), 3 = static.  START(2) = go-live / HW-hit re-arm. */
 #define CN_L3E_AGE_FREE			0
 #define CN_L3E_AGE_IDLE			1	/* set by the stats sweep; HW re-arms on hit */
 #define CN_L3E_AGE_START		2
@@ -329,9 +336,20 @@ struct cn_l3e_act {
 	u64 permit		: 1;
 	u64 deepq		: 1;
 	u64 mcgid		: 10;
-	u64 mc			: 1;
-	/* group 20 - the NAT/encap rewrite (205 bits) */
-	u64 mdata_byte_vld	: 1;
+	/*
+	 * ★ aal-77c FIB layout fix (2026-07-24, tier-1): this die runs aal-77c,
+	 * NOT aal-gen2.  The aal-gen2-derived struct had a spurious `mc:1` (bit18)
+	 * and `mdata_byte_vld:1` (bit19) here, pushing all of group-20 +2 bits.
+	 * On aal-77c (serializer convert_act_flow_nomal_mode @ca-ne.ko 0x93fe0)
+	 * bit18 begins mdata_byte(8) directly; there is no mc / mdata_byte_vld.
+	 * Removing them lands the group-20 fields at their PROVEN silicon bits
+	 * (live stock oracle idx43000): ip_addr@45 (=NAT-src, exact 32-bit match),
+	 * mac_da_idx@79, chk_msk_ptr@92, cache_ctrl@98.  The old +2 offset made
+	 * chk_msk_ptr (the T2 double-check mask) land at bit94 -> the lookup's
+	 * double-check re-derived the hash under the WRONG mask -> a crc-match was
+	 * silently rejected -> the entry read as "not present" (the P3 miss).
+	 * group 20 - the NAT/encap rewrite; starts at bit18 (mdata_byte).
+	 */
 	u64 mdata_byte		: 8;
 	u64 l3_if_vld		: 1;
 	u64 smac_trans		: 1;
@@ -388,8 +406,9 @@ struct cn_l3e_act {
 	u64 sixrd_fmr_idx	: 2;
 	u64 vxlan_sport_msb15	: 6;
 	u64 vxlan_sport_update	: 1;
-	/* pad to the 32-byte FIB entry */
-	u64 pad			: 32;
+	/* pad to the 32-byte FIB entry (34 = 32 + the 2 bits freed by dropping
+	 * the aal-gen2 mc/mdata_byte_vld above; the 256-bit entry is unchanged). */
+	u64 pad			: 34;
 } __packed;
 
 static_assert(sizeof(struct cn_l3e_act) == CN_L3E_FIB_BYTES);
@@ -624,16 +643,12 @@ static int cn_l3e_go(struct cn_l3e *l3e, u32 reg, u32 val, u32 busy_bit)
  * DATA_LO/HI -> ACCESS = bucket | WRITE | GO.  A non-zero age is what
  * makes an entry live; age 0 kills it.
  *
- * ★ AGE WIDTH = 2 BITS on THIS die (tier-2, do NOT change to 4-bit).  The
- * shipping ca-ne.ko aal_hash_age_set (@0x965e0) rejects age>3 (`cmp #3;
- * b.hi`), masks the value with `& 0x3`, and writes a `bfi …,#width=2` field
- * at bit (slot & 0xf)*2 into DATA0=0x3938 (slots 0-15) / DATA1=0x3934 (slots
- * 16-31) - i.e. 2 bits/slot, 16 slots/word, 2 words = 32 slots/bucket.  This
- * is confirmed independently by the live age-decay validation (tier-1).  The
- * aal-gen2 SDK's 4-bit age layout (DATA0..3, START=6/STATIC=7) is a DIFFERENT
- * chip variant and does NOT apply here; writing a 4-bit field would land the
- * age in the wrong bits and leave each entry's real 2-bit slot 0 (INVALID ->
- * never a live hit).  Codes: 0=free, 1..2=aging (HW re-arms on hit), 3=static.
+ * ★ 2-BIT main-hash age (this die - board-proven 2026-07-23: the age SRAM row
+ * is only 2 DATA words, DATA0=0x3938 slots 0-15, DATA1=0x3934 slots 16-31, at
+ * 2 bits/slot; DATA2/DATA3 read back 0 = absent).  A 4-bit accessor (per the
+ * aal-77c source) writes to the non-existent DATA2/3 and leaves the real slot 0
+ * = INVALID -> the entry never matches.  word = (idx&0x10)?HI:LO, bit =
+ * (idx&0xf)*2; age 0..3, START=2, STATIC=3.
  */
 static int cn_l3e_age_set(struct cn_l3e *l3e, u32 idx, u32 age)
 {
@@ -671,7 +686,8 @@ out:
 }
 
 /* single-entry age read: the P2 bring-up oracle ("did my one flow HIT?" -
- * age 2 = matched since last sweep, 1 = live but idle, 0 = not live).
+ * age > IDLE(1), i.e. re-armed to START(2), = matched since install; 1 =
+ * live but idle; 0 = not live).  2-bit main-hash slot (see cn_l3e_age_set).
  * NEVER used on the stats path - that is the batch sweep's job. */
 static int __maybe_unused cn_l3e_age_get(struct cn_l3e *l3e, u32 idx, u32 *age)
 {
@@ -695,9 +711,10 @@ static int __maybe_unused cn_l3e_age_get(struct cn_l3e *l3e, u32 idx, u32 *age)
  * latch/commit pair - the ONLY stats primitive that scales (a per-flow
  * age_get would be 10k+ indirect reads at the design load).  Returns a
  * bitmap: bit k set == HW re-armed slot k's age since the last sweep
- * (age >= START, i.e. at least one packet matched).  Live slots are
+ * (age > IDLE(1), i.e. at least one packet matched).  Live slots are
  * rewritten to IDLE(1) so the next sweep sees fresh re-arms; STATIC(3)
- * slots are left untouched.
+ * slots are left untouched.  2-bit main-hash slots: 2 DATA words, 16 slots/
+ * word (this die; the vendor 4-word/8-slot read-and-clear does not apply).
  */
 static int cn_l3e_bucket_sweep(struct cn_l3e *l3e, u32 bucket, u32 *traffic)
 {
@@ -718,10 +735,14 @@ static int cn_l3e_bucket_sweep(struct cn_l3e *l3e, u32 bucket, u32 *traffic)
 		for (i = 0; i < 16; i++) {
 			u32 age = (w[r] >> (i * 2)) & 3;
 
-			if (age >= CN_L3E_AGE_START)
+			/* traffic = re-armed above IDLE (a HW hit set it to
+			 * START(2)); clear such a slot back to IDLE(1) so the
+			 * next sweep detects a fresh re-arm.  Leave STATIC(3)
+			 * and FREE(0) untouched. */
+			if (age > CN_L3E_AGE_IDLE && age != CN_L3E_AGE_STATIC) {
 				trf |= BIT(r * 16 + i);
-			if (age == CN_L3E_AGE_START)
 				age = CN_L3E_AGE_IDLE;
+			}
 			n[r] |= age << (i * 2);
 		}
 	}
@@ -771,20 +792,18 @@ static int cn_l3e_cache_invalidate(struct cn_l3e *l3e, u32 idx, u16 crc16)
 /* flow add / delete on the engine                                     */
 /* ------------------------------------------------------------------ */
 
-static int cn_l3e_flow_add(struct cn_l3e *l3e, const struct cn_l3e_key *key,
-			   const struct cn_l3e_act *act, int profile,
-			   u32 mask_id, u32 *idx_out, u16 *crc16_out)
+/*
+ * Install one entry with a PRECOMPUTED {crc32, crc16} - the common tail of
+ * cn_l3e_flow_add, split out so the TEMPORARY rawinst diagnostic (the /proc
+ * "rawinst" command; P3 crc_ntfy divergence hunt) can install the exact
+ * HW-read lookup CRC without going through the SWO.  Behaviour of the normal
+ * flow_add path is unchanged (it computes the SWO hash then calls this).
+ */
+static int cn_l3e_flow_add_rawcrc(struct cn_l3e *l3e, u32 crc32, u16 crc16,
+				  const struct cn_l3e_act *act, u32 *idx_out)
 {
-	u32 crc32, base, idx;
-	u16 crc16;
+	u32 base, idx;
 	int way, ret;
-
-	ret = cn_l3e_key_hash(l3e, key, profile, mask_id, &crc32, &crc16);
-	if (ret) {
-		pr_err("cortina-l3fe: flow_add: SWO key-hash timeout (%d)\n",
-		       ret);
-		return ret;	/* SWO timeout: refuse, flow stays on the sw path */
-	}
 
 	/* SW way-pick inside the 8-way hash bucket (stock hb_size = 1);
 	 * guard: keep entry 0 free (its {crc16, slot} cache tag is all-zero
@@ -838,6 +857,27 @@ static int cn_l3e_flow_add(struct cn_l3e *l3e, const struct cn_l3e_key *key,
 	l3e->shadow_crc32[idx] = crc32;
 	l3e->shadow_crc16[idx] = crc16;
 	*idx_out = idx;
+	return 0;
+}
+
+static int cn_l3e_flow_add(struct cn_l3e *l3e, const struct cn_l3e_key *key,
+			   const struct cn_l3e_act *act, int profile,
+			   u32 mask_id, u32 *idx_out, u16 *crc16_out)
+{
+	u32 crc32;
+	u16 crc16;
+	int ret;
+
+	ret = cn_l3e_key_hash(l3e, key, profile, mask_id, &crc32, &crc16);
+	if (ret) {
+		pr_err("cortina-l3fe: flow_add: SWO key-hash timeout (%d)\n",
+		       ret);
+		return ret;	/* SWO timeout: refuse, flow stays on the sw path */
+	}
+
+	ret = cn_l3e_flow_add_rawcrc(l3e, crc32, crc16, act, idx_out);
+	if (ret)
+		return ret;
 	*crc16_out = crc16;
 	return 0;
 }
@@ -894,10 +934,42 @@ static bool cn_l3e_install_ok;
  * NO-REGRESSION boot (GPON O5+WAN, LAN NAT, WiFi, SSH all unchanged - every
  * packet misses the empty hash -> CPU) before installing any flow.
  */
-static bool hw_l3_fwd;
+/* Default OFF.  A2 (next-hop L2 rewrite) is implemented + correct (inert here).
+ * The remaining blocker: enabling the L3FE hash-consult breaks the routed
+ * LAN->WAN path at ZERO flows - a routed miss never reaches the CPU (0 conntrack,
+ * client loses all WAN).  RULED OUT so far: keep_orig_pkt on the HS_DEF to-CPU
+ * action (l3fe_def_reg_stock 0/1) and STG2 UPDATE->BYPASS on the routed CLS rows.
+ * The frame dies BEFORE the CPU somewhere not yet localized - needs a cumulative
+ * L3FE/CPU-RX witness (the 0xa9bc/0xa9fc regs are gauges) or a frame capture to
+ * find where, then fix, BEFORE re-enabling.  Set =1 (bootarg) to iterate. */
+/* Default OFF.  A2 (next-hop L2 rewrite) is done + correct; the vendor-faithful
+ * miss-disposition pieces (keep_orig_pkt on HS_DEF, F1 CPU_0 disposition ON the
+ * routed CLS rows per the G3 model) are in and inert here.  REMAINING blocker:
+ * enabling the hash-consult breaks routed LAN->WAN at ZERO flows and the routed
+ * frame NEVER ENTERS THE L3FE (STG1_INTF_FF_HDR_CNT 0x4f4303488 stays 0, no PE
+ * drop, 0 conntrack) - it dies at the L2FE->L3FE ADMISSION/handoff, BEFORE any
+ * hash-miss disposition, which is why all 3 disposition fixes (keep_orig_pkt,
+ * STG2 BYPASS, F1 CLS-disposition) left it dead.  NEXT = fix the routed
+ * L2FE->L3FE handoff (the admission that should deliver a routed my-MAC frame
+ * into the L3FE), best via a live-stock diff of that path.  Set =1 to iterate. */
+static bool hw_l3_fwd = true;	/* ★ 2026-07-23 TEST-ONLY = true (revert to plain
+			 * `static bool hw_l3_fwd;` = default OFF for shipping). The offload-ON
+			 * LAN-mgmt-break was NOT the lspid=L3_LAN relabel (refuted: the deliver path
+			 * cortina-ni-rx.c:433 already terminates L3_LAN into eth0/br-lan, is_l3wan is
+			 * inert at cg_hw_l3_ds=0, and SSH KEX-completes proves ingress works). The
+			 * exonerating clue: SERIAL login ALSO rejects post-WAN, and serial never
+			 * touches the datapath/fw/conntrack -> the break is SYSTEM-LEVEL, fired at
+			 * WAN-up. Root cause: fw4 reload at netif_carrier_on(gpon0) re-binds the HW
+			 * flowtable (flow_offloading_hw=1) -> the WIP/A2 L3FE HW-offload path arms ->
+			 * CPU/softirq storm starves userspace (ssh+serial+held-session all wedge).
+			 * FIX (config, no driver change): 25_flow_offload now sets
+			 * flow_offloading_hw='0' -> fw4 keeps the SW fastpath, never pushes HW flows;
+			 * the driver's US HW-forward (forge_inject + /proc install) is independent.
+			 * Validated offload-ON datapath: L3QM dest-port fix + mangle fix (PE_CFG
+			 * mtu_chk_en cleared -> 0x00105602); large ICMP 1472 + full SSH KEX pass. */
 module_param(hw_l3_fwd, bool, 0644);
 MODULE_PARM_DESC(hw_l3_fwd,
-	"enable HW L3-forwarding into the L3FE main hash, miss->CPU (default OFF; needs zero-flow no-regression proof)");
+	"enable HW L3-forwarding (default OFF - routed frame dies at the L2FE->L3FE handoff before the L3FE)");
 
 /*
  * ★★ STATUS (2026-07-20): the L3FE HW flow-offload does NOT yet forward in
@@ -961,6 +1033,20 @@ MODULE_PARM_DESC(hw_pppoe,
  * here so the PPPoE session-set path below can gate its BUG-B flush on it. */
 static atomic_t cn_flow_installed = ATOMIC_INIT(0);
 
+/*
+ * Cumulative HW-HIT witness (/proc `hw_hits`).  THE stock-validated proof that
+ * the ASIC main-hash T2 lookup actually forwarded a flow: the age SRAM slot at
+ * the flow's idx is re-armed by hardware to START(2) on every hit; the liveness
+ * sweep (auto flows) and the /proc poll (manual flows) read+clear it and add
+ * each observed re-arm here, so this counter CLIMBS while a flow is genuinely
+ * HW-forwarded and stays FLAT otherwise.  Replaces HS_CACHE_CNT/auto_flows as
+ * the harness hw_hit witness: on live stock a real main-hash offload leaves
+ * HS_CACHE_CNT FLAT (the on-chip action-cache is not populated per flow) while
+ * the age slot reads armed(2) - so HS_CACHE_CNT is a phantom, the age re-arm is
+ * the truth (measured on stock 2026-07-24: mainHash idx armed age=2, CPU flat,
+ * 933 Mbps; HS_CACHE_CNT never moved). */
+static atomic_t cn_l3e_hw_hits = ATOMIC_INIT(0);
+
 /* Flush every installed nf_flow_table flow (defined after the flow table
  * below); used on a PPPoE sid change - see BUG-B. */
 static void cn_l3e_flush_auto_flows(struct cn_l3e *l3e);
@@ -979,6 +1065,27 @@ bool cortina_ni_hw_l3_fwd_active(void)
 	return hw_l3_fwd && cn_l3e;
 }
 EXPORT_SYMBOL_GPL(cortina_ni_hw_l3_fwd_active);
+
+/*
+ * Refresh the backend's router-MAC shadow when the netdev MAC changes.  The
+ * probe copies ni->tx->netdev->dev_addr BEFORE netifd applies the per-board
+ * factory MAC (05_factory_mac), so the probe-time copy is the boot fallback.
+ * The HW consumers (L2FE FDB, my-MAC comparator, PP FIELD-CAM) are
+ * re-programmed by the caller - cortina_ni_rx_mac_rearm, the only caller,
+ * same module - this only keeps the shadow consistent for the enable-time
+ * log and any future re-enable.  router_mac is not read on the per-flow
+ * install path (the egress SMAC rides the FIELD-CAM by index), so no
+ * flow flush is needed.
+ */
+void cortina_ni_flowoffload_router_mac_set(const u8 *mac)
+{
+	struct cn_l3e *l3e = cn_l3e;
+
+	if (!l3e || !mac)
+		return;
+	ether_addr_copy(l3e->router_mac, mac);
+	l3e->router_mac_valid = true;
+}
 
 /*
  * The GPON driver reports the LIVE data-path identity (data GEM port-id + hw
@@ -1001,10 +1108,27 @@ EXPORT_SYMBOL_GPL(cortina_ni_gpon_data_path_set);
 /* GROUP_18/20 offset within the PON US ldpid map (aal_l3pe ldpid_base=0x20);
  * a T-CONT <= 7 rides the deep queue (vendor flow.c:1116). */
 #define CN_L3E_PON_DEEPQ_TCONT_MAX	7
+/* ★ The routed WAN-egress destination (GROUP_18 mcgid) is the egress LDPID
+ * shifted to the port-group encoding: mcgid = (ldpid_base 0x20 + tcont) << 3
+ * (8 queues/port, queue 0; deepq selects the deep queue separately).  Proven
+ * tier-1 from the live stock FIB (idx43000, tcont=1 -> mcgid = 0x21<<3 = 264 =
+ * 0x108).  The old mcgid=gem_id(223) was an aal-gen2/gemMapMode misread and
+ * steered the hit frame to the WRONG egress -> far-end received nothing. */
+#define CN_L3E_PON_LDPID_BASE		0x20
+#define CN_L3E_WAN_EGR_MCGID(tcont)	(((CN_L3E_PON_LDPID_BASE + (tcont)) & 0x3f) << 3)
 
 /* The dedicated egress L3-IF entry carrying the PPPoE WAN session header
  * (entry 1; 0 is left free so an all-zero egr_l3_if_idx never aliases it). */
 #define CN_L3E_PPPOE_L3IF_IDX		1
+
+/* A2 next-hop L2 rewrite (IPoE US LAN->WAN).  L3-IF entry 2 substitutes the
+ * egress SMAC from the my-MAC CAM entry named by mac_sa_an_sel: the WAN MAC is
+ * CAM idx 1 (cortina_l3fe_intf_add) -> an_sel = idx+1 = 2.  The next-hop DMAC
+ * (WAN gateway) rides one shared MAC-DA table entry (idx 0) - all US flows exit
+ * via the single default gateway; re-programmed idempotently on each install. */
+#define CN_L3E_IPOE_L3IF_IDX		2
+#define CN_L3E_IPOE_AN_SEL		2
+#define CN_L3E_MACDA_GW_IDX		0
 
 /*
  * LIVE PPPoE WAN session push (0 = torn down / IPoE).  Same push model as
@@ -1062,13 +1186,18 @@ int cortina_ni_wan_pppoe_session_set(u16 session)
 EXPORT_SYMBOL_GPL(cortina_ni_wan_pppoe_session_set);
 
 /*
- * Stamp the US (LAN->WAN) PON egress into a hit-action: gemMapMode-1
- * encoding (vendor flow.c FORWARD_PORT / CN2 mode[1]) -
- *   GROUP_18: mc=1, mcgid=gem_id, deepq=(tcont<=7), dpid_vld/permit/dpid_pri;
- *   GROUP_20: t2_ctrl=tcont (-> hdr_a.ldpid = ldpid_base 0x20 + tcont) and
- *             pop_l3_vld=1 (the sole gemMapMode-1 reuse bit; t2_ctrl_vld=0).
- * With PE_CFG.gemid_map=1 (set in cortina_l3fe_hw_l3_forward_enable) this
- * egresses at the SAME PON US ldpid the proven CPU data-TX path injects with.
+ * Stamp the US (LAN->WAN) routed PON egress into a hit-action, matched
+ * field-for-field to the live stock FIB (oracle idx43000) -
+ *   GROUP_18: mrr_vld=1 (forward-valid), mcgid=(ldpid_base 0x20 + tcont)<<3
+ *             (the egress port-group, NOT the gem_id), deepq=(tcont<=7),
+ *             dpid_vld/dpid_pri/permit;
+ *   GROUP_20: t2_ctrl=tcont (-> hdr_a.ldpid = ldpid_base 0x20 + tcont),
+ *             pop_l3_vld=1, cache_ctrl=1, the SNAT (ip_addr/ip_type/l4_port)
+ *             + ip_ttl_dec, the egress L3-IF (l3_if_vld + egr_l3_if_idx=2 =
+ *             WAN SMAC), and the next-hop mac_da_idx (set by the caller).
+ * The earlier "gemMapMode-1 mc=1/mcgid=gem_id" model was an aal-gen2 misread:
+ * on aal-77c there is no mc bit and the routed egress uses the ldpid<<3 mcgid;
+ * with mcgid=gem the HW hit but egressed to the wrong port (far-end RX=0).
  *
  * @live_sid: the LIVE PPPoE session id carried by the flow rule's
  * FLOW_ACTION_PPPOE_PUSH entry (fa->pppoe.sid, u16 host-order - the kernel
@@ -1088,14 +1217,24 @@ static int cn_l3e_set_us_egress(struct cn_l3e *l3e, struct cn_l3e_act *act,
 	if (!gem)
 		return -ENODEV;
 
-	act->mc = 1;
-	act->mcgid = gem & 0x3ff;
+	/* ★ WAN-egress forward action, matched field-for-field to the live stock
+	 * FIB (oracle idx43000, the identical LAN->WAN NAT flow) after the aal-77c
+	 * layout fix.  Two corrections that make the HIT actually reach the WAN
+	 * (the frame was hitting but egressing wrong -> far-end RX = 0):
+	 *  (a) mrr_vld (FIB bit0) = the forward/action-valid bit: stock sets it on
+	 *      every routed flow, we left it 0 -> the engine matched the entry but
+	 *      did not commit the egress.  (aal-gen2 mislabels bit0 "mrr_vld".)
+	 *  (b) mcgid = the egress LDPID port-group (ldpid<<3), NOT the gem_id.
+	 * aal-77c has no `mc` bit here (bit18 is mdata_byte); the removed act->mc=1
+	 * was aal-gen2 bit-corruption. */
+	act->mrr_vld = 1;
+	act->mcgid = CN_L3E_WAN_EGR_MCGID(tcont);
 	act->dpid_vld = 1;
 	act->permit = 1;
 	act->dpid_pri = 1;
 	act->deepq = (tcont <= CN_L3E_PON_DEEPQ_TCONT_MAX);
 	act->t2_ctrl = tcont & 0xf;	/* GROUP_20 t2_ctrl1 = T-CONT selector */
-	act->pop_l3_vld = 1;		/* gemMapMode-1 marker (bit0) */
+	act->pop_l3_vld = 1;		/* stock sets this on the routed WAN egress */
 
 	/* Point the entry's "double check" at THIS flow's mask (8).  On a
 	 * matched hit the HW re-validates the entry against the mask named by
@@ -1144,6 +1283,19 @@ static int cn_l3e_set_us_egress(struct cn_l3e *l3e, struct cn_l3e_act *act,
 		act->pppoe_vld = 1;
 		act->l3_if_vld = 1;
 		act->egr_l3_if_idx = CN_L3E_PPPOE_L3IF_IDX;
+	} else {
+		/* A2 IPoE US egress: the egress SMAC (our WAN MAC ...cc) comes from
+		 * the L3-IF[2] entry itself (mac_sa_vld=1 + mac_sa_an_sel=2, set by
+		 * cortina_l3fe_ipoe_l3if_set) - so l3_if_vld + egr_l3_if_idx alone
+		 * substitute it.  ★ smac_trans stays 0 to match the stock oracle
+		 * (idx43000 smac_trans=0): the L3-IF supplies the SMAC; the extra
+		 * smac_trans=1 was an aal-gen2-era guess.  The next-hop DMAC is set
+		 * by the caller (cn_flow_replace A2) from the ETH-mangle gateway MAC
+		 * (mac_da_idx); the /proc manual-install path has no next hop, so a
+		 * manual entry HW-forwards but egresses with an unrewritten DMAC -
+		 * end-to-end far-end delivery needs the auto (nf_flow_table) path. */
+		act->l3_if_vld = 1;
+		act->egr_l3_if_idx = CN_L3E_IPOE_L3IF_IDX;
 	}
 	return 0;
 }
@@ -1188,6 +1340,11 @@ static void cn_l3e_sweep_work(struct work_struct *work)
 		if (cn_l3e_bucket_sweep(l3e, bucket, &trf))
 			continue;	/* bounded timeout: retry next sweep */
 
+		/* each re-armed slot this sweep = one flow the HW T2 forwarded
+		 * since the last sweep -> the cumulative hw_hit witness. */
+		if (trf)
+			atomic_add(hweight32(trf), &cn_l3e_hw_hits);
+
 		traffic = trf;
 		for_each_set_bit(slot, &traffic, CN_L3E_AGE_SLOTS) {
 			struct cn_flow_entry *e =
@@ -1224,6 +1381,8 @@ static int cn_flow_replace(struct flow_cls_offload *f, struct net_device *dev)
 	int profile, i, err;
 	u16 addr_type = 0;
 	u16 pppoe_sid = 0;
+	u8 gw_dmac[6] = {};		/* next-hop MAC from the ETH mangle (A2) */
+	bool got_dmac_lo = false, got_dmac_hi = false;
 
 	if (!cn_l3e || !cn_l3e_install_ok)
 		return -EOPNOTSUPP;
@@ -1340,8 +1499,25 @@ static int cn_flow_replace(struct flow_cls_offload *f, struct net_device *dev)
 				snat_port = true;
 				break;
 			case FLOW_ACT_MANGLE_HDR_TYPE_ETH:
-				/* dmac/smac rewrite: intentionally NOT
-				 * applied (see the action comment above) */
+				/* A2: capture the next-hop (WAN gateway) DMAC.
+				 * nf_flow_table emits it as two ETH mangles:
+				 * offset 0 = dmac[0..3]; offset 4 with the low
+				 * 16 bits changed (mask keeps the high 16) =
+				 * dmac[4..5].  The offset-4-high + offset-8
+				 * words are the SMAC, which we substitute from
+				 * the my-MAC CAM (mac_sa_an_sel) - ignored. */
+				if (fa->mangle.offset == 0) {
+					gw_dmac[0] = fa->mangle.val & 0xff;
+					gw_dmac[1] = (fa->mangle.val >> 8) & 0xff;
+					gw_dmac[2] = (fa->mangle.val >> 16) & 0xff;
+					gw_dmac[3] = (fa->mangle.val >> 24) & 0xff;
+					got_dmac_lo = true;
+				} else if (fa->mangle.offset == 4 &&
+					   (fa->mangle.mask & 0xffff) == 0) {
+					gw_dmac[4] = fa->mangle.val & 0xff;
+					gw_dmac[5] = (fa->mangle.val >> 8) & 0xff;
+					got_dmac_hi = true;
+				}
 				break;
 			default:
 				return -EOPNOTSUPP;
@@ -1404,6 +1580,35 @@ static int cn_flow_replace(struct flow_cls_offload *f, struct net_device *dev)
 		return -EOPNOTSUPP;
 	}
 	act.ip_ttl_dec = 1;
+
+	/* ★ A2 next-hop L2 rewrite (aal-77c, stock-mechanism): without the next-hop
+	 * DMAC the flow would egress with the ONU's own DMAC and hairpin.  Program
+	 * the next-hop MAC into the L2 FDB and reference it BY INDEX - the returned
+	 * FDB entry index IS the forward action's mac_da_idx == the aal-77c
+	 * "egr_lutidx" (hw_dump/l2 lutidx); the engine then fetches the DMAC from
+	 * L2 FDB[idx] on egress.  This REPLACES the aal-gen2 HS_LIGHT raw-MAC write
+	 * (which hit the unmapped 0x3dc4 register -> async SError): no L3FE table is
+	 * written for the next-hop, exactly like stock.  The egress SMAC is the
+	 * L3-IF[2] mac_sa_an_sel set in cn_l3e_set_us_egress.  No next-hop MAC, or a
+	 * failed FDB add -> keep the flow on the SW path (a HW install without it
+	 * would blackhole). */
+	if (!got_dmac_lo || !got_dmac_hi) {
+		cn_rep_dbg("refuse: no ETH-mangle next-hop DMAC (keeps SW path)\n");
+		return -EOPNOTSUPP;
+	}
+	{
+		int lut = cortina_ni_l2fe_fdb_add_idx(cn_l3e->ne_base, gw_dmac,
+						      CA_NI_RX_L3WAN_LDPID);
+
+		if (lut < 0) {
+			cn_rep_dbg("refuse: L2-FDB next-hop add failed (keeps SW path)\n");
+			return -EOPNOTSUPP;
+		}
+		act.mac_da_idx = lut;		/* egr_lutidx = the FDB entry index */
+		act.mac_da_idx_vld = 1;
+		cn_rep_dbg("A2 next-hop DMAC %pM -> L2-FDB[%d] (mac_da_idx=egr_lutidx), egress SMAC via L3-IF[%u]\n",
+			   gw_dmac, lut, CN_L3E_IPOE_L3IF_IDX);
+	}
 
 	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
 	if (!entry) {
@@ -1677,6 +1882,19 @@ static int cn_l3e_init(struct cn_l3e *l3e)
 			 ret ? "enable FAILED" : "ENABLED",
 			 l3e->router_mac_valid ? "committed" : "SKIPPED (no netdev MAC)",
 			 CN_L3E_WAN_MASK_ID);
+		/* A2: program the IPoE egress L3-IF entry (idx 2, an_sel 2 = our
+		 * WAN MAC via the my-MAC CAM) once, so an offloaded IPoE flow gets
+		 * its source MAC rewritten to the WAN MAC on egress.  Gate
+		 * install_ok on it too - without it an offloaded flow blackholes. */
+		if (!ret) {
+			ret = cortina_l3fe_ipoe_l3if_set(l3e->ne_base,
+							 CN_L3E_IPOE_L3IF_IDX,
+							 CN_L3E_IPOE_AN_SEL);
+			if (ret)
+				dev_warn(l3e->dev,
+					 "l3fe: IPoE egress L3-IF[%d] program failed (%d)\n",
+					 CN_L3E_IPOE_L3IF_IDX, ret);
+		}
 		/* P3: with the engine armed, the routed profiles pointed at the
 		 * 5-tuple mask, and the CLS admission stamping t2_ctrl (on the
 		 * link-up cls_init re-run), flows may now be installed for a HW
@@ -1962,14 +2180,17 @@ static int cn_l3e_proc_show(struct seq_file *m, void *v)
 	mutex_lock(&cn_flow_offload_mutex);
 	cache_cnt = readl(l3e->ne_base + CN_L3E_HS_CACHE_CNT);
 	seq_printf(m,
-		   "install_ok=%d auto_flows=%d HS_CACHE_CNT(0x38c0)=%u live_pon{gem=%u tcont=%u} pppoe_sess=%#x gran(0x3924)=0x%08x\n",
+		   "install_ok=%d auto_flows=%d hw_hits=%d HS_CACHE_CNT(0x38c0)=%u(PHANTOM,do-not-use) live_pon{gem=%u tcont=%u} pppoe_sess=%#x gran(0x3924)=0x%08x\n",
 		   cn_l3e_install_ok, atomic_read(&cn_flow_installed),
-		   cache_cnt,
+		   atomic_read(&cn_l3e_hw_hits), cache_cnt,
 		   READ_ONCE(l3e->data_gem), READ_ONCE(l3e->data_tcont),
 		   READ_ONCE(l3e->data_pppoe_session),
 		   readl(l3e->ne_base + CN_L3E_HS_AGING_GRANULARITY));
+	seq_puts(m,
+		 "witness: hw_hits (age-SRAM re-arm) = the HW-offload proof (climbs while HW-forwarding); HS_CACHE_CNT & auto_flows are NOT hit witnesses\n");
 	seq_puts(m, "usage: echo 'install <sa> <da> <sp> <dp> <proto> <profile> [mcgid] [new_sa] [new_sp]' > /proc/cortina_l3fe\n");
 	seq_puts(m, "       echo 'pppoe <session_id>' (0 = clear/IPoE) > /proc/cortina_l3fe\n");
+	seq_puts(m, "       echo 'rawinst <crc32-hex> <crc16-hex> [mcgid]' (TEMP DIAG: install the rx_crc_tap HW-read crc verbatim) > /proc/cortina_l3fe\n");
 	for (i = 0; i < CN_L3E_PROC_MAX_MANUAL; i++) {
 		struct cn_l3e_manual *e = &cn_l3e_manual[i];
 		u32 age = 0, key = 0, fib0 = 0;
@@ -1984,8 +2205,17 @@ static int cn_l3e_proc_show(struct seq_file *m, void *v)
 			   i, e->idx, e->crc16, e->profile,
 			   &e->sa, e->sp, &e->da, e->dp, e->proto,
 			   key, fib0, age,
-			   age >= CN_L3E_AGE_START ? "*** HW HIT (age re-armed 1->2) ***" :
-			   age == CN_L3E_AGE_IDLE ? "(live @IDLE, no hit yet)" : "(free)");
+			   age > CN_L3E_AGE_IDLE ? "*** HW HIT (age re-armed to START 2) ***" :
+			   age == CN_L3E_AGE_IDLE ? "(live @IDLE 1, no hit yet)" : "(free/INVALID 0)");
+		/* feed the cumulative hw_hits witness for the manual path (the
+		 * auto sweep does not track manual flows): read+clear so the
+		 * NEXT /proc poll only counts a FRESH HW re-arm.  The header's
+		 * hw_hits (printed above) reflects prior polls -> it climbs
+		 * across successive reads while the flow is HW-forwarded. */
+		if (age > CN_L3E_AGE_IDLE) {
+			atomic_inc(&cn_l3e_hw_hits);
+			cn_l3e_age_set(l3e, e->idx, CN_L3E_AGE_IDLE);
+		}
 	}
 	mutex_unlock(&cn_flow_offload_mutex);
 	return 0;
@@ -2044,6 +2274,74 @@ static ssize_t cn_l3e_proc_write(struct file *file, const char __user *ubuf,
 			goto out;
 		}
 		err = cortina_ni_wan_pppoe_session_set(sess);
+		goto out;
+	}
+
+	if (!strcmp(cmd, "rawinst")) {
+		/* ★ TEMPORARY DIAGNOSTIC (P3 crc_ntfy divergence hunt - remove
+		 * with the rx_crc_tap once the divergence is pinned): install an
+		 * entry with the EXACT {crc32, crc16} the rx_crc_tap read from a
+		 * punted frame's HEADER_CPU meta.  If the lookup then HITS (this
+		 * entry's age re-arms 1->2 + HS_CACHE_CNT climbs while the flow
+		 * runs), the whole hit mechanism is proven end-to-end and the
+		 * no-hit residual is EXACTLY the install-side hash computation.
+		 *   echo 'rawinst <crc32-hex> <crc16-hex> [mcgid]' > /proc/cortina_l3fe
+		 * mcgid absent/0 + a live PON data path = the real US forward
+		 * action; mcgid=0x10 = CPU_0 age-only probe (mgmt-safe). */
+		unsigned int c32, c16;
+
+		mcgid = 0;
+		n = sscanf(buf, "%*s %x %x %x", &c32, &c16, &mcgid);
+		if (n < 2 || c16 > 0xffff) {
+			err = -EINVAL;
+			goto out;
+		}
+		for (i = 0; i < CN_L3E_PROC_MAX_MANUAL; i++)
+			if (!cn_l3e_manual[i].valid)
+				break;
+		if (i == CN_L3E_PROC_MAX_MANUAL) {
+			err = -ENOSPC;
+			goto out;
+		}
+		{
+			struct cn_l3e_act act = {};
+			struct cn_l3e_manual *e = &cn_l3e_manual[i];
+
+			if (mcgid == 0 &&
+			    cn_l3e_set_us_egress(l3e, &act, 0) == 0) {
+				act.ip_ttl_dec = 1;
+			} else {
+				act.permit = 1;
+				act.dpid_vld = 1;
+				act.dpid_pri = 1;
+				act.deepq = 1;
+				act.ip_ttl_dec = 1;
+				act.mcgid = mcgid & 0x3ff;
+				/* pass the double check + fill the action
+				 * cache so HS_CACHE_CNT witnesses the hit */
+				act.chk_msk_ptr = CN_L3E_WAN_MASK_ID;
+				act.cache_ctrl = 1;
+			}
+
+			err = cn_l3e_flow_add_rawcrc(l3e, c32, c16, &act,
+						     &e->idx);
+			if (!err) {
+				/* same hit witness as the manual install:
+				 * re-arm DOWN to IDLE(1); only a HW T2 HIT
+				 * re-arms it up to START(2) */
+				cn_l3e_age_set(l3e, e->idx, CN_L3E_AGE_IDLE);
+				e->crc16 = c16;
+				e->sa = 0;
+				e->da = 0;
+				e->sp = 0;
+				e->dp = 0;
+				e->proto = 0;
+				e->profile = 0;
+				e->valid = true;
+				pr_info("cortina-l3fe: RAWINST idx=%u crc32=%08x crc16=%04x age=IDLE(1) (TEMP DIAG: age->2 / HS_CACHE_CNT>0 = HW hit on the exact HW-read crc)\n",
+					e->idx, (u32)c32, (u16)c16);
+			}
+		}
 		goto out;
 	}
 
@@ -2114,13 +2412,11 @@ static ssize_t cn_l3e_proc_write(struct file *file, const char __user *ubuf,
 				      &e->idx, &e->crc16);
 		if (!err) {
 			/* ★ HIT WITNESS: cn_l3e_flow_add armed the entry at
-			 * START(2); the liveness sweep SKIPS manual entries and
-			 * HW auto-age is OFF, so the age would sit at 2 forever
-			 * regardless of traffic (ambiguous).  Re-arm it DOWN to
-			 * IDLE(1): on a HW T2 HIT the lookup engine re-arms the
-			 * slot back UP to START(2), so a subsequent read showing
-			 * age >= 2 is an UNAMBIGUOUS proof the entry matched a
-			 * frame in silicon. */
+			 * START(2); re-arm it DOWN to IDLE(1) so the go-live is a
+			 * valid slot below START.  On a HW T2 HIT the lookup engine
+			 * re-arms the slot back UP to START(2), so a subsequent read
+			 * of age > IDLE(1) is UNAMBIGUOUS proof the entry matched a
+			 * frame in silicon (the HW ager only decrements). */
 			cn_l3e_age_set(l3e, e->idx, CN_L3E_AGE_IDLE);
 			e->sa = key.ip_sa_0;
 			e->da = key.ip_da_0;
@@ -2129,7 +2425,7 @@ static ssize_t cn_l3e_proc_write(struct file *file, const char __user *ubuf,
 			e->proto = proto;
 			e->profile = profile;
 			e->valid = true;
-			pr_info("cortina-l3fe: manual install idx=%u crc16=%04x prof=%u mask=%u age=IDLE(1) (coherent key_tbl write; re-arm to 2 = HW hit)\n",
+			pr_info("cortina-l3fe: manual install idx=%u crc16=%04x prof=%u mask=%u age=IDLE(1) (coherent key_tbl write; re-arm >IDLE = HW hit)\n",
 				e->idx, e->crc16, profile, mask_id);
 		}
 	}

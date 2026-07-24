@@ -112,6 +112,15 @@
 #define L3FE_PE_CFG			0x351c
 #define L3FE_PE_CFG_LDPID_BASE		GENMASK(9, 4)
 #define L3FE_PE_CFG_GEMID_MAP		BIT(10)
+#define L3FE_PE_CFG_PAD_CTRL		BIT(12)		/* vendor-init: set by stock */
+#define L3FE_PE_CFG_RSVD14		BIT(14)		/* vendor-init: set by stock */
+#define L3FE_PE_CFG_MTU_CHK_EN		BIT(31)		/* ★ reset=1; stock CLEARS it.  Left set,
+							 * every PE-transiting T2-miss CPU punt is MTU-
+							 * length-checked against the (mostly-zero)
+							 * L3FE_PE_MTU_SIZE table -> large frames (ssh KEX,
+							 * bulk shell) diverted to CPU_REASON_MTU and lost;
+							 * small frames (SYN/banner/ICMP) pass = the
+							 * terminating-TCP "mangle".  Clear to match stock. */
 #define L3FE_LDPID_PON_US_0		0x20	/* AAL_LPORT_PON_US_0 */
 
 /*
@@ -400,13 +409,47 @@ static const u32 l3fe_mask_lo[9][4] = {
 	{ 0xffffffff, 0x027fffff, 0xfffff000, 0xc0ffffff },
 	{ 0xffffffff, 0x027fffff, 0xff7ff000, 0xffffffff },
 	{ 0x000003ff, 0x0221f000, 0x15001402, 0xc0f03fe1 },
-	/* mask 8: 5-tuple only (mask0 | ~mask1, swolearn-verified).  DATA2 also
-	 * excludes the PPPoE session fields (pppoe_session_id @ mask-bit 89,
-	 * pppoe_type @ 91) so a PPPoE-session frame's parsed key (session != 0)
-	 * still matches the sparse install key on the inner 5-tuple; a no-op for
-	 * IPoE (those fields are 0 either way).  ppp_protocol_enc/pppoe_code_enc
-	 * (bits 88/90) are already excluded. */
-	{ 0x000003ff, 0xffa1f000, 0xffbfdfff, 0xffffffff },
+	/*
+	 * ★ mask 8: 5-TUPLE-ONLY NAPT mask, DERIVED FROM THE aal-77c
+	 * aal_hash_mask_t field table (the chip's own tree - proven by the
+	 * ca-ne.ko symbol aal_hash_add_with_no_crc_calulate; NOT aal-gen2),
+	 * decode-validated bit-for-bit against the two stock masks that work
+	 * (mask 0 = NAT, mask 1 = bridge).  Polarity: 1 = EXCLUDE a field, 0 =
+	 * KEEP; ip_da/ip_sa are a 9-bit KEEP-LENGTH (0x080 = /128, clamps to /32
+	 * for IPv4); ip_ttl is a 2-bit enum where 0/1 = exclude, 2/3 = keep.
+	 *
+	 * KEEP (mask field = 0): l4_dp value (16 bits), l4_sp value (16 bits),
+	 * ip_protocol, ip_ver, ip_vld; ip_da / ip_sa keep-length = 0x020 (= keep
+	 * the top 32 bits = the IPv4 address in ip_xa_0).  EXCLUDE everything
+	 * else (= 1), including the 17th "port range/exact" bit of each L4-port
+	 * field and ip_ttl (enum forced to 0).  This exact 224-bit value was
+	 * derived TWO independent ways that AGREE bit-for-bit on all meaningful
+	 * bits [219:0]: (a) built from the aal-77c aal_hash_mask_t field table,
+	 * (b) an independent Ghidra/source extraction of hash_value_calculate.
+	 *
+	 * ★ Fixes vs the previous hand-built "mask0|~mask1" value
+	 * (0x000003ff,0xffa1f000,0xffbfdfff,0xffffffff), whose decode revealed
+	 * three bugs that made the sparse-install CRC diverge from the HW
+	 * parsed-frame CRC (board-measured 2026-07-23: install c9b5981e/5fc9 vs
+	 * HW crc_ntfy tap 6667e6d3/5a64):
+	 *   1. ip_ttl enum = 3 -> KEPT the TTL (the parser sets the real TTL, the
+	 *      sparse HDR_I leaves 0) AND armed the TTL>10 -> AAL_E_OUTRANGE
+	 *      range-check.  Now 0 (excluded).
+	 *   2. ip_da/ip_sa keep-length = 511 (malformed: suffix-flag set + len
+	 *      255).  Now 0x020 (prefix, keep top 32 = the v4 addr).
+	 *   3. kept ipv6_doh/rh/hbh, ip_fragment_flag, ip_options, and the L4
+	 *      port 17th (range) bit - all parser-set, zero in the sparse build.
+	 *      Now excluded.
+	 * PPPoE session/type, dscp/ecn, vlan, MAC SA/DA, lspid, l3_chksum: all
+	 * excluded, so a real routed frame hashes identically to the driver's
+	 * sparse 5-tuple install.  Only reachable under hw_l3_fwd (routed
+	 * profiles' maskptr re-pointed here); gate-off leaves the stock masks
+	 * untouched.  (The DOUBLE-CHECK is separate and already correct: the
+	 * action's chk_msk_ptr1 = this mask id 8 + cache_ctrl1 = 1 - aal-77c
+	 * GROUP_20; the chip's flow FIB never fetches GROUP_21/chk_hash_val, so
+	 * no xor32 is needed.)
+	 */
+	{ 0x040003ff, 0x827ff800, 0xff3fd100, 0xffffffff },
 };
 static const u32 l3fe_mask_hi[9][4] = {
 	{ 0xffff807f, 0xffffffff, 0xfeffffff, 0xffffffff },
@@ -553,7 +596,14 @@ static const u32 l3fe_def_reg_stock[L3FE_HS_DEF_REG_COUNT] = {
 	 * climbed, l3fe_rx stayed 0).  Fixed by the static FDB WAN-MAC -> L3_WAN
 	 * entry (l3fe_fdb_static_add / cortina_ni_rx_fdb_add_cpu), after which
 	 * DS-WAN unicast delivers 0-loss end to end. */
-	0x1C000000, 0x00000004, 0x00000000,	/* entry 0: TRAP -> CPU_0 (mcgid 0x10) */
+	/* ★ word1 bits 22/23 = keep_orig_pkt_vld|keep_orig_pkt (0x00C00000).  EVERY
+	 * vendor to-CPU miss action carries them (aal-gen2/aal_hash.c
+	 * WAN/LAN/MC/CLS _HASH_ACT_DEFAULT_TO_CPU) so the punt is delivered VERBATIM;
+	 * without them the miss frame is rebuilt by the PE (edited/decapsulated) and
+	 * dies at/after CPU RX - which is exactly why enabling the hash-consult
+	 * BROKE the routed LAN->WAN path at zero flows (same class as the board-proven
+	 * PPPoE-LCP mangling that keep_orig_pkt fixed). */
+	0x00000000, 0x00300000, 0x00000000,	/* entry 0: stock hash-miss (NO dpid; the CLS row supplies the CPU port - tier-1 devmem 2026-07-23) */
 	/* ★ entry 1 = TRAP -> CPU_0 too (deviation from the stock capture
 	 * 0x00009811): profile 3's INI (0x3784 = 0x00084211) points all four
 	 * default_sel nibbles at DEFAULT_ACTION entry 1, and the gated routed
@@ -562,7 +612,7 @@ static const u32 l3fe_def_reg_stock[L3FE_HS_DEF_REG_COUNT] = {
 	 * resolves through entry 1.  Stock's 0x9811 is its bridge-flow miss
 	 * action; ours MUST punt to CPU_0 or gate-on would black-hole LAN
 	 * management on the first miss. */
-	0x1C000000, 0x00000004, 0x00000000,	/* entry 1: TRAP -> CPU_0 (see above) */
+	0x00009811, 0x00000000, 0x00000000,	/* entry 1: stock bridge/flood miss action 0x9811 (tier-1 devmem 2026-07-23) */
 	0x00040001, 0x00300000, 0x00404000,	/* entry 2 */
 	0x00009831, 0x00300000, 0x00000000,	/* entry 3 */
 };
@@ -621,8 +671,8 @@ static int l3fe_mac_da_cam_set(void __iomem *ne, u32 idx, const u8 *mac)
 }
 
 /* One CLS-KEY indirect write: 11 words then ACCESS=GO|WR|idx, poll GO clear. */
-static int l3fe_cls_key_write(void __iomem *ne, u16 idx,
-			      const u32 w[L3FE_CLS_KEY_WORDS])
+static int __maybe_unused l3fe_cls_key_write(void __iomem *ne, u16 idx,
+					     const u32 w[L3FE_CLS_KEY_WORDS])
 {
 	int i;
 
@@ -664,7 +714,10 @@ static int l3fe_cls_key_write(void __iomem *ne, u16 idx,
  * pre-resolved forwarding disposition here would suppress the T2 lookup
  * (why stamping t2_ctrl on the dispositioned catch-all rows was inert).
  */
-static const struct { u16 idx; u32 w[L3FE_CLS_KEY_WORDS]; } l3fe_cls_routed_key[] = {
+/* Refuted (tier-1 2026-07-23): stock leaves CLS rows 3/67 empty; kept
+ * __maybe_unused until the golden-row t2_ctrl approach is board-proven. */
+static const struct { u16 idx; u32 w[L3FE_CLS_KEY_WORDS]; }
+	l3fe_cls_routed_key[] __maybe_unused = {
 	/* WAN ingress: an_sel=2 (WAN MAC, CAM idx 1), lspid=0x18, pri 6 */
 	{ L3FE_CLS_KEY_ROW_WAN, { 0xFFFFFFFF, 0xFFFFFFFF, 0x00030FE4, 0, 0,
 				  0, 0, 0, 0, 0, 0x08180000 } },
@@ -707,13 +760,22 @@ static const struct { u16 idx; u32 w[L3FE_CLS_KEY_WORDS]; } l3fe_cls_routed_key[
 	{ L3FE_CLS_KEY_ROW_WAN_CTL, { 0xFFFFFCFF, 0xFFFFFFFF, 0x0007FFFF, 0, 0,
 				      0, 0, 0, 0, 0, 0x08200000 } },
 };
-static const struct { u16 idx; u32 w[L3FE_CLS_FIB_WORDS]; } l3fe_cls_routed_fib[] = {
-	/* WAN: run T2 profile 0, stage2(NAT)=UPDATE+vld, no fwd disposition */
+static const struct { u16 idx; u32 w[L3FE_CLS_FIB_WORDS]; }
+	l3fe_cls_routed_fib[] __maybe_unused = {
+	/* ★ CARRY the to-CPU disposition ON THE CLS ROW (w4 = permit|dpid_pri|
+	 * dpid_vld 0x1C000000; w5 = mcgid CPU_0 + stage3_ctrl_vld 0x01000004),
+	 * NOT on the HS_DEF miss action.  This silicon = the vendor G3 model
+	 * (aal-gen2/aal_hash.c *_HASH_ACT_DEFAULT_TO_CPU: "use CLS to decide flow
+	 * miss CPU port" - the HS_DEF miss default has NO dpid).  Ours had it
+	 * inverted (no disposition on the row, relying on a HS_DEF dpid) so a
+	 * routed T2 MISS carried no CPU disposition and was DROPPED - the enable
+	 * regression.  Keep stage2_ctrl_vld (0x04000000, the hit-path NAT) +
+	 * t2_ctrl (w6); a T2 HIT overrides the disposition with the flow action. */
 	{ L3FE_CLS_FIB_IDX(L3FE_CLS_KEY_ROW_WAN),
-	  { 0, 0, 0, 0, 0, 0x04000000, 0x00000A00 } },
-	/* LAN: run T2 profile 1 */
+	  { 0, 0, 0, 0, 0x1C000000, 0x05000004, 0x00000A00 } },
+	/* LAN: run T2 profile 1, same to-CPU disposition on the row */
 	{ L3FE_CLS_FIB_IDX(L3FE_CLS_KEY_ROW_LAN),
-	  { 0, 0, 0, 0, 0, 0x04000000, 0x00001A00 } },
+	  { 0, 0, 0, 0, 0x1C000000, 0x05000004, 0x00001A00 } },
 	/*
 	 * WAN non-IP control trap action: the stock unicast->CPU_0 disposition
 	 * bytes (golden FIB[4]: w4 0x1C000000 = dpid_vld|dpid_pri|permit @bits
@@ -748,7 +810,7 @@ static void l3fe_wan_mac_derive(const u8 *lan_mac, u8 *wan_mac)
 int cortina_l3fe_intf_add(void __iomem *ne, const u8 *lan_mac)
 {
 	u8 wan_mac[6];
-	int i, ret;
+	int ret;
 
 	if (!lan_mac)
 		return -EINVAL;
@@ -763,34 +825,18 @@ int cortina_l3fe_intf_add(void __iomem *ne, const u8 *lan_mac)
 	if (ret)
 		return ret;
 
-	/* 2. Latch the compare in the ingress STG0 LPB profiles:
-	 * mac_da_an_mask |= bit(idx+1), match_en left 0 (promiscuous).
-	 * RMW is safe against the link-up re-init: cortina_ni_rx_mymac_trap
-	 * rewrites the HIGH words with the stock constants first, then the
-	 * cls_init re-run re-applies these bits. */
-	for (i = 0; i < L3FE_LPB_AN_PROFILES; i++) {
-		u32 v = readl(ne + L3FE_STG0_LPB_HIGH(i));
-
-		v |= L3FE_LPB_AN_MASK(L3FE_AN_SEL(L3FE_AN_IDX_LAN)) |
-		     L3FE_LPB_AN_MASK(L3FE_AN_SEL(L3FE_AN_IDX_WAN));
-		writel(v, ne + L3FE_STG0_LPB_HIGH(i));
-	}
-
-	/* 3. The pri-6 routed CLS rules: ALL FIBs first, then ALL KEYs
-	 * (stock aal_l3_cls_add order - a key must never point at a stale
-	 * action). */
-	for (i = 0; i < (int)ARRAY_SIZE(l3fe_cls_routed_fib); i++) {
-		ret = l3fe_cls_fib_write(ne, l3fe_cls_routed_fib[i].idx,
-					 l3fe_cls_routed_fib[i].w);
-		if (ret)
-			return ret;
-	}
-	for (i = 0; i < (int)ARRAY_SIZE(l3fe_cls_routed_key); i++) {
-		ret = l3fe_cls_key_write(ne, l3fe_cls_routed_key[i].idx,
-					 l3fe_cls_routed_key[i].w);
-		if (ret)
-			return ret;
-	}
+	/*
+	 * Tier-1 stock-diff (2026-07-23, live devmem on stock NAND): stock's
+	 * routed-ingress LPB profiles 0/1/2 carry mac_da_an_mask = 0, and CLS
+	 * rows 3/67 (the pri-6 slots) are EMPTY.  Stock drives L3 HW-forward
+	 * purely through the ALWAYS-ON golden CLS rows 0/1/2 + 64/65/66, whose
+	 * FIB action already carries t2_ctrl + the CPU_0 miss disposition
+	 * (cortina-ni-rx.c cls_fib_golden == stock FIB 0/4/8/256/260/264,
+	 * byte-matched).  The earlier STG0 an-mask + pri-6 routed-rule scheme is
+	 * NOT how stock works and corrupted the routed path on enable - removed.
+	 * intf_add now only provisions the PP FIELD-CAM router-MAC entries
+	 * (which stock also has: MAC-DA e0 = LAN gw, e1 = WAN = base+1).
+	 */
 	return 0;
 }
 
@@ -877,10 +923,11 @@ int cortina_l3fe_hw_l3_forward_enable(void __iomem *ne, const u8 *router_mac)
 	{
 		u32 v = readl(ne + L3FE_PE_CFG);
 
-		v &= ~L3FE_PE_CFG_LDPID_BASE;
+		v &= ~(L3FE_PE_CFG_LDPID_BASE | L3FE_PE_CFG_MTU_CHK_EN);
 		v |= FIELD_PREP(L3FE_PE_CFG_LDPID_BASE, L3FE_LDPID_PON_US_0) |
-		     L3FE_PE_CFG_GEMID_MAP;
-		writel(v, ne + L3FE_PE_CFG);
+		     L3FE_PE_CFG_GEMID_MAP |
+		     L3FE_PE_CFG_PAD_CTRL | L3FE_PE_CFG_RSVD14;
+		writel(v, ne + L3FE_PE_CFG);	/* == stock 0x00105602 (tier-1 devmem) */
 	}
 
 	/* 2c-bis. PPPoE PE encap globals (one-time): header code/version/type
@@ -976,6 +1023,67 @@ int cortina_l3fe_pppoe_l3if_set(void __iomem *ne, u32 idx, u16 session)
 		entry = L3FE_L3IF_PPPOE_SET | L3FE_L3IF_PPPOE_VLD |
 			FIELD_PREP(L3FE_L3IF_PPPOE_SESSION, session);
 
+	writel(entry, ne + L3FE_L3IF_DATA);
+	writel(L3FE_GO | L3FE_WRITE | (idx & (L3FE_L3IF_ENTRIES - 1)),
+	       ne + L3FE_L3IF_ACCESS);
+	return l3fe_poll_clear(ne, L3FE_L3IF_ACCESS, L3FE_GO);
+}
+
+/* ---- L3FE HW flow-offload next-hop L2 rewrite (defect A2) -------------- *
+ * A routed/NAT flow's hit-action rewrites the next-hop DMAC (mac_da_idx into
+ * the HS_LIGHT indexed MAC table) + the egress SMAC (egr_l3_if_idx into the
+ * L3-IF table, which selects our WAN MAC from the my-MAC CAM).  Without these
+ * an offloaded flow egresses with the ONU's own DMAC (hairpin) - which is why
+ * hw_l3_fwd is gated OFF.  Both are plain indirect-access register SRAM; recipe
+ * RE'd from cortina-api/flow.c + aal-gen2/aal_hashlite.c + aal-77c/aal_l3_if.c
+ * (the same GO/poll protocol as the mask/CLS/CAM tables). */
+
+#define L3FE_MACDA_IDX_ENTRIES		1024
+
+/*
+ * ★ CRASH FIX (async SError on the first AUTO flow install) + aal-77c reality.
+ *
+ * The "HS_LIGHT indexed-interface MAC table" this used to write (ACCESS 0x3dc4,
+ * DATA5/DATA4 0x3dc8/0x3dcc, tblsel 8<<12) was RE'd from aal-gen2/aal_hashlite.c
+ * - the WRONG chip tree (same class as the FIB layout bug).  On this aal-77c die
+ * (rtl8277c) that block DOES NOT EXIST:
+ *   - the L3FE register window ends at ~0x3c8c (authoritative rtl8277c_registers.h);
+ *     0x3dc4/0x3dc8/0x3dcc are UNMAPPED holes -> a write async-SErrors the CPU
+ *     (the t=58.5s panic on the first nf_flow_table install);
+ *   - rtl8277c has NO HS_LIGHT register at all (0x3d00-0x3exx undefined).  Even
+ *     the *correct* aal-gen2 offset (ca8271 HS_LIGHT_IND_X_ACCESS = 0x3e64) is
+ *     absent here.
+ *
+ * The next-hop DMAC on aal-77c comes from a DIFFERENT table, not an HS_LIGHT
+ * indexed MAC: the egress L3-IF entry carries only the SMAC (EGRESS_L3_IF_TBL_DATA
+ * = PPPoE + MAC_SA_VLD/AN_SEL only, no DMAC field), and the FIB mac_da_idx indexes
+ * the L2 FDB / LUT (fc_mgr programs it via rtk_fc_l2_addr_add -> _rtk_fc_lut_learning).
+ * Porting that next-hop path is a follow-up; until then REFUSE, so cn_flow_replace
+ * keeps the routed flow on the SW fast path (which forwards+delivers correctly) -
+ * no crash, no regression, only no HW offload of that flow yet.
+ */
+int cortina_l3fe_macda_idx_set(void __iomem *ne, u32 idx, const u8 *mac)
+{
+	(void)ne; (void)idx; (void)mac;
+	return -EOPNOTSUPP;
+}
+
+/* IPoE egress L3-IF entry: substitute the egress SMAC from the my-MAC CAM entry
+ * named by mac_sa_an_sel (WAN MAC = CAM idx 1 -> an_sel 2), no PPPoE.  Vendor:
+ * cortina-api/route.c convert_intf_to_eif {mac_sa_vld=1, mac_sa_an_sel=idx+1}. */
+#define L3FE_L3IF_MAC_SA_VLD		BIT(18)
+#define L3FE_L3IF_MAC_SA_AN_SEL		GENMASK(22, 19)
+#define L3FE_L3IF_PAD_CTRL		BIT(23)	/* stock sets it on the SMAC entries */
+
+int cortina_l3fe_ipoe_l3if_set(void __iomem *ne, u32 idx, u8 an_sel)
+{
+	/* Stock SMAC egress entries carry PAD_CTRL + PPPOE_SET (with PPPOE_VLD=0,
+	 * so the PPPoE push stays inert): WAN SMAC (an_sel 2) = 0x00940001 tier-1. */
+	u32 entry = L3FE_L3IF_MAC_SA_VLD | L3FE_L3IF_PAD_CTRL | L3FE_L3IF_PPPOE_SET |
+		    FIELD_PREP(L3FE_L3IF_MAC_SA_AN_SEL, an_sel);
+
+	if (idx >= L3FE_L3IF_ENTRIES)
+		return -EINVAL;
 	writel(entry, ne + L3FE_L3IF_DATA);
 	writel(L3FE_GO | L3FE_WRITE | (idx & (L3FE_L3IF_ENTRIES - 1)),
 	       ne + L3FE_L3IF_ACCESS);

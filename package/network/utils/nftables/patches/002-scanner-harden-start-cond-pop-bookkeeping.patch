@@ -1,0 +1,63 @@
+scanner: never lose a deferred start-condition pop, never pop an empty stack
+
+scanner_pop_start_cond() keeps a count of deferred pops (flex_state_pop)
+for close_scope events that arrive while the scanner has already moved
+into a nested start condition (bison lookahead).  Two defects in the
+drain logic:
+
+1. When draining stops early because the newly exposed start condition is
+   still active, the CURRENT call's own pop is silently dropped instead of
+   being re-queued.  Each occurrence desynchronizes the pop accounting
+   from the real flex start-condition stack (observed on the standard fw4
+   ruleset at "meta nfproto ipv4 meta l4proto igmp counter accept": the
+   counter scope's pop is lost).
+
+2. yy_top_state()/yy_pop_state() are called without checking that the
+   start-condition stack is non-empty.  Once the bookkeeping is off (see
+   above and the IGMP grammar leak fixed in the previous patch),
+   yy_top_state() reads stack[-1] (UB) and yy_pop_state() hits the fatal
+   "start-condition stack underflow" flex error, aborting the whole parse.
+   This is what made the fw4-rendered ruleset unloadable on the ONU
+   (firewall/NAT completely absent).
+
+Re-queue the own pop on early drain exit, and guard both pop sites so a
+residual imbalance degrades into a no-op instead of a fatal error.
+
+--- a/src/scanner.l
++++ b/src/scanner.l
+@@ -1350,6 +1350,11 @@
+ 	yy_push_state((int)type, scanner);
+ }
+ 
++static bool scanner_start_stack_empty(void *scanner)
++{
++	return ((struct yyguts_t *)scanner)->yy_start_stack_ptr <= 0;
++}
++
+ void scanner_pop_start_cond(void *scanner, enum startcond_type t)
+ {
+ 	struct parser_state *state = yyget_extra(scanner);
+@@ -1363,14 +1368,22 @@
+ 
+ 	while (state->flex_state_pop) {
+ 		state->flex_state_pop--;
++		if (scanner_start_stack_empty(scanner))
++			return;
+ 		state->startcond_type = yy_top_state(scanner);
+ 		yy_pop_state(scanner);
+ 
+ 		t = state->startcond_type;
+-		if (state->startcond_active[t])
++		if (state->startcond_active[t]) {
++			/* defer our own pop, else it is lost */
++			state->flex_state_pop++;
+ 			return;
++		}
+ 	}
+ 
++	if (scanner_start_stack_empty(scanner))
++		return;
++
+ 	state->startcond_type = yy_top_state(scanner);
+ 
+ 	yy_pop_state(scanner);

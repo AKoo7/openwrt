@@ -312,8 +312,10 @@ enum cortina_ni_win {
 #define  CA_NI_GPHY_WRAP_EN1_PATCH_DONE	BIT(12)		/* GPHY->MAC datapath */
 #define  CA_NI_GPHY_WRAP_EN1_BITS \
 	(CA_NI_GPHY_WRAP_EN1_MDIO_OCP | CA_NI_GPHY_WRAP_EN1_PATCH_DONE)
-#define  CA_NI_GPHY_WRAP_EN1_VAL	CA_NI_GPHY_WRAP_EN1_BITS	/* 0x1001 */
-/* per-GPHY interface enable in EN1; the ko's phy reinit clears then sets it */
+#define  CA_NI_GPHY_WRAP_EN1_VAL	CA_NI_GPHY_WRAP_EN1_BITS	/* 0x1001 (stock steady) */
+/* per-GPHY interface enable in EN1 = an EDGE/STROBE (NOT a resting level): the
+ * reinit pulses EN1_IF(p) 0->1 between two INTF_RST pulses to connect GPHY p to
+ * its MAC; the resting readback is 0x1001 (bits[7:4] don't "stick"). */
 #define  CA_NI_GPHY_WRAP_EN1_IF(p)	BIT(4 + (p))
 /* other wrapper regs (analog/datapath, U-Boot-inherited) - dumped for verify */
 #define CA_NI_GPHY_WRAP_R00		0x00
@@ -1360,6 +1362,9 @@ enum cortina_ni_win {
  * QM VOQ picks (index 15 = the stock CPU slot CA_NI_RX_CPU_DEST_PORT). */
 #define CA_NI_RX_DEEPQ_DEST_PORT_LO	8
 #define CA_NI_RX_DEEPQ_DEST_PORT_HI	15
+/* highest DEST_PORT_EQ_CFG index (0x6168 + 0x2f*4 = 0x6224); stock configures the
+ * whole CPU/PON range up to here, ours left 16..0x2f at profile 0 -> empty EQ0 */
+#define CA_NI_QM_DEST_PORT_MAX		0x2f
 /* dest-port (index = ldpid - 0x10; CPU port 0 = 0) -> EQ-profile select */
 /* per-dest-port EQ-profile select: authoritative base QM_QM_DEST_PORT0_EQ_CFG
  * = ELNATH 0x6168 (rtl8277c 0x6148), stride 4, 32 entries.  CPU dest port = 8,
@@ -1597,6 +1602,7 @@ enum cortina_ni_win {
 #define CA_NI_L2FE_ARB_PDPID_DATA	0x1670	/* pdpid[3:0] */
 #define CA_NI_PPORT_OAM			0x0c	/* AAL_PPORT_OAM */
 #define CA_NI_PPORT_QM			0x08	/* AAL_PPORT_QM (US PON data path) */
+#define CA_NI_PPORT_BLACKHOLE		0x0f	/* AAL_PPORT_BLACKHOLE (drop) */
 #define CA_NI_LDPID_9QUEUE_LO		0x08	/* AAL_LPORT_9QUEUE_NI0 */
 #define CA_NI_LDPID_9QUEUE_HI		0x0f	/* AAL_LPORT_9QUEUE_NI7 (PON 7 + 8) */
 #define CA_NI_LDPID_CPU_MQ_LO		0x20	/* AAL_LPORT_CPU_MQ_0 / LLID_GEM_INDEX_0 */

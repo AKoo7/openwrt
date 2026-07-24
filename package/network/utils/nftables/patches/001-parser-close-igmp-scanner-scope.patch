@@ -1,0 +1,41 @@
+parser_bison: close the IGMP scanner scope when igmp is used as a protocol value
+
+The scanner unconditionally pushes the SCANSTATE_IGMP flex start condition
+on the "igmp" keyword.  In the primary_rhs_expr protocol-value production
+every protocol alternative pops its scanner scope again via close_scope_*
+(TCP, UDP, UDPLITE, ESP, AH, ICMP, ICMP6, GRE, COMP, DCCP, SCTP) - except
+IGMP, which is missing close_scope_igmp.
+
+Consequence: every ruleset containing e.g.
+
+    meta l4proto igmp counter accept
+
+(the standard fw4 "Allow-IGMP" rule) permanently leaks one start-condition
+stack entry, leaves the scanner's startcond_type stuck at SCANSTATE_IGMP,
+and via the deferred-pop bookkeeping in scanner_pop_start_cond() also loses
+the pop of the following scope (e.g. the counter scope).  The corrupted
+bookkeeping accumulates across the ruleset and, depending on the following
+content, ends in the fatal flex error
+
+    start-condition stack underflow
+
+which aborts the parse.  On our RTL9607F ONU image this made the whole
+fw4-rendered ruleset unloadable (no firewall, no masquerade, LAN->WAN
+dead).
+
+Add the missing close_scope_igmp, matching all sibling alternatives.
+Verified with an instrumented scanner: the fw4 ruleset now ends with a
+balanced start-condition stack (depth 0, no deferred pops) instead of two
+leaked entries and a stale IGMP state.
+
+--- a/src/parser_bison.y
++++ b/src/parser_bison.y
+@@ -5388,7 +5388,7 @@
+ 							 BYTEORDER_HOST_ENDIAN,
+ 							 sizeof(data) * BITS_PER_BYTE, &data);
+ 			}
+-			|	IGMP
++			|	IGMP	close_scope_igmp
+ 			{
+ 				uint8_t data = IPPROTO_IGMP;
+ 				$$ = constant_expr_alloc(&@$, &inet_protocol_type,

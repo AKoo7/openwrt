@@ -13,7 +13,13 @@
 #    by itself if the kernel rejects the offload flowtable).
 uci -q batch <<-EOF
 	set firewall.@defaults[0].flow_offloading='1'
-	set firewall.@defaults[0].flow_offloading_hw='1'
+	set firewall.@defaults[0].flow_offloading_hw='1'	# 2026-07-24: L3FE HW-offload now CORRECT (aal-77c FIB
+					# layout + chk_msk_ptr@bit92 + egress mcgid=(0x20+tcont)<<3 / mrr_vld=1 /
+					# SMAC-from-L3IF all fixed; entry HITS + HW-forwards, CPU bypassed). Enable
+					# auto-offload so nf_flow_table installs real flows WITH the resolved
+					# next-hop DMAC (set only on the auto path, cn_flow_replace) -> far-end RX.
+					# The prior '0' avoided a CPU storm from the BROKEN WIP offload; fixed now.
+					# Requires cortina_ni.hw_l3_fwd=1 + engine armed.
 	commit firewall
 EOF
 exit 0

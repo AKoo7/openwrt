@@ -49,6 +49,7 @@
 #include <linux/netdevice.h>
 #include <linux/platform_device.h>
 #include <linux/proc_fs.h>
+#include <linux/ratelimit.h>	/* ★ TEMP DIAG rx_stack_tap - revert with it */
 #include <linux/seq_file.h>
 #include <linux/skbuff.h>
 #include <linux/unaligned.h>
@@ -66,6 +67,66 @@ module_param(rx_skip_portcfg, bool, 0644);
 static bool rx_debug;
 module_param(rx_debug, bool, 0644);
 MODULE_PARM_DESC(rx_debug, "dump the first received descriptors/frames");
+
+/* ★ TEMPORARY DIAGNOSTIC (P3 crc_ntfy tap, 2026-07-23 - REVERT once the T2
+ * hash divergence is pinned).  HASH_INI.crc_ntfy_en=1 makes the T2 lookup
+ * write its computed {crc32, crc16} into every punted frame's HEADER_CPU meta
+ * (frame buffer +0x48/+0x4C, big-endian).  With this gate on, each punted
+ * IPv4/UDP frame to the offload-test sink port (19555) has that HW lookup CRC
+ * logged (ratelimited) and exported via /proc/net/cortina_ni_rx, so it can be
+ * diffed directly against the driver's install-side SWO CRC (the
+ * "manual install ... crc16=" log line) - the diff IS the executed-no-match
+ * divergence.  Runs on the coherent CPU-pool mapping (a userspace /dev/mem
+ * read of the ring SIGBUSed).  Runtime-flippable, default OFF, off = zero
+ * cost beyond one predicted-untaken branch. */
+static bool rx_crc_tap;
+module_param(rx_crc_tap, bool, 0644);
+MODULE_PARM_DESC(rx_crc_tap,
+	"TEMP DIAG: log the HW lookup CRC (HEADER_CPU crc_ntfy) of punted UDP:19555 frames");
+
+/* ★ TEMPORARY DIAGNOSTIC (P3 packet-STACK tap, 2026-07-23 - REVERT together
+ * with rx_crc_tap once the T2 hash divergence is pinned).  For each punted
+ * transit probe frame (innermost IPv4/UDP dport 19555 - matched through any
+ * VLAN/QinQ/PPPoE/IP-in-IP layering, unlike the fixed-offset crc tap, so a
+ * tag-shifted probe still fires), log side by side:
+ *   (a) the SW-decoded protocol stack of the actual frame bytes (explicit
+ *       byte math), flagging any deviation from the expected plain
+ *       {Ethernet -> IPv4 -> UDP}: a per-port VLAN tag the L2FE did NOT
+ *       untag, a QinQ double-tag, PPPoE, IP-over-IP;
+ *   (b) the HW's OWN parse of the frame: the 128-byte L3FE HDR_I descriptor
+ *       read from the L3FE debug snapshot mux (stock aal_l3fe_glb_dbg_get;
+ *       tap 2 = "HDR_I between STG1 ~ T2 (Hash)" = the exact T2 lookup-key
+ *       input), decoded at the a_cut bit offsets recovered from the stock
+ *       ca-ne.ko l3fe_debug_dump_hw_hdr_i_a_cut field extractions.
+ * A divergence between (a) and (b) - or an unexpected tag in (a) - IS a
+ * hash-divergence mechanism: the HW parsed/hashed different bytes than the
+ * driver's install-side HDR_I build assumed.  The debug mux is a LIVE
+ * snapshot of the LAST frame through STG1->T2 (not a per-frame meta), so the
+ * dump prints a same-frame check (HW l4_dp vs 19555); a STALE verdict means
+ * another frame raced the mux between the punt and this NAPI read - re-read
+ * under quieter traffic.  Ratelimited; raw HDR_I words hexdumped on the
+ * first hits for offline decode.  Runtime-flippable, default OFF, off = one
+ * predicted-untaken branch. */
+static bool rx_stack_tap;
+module_param(rx_stack_tap, bool, 0644);
+MODULE_PARM_DESC(rx_stack_tap,
+	"TEMP DIAG: dump SW frame-stack vs HW HDR_I parse for punted UDP:19555 frames");
+
+/* ★ Decoupled datapath bring-up (default ON, 2026-07-22).  The full datapath
+ * bring-up (dphy_rst release glb+0xa0, all-bank GPHY line<->system SRAM patch,
+ * GPHY<->MAC wrapper, FE path) normally runs ONLY from the connected PHY's
+ * link-up hook.  This driver connects ONE PHY (phy_find_first) to eth0; on a rig
+ * where that PHY's port has no cable, link-up never fires, so the internal
+ * GPHY/datapath stays HELD IN RESET and NO physical LAN port (eth0.2..5)
+ * ingresses (host ARP flood -> rx=0) even though the L2FE forwarding tables
+ * byte-match stock.  Fix: also drive the bring-up from the 1 Hz recovery_work
+ * (which runs regardless of eth0's link) until every GPHY bank is patched, so
+ * the LAN ports come up independent of eth0's PHY.  Set =0 to restore the old
+ * link-up-only behaviour for an A/B. */
+static bool rx_decoupled_bringup = true;
+module_param(rx_decoupled_bringup, bool, 0644);
+MODULE_PARM_DESC(rx_decoupled_bringup,
+		 "drive the datapath bring-up from the 1Hz poll so LAN ports come up without an eth0 cable (default on)");
 
 /* ★ build88: A/B which CPU-EPP ring NAPI reads descriptors from - 0 = the LOW ring at
  * PADDR(0x7200)=0x0bc48000 (default/current); 1 = the HIGH ring at PADDR_HI(0x7220)=
@@ -267,6 +328,273 @@ void cortina_ni_pon_wan_ndev_set(struct net_device *ndev)
 }
 EXPORT_SYMBOL_GPL(cortina_ni_pon_wan_ndev_set);
 
+/* ------------------------------------------------------------------ */
+/* ★ TEMP DIAG rx_stack_tap implementation (REVERT with rx_crc_tap)    */
+/* ------------------------------------------------------------------ */
+
+/* L3FE debug snapshot mux (stock ca-ne.ko aal_l3fe_glb_dbg_get, tier-2
+ * disasm): write (tap_idx << 5) | word_idx to NE+0x30b8, read the 32-bit
+ * word at NE+0x30bc; 32 words per tap point = the 128-byte HDR_I.  Plain
+ * address/data mux - no GO bit, no poll.  Tap idx 2 = "HDR_I between STG1 ~
+ * T2 (Hash)" (the stock help text), i.e. the exact descriptor the T2 lookup
+ * hashes. */
+#define CA_NI_L3FE_DBG_ADDR		0x30b8
+#define CA_NI_L3FE_DBG_DATA		0x30bc
+#define CA_NI_L3FE_DBG_TAP_T2IN		2
+#define CA_NI_HDRI_WORDS		32
+
+/* a_cut HDR_I bit offsets (LSB-first over the 128-byte little-endian
+ * descriptor: bit n = word[n >> 5] bit (n & 31)) - recovered from the stock
+ * ca-ne.ko l3fe_debug_dump_hw_hdr_i_a_cut pretty-printer field extractions.
+ * The l4_dp/l4_sp/ip_da/ip_sa/ip_l4_type/ip_proto/ip_ver/ip_vld offsets
+ * independently agree with the tier-1 single-bit SWO learn (the same values
+ * cortina-ni-flowoffload.c CN_HDRI_* uses), which validates the whole map. */
+#define HDRI_L4_DP		74	/* 16b dest L4 port */
+#define HDRI_L4_SP		90	/* 16b src L4 port */
+#define HDRI_L3_TOTLEN		122	/* 14b IP total length */
+#define HDRI_L3_CK_ERR		136	/*  1b l3_chksum_err */
+#define HDRI_L3_CKSUM		137	/* 16b IP header checksum */
+#define HDRI_IP_DA0		233	/* 32b v4 DA (LSW of the 128b field) */
+#define HDRI_IP_SA0		361	/* 32b v4 SA (LSW of the 128b field) */
+#define HDRI_IP_L4_TYPE		489	/*  3b 0=UDP 1=TCP .. */
+#define HDRI_IP_PROTO		492	/*  8b IP protocol */
+#define HDRI_IP_IHL		500	/*  4b IHL (words) */
+#define HDRI_IP_VER		504	/*  1b 0=IPv4 1=IPv6 */
+#define HDRI_IP_VLD		505	/*  1b parsed an IP header */
+#define HDRI_PPP_PROTO_ENC	506	/*  4b ppp_protocol_enc */
+#define HDRI_PPPOE_SESS		510	/* 16b pppoe_session_id */
+#define HDRI_PPPOE_TYPE		526	/*  2b pppoe_type */
+#define HDRI_INNER_1P		528	/*  3b inner 802.1p */
+#define HDRI_TOP_1P		531	/*  3b top 802.1p */
+#define HDRI_INNER_DEI		534	/*  1b */
+#define HDRI_INNER_VID		535	/* 12b */
+#define HDRI_INNER_TPID_ENC	547	/*  3b */
+#define HDRI_TOP_DEI		550	/*  1b */
+#define HDRI_TOP_VID		551	/* 12b */
+#define HDRI_TOP_TPID_ENC	563	/*  3b */
+#define HDRI_VLAN_CNT		566	/*  2b tags still ON the frame at T2 */
+#define HDRI_ETYPE_ENC		585	/*  4b ethertype_enc */
+#define HDRI_ETYPE		589	/* 16b ethertype (post-tag) */
+#define HDRI_O_LSPID		816	/*  6b original lspid */
+#define HDRI_LSPID		822	/*  6b lspid (post-LPB rewrite) */
+#define HDRI_L4_OFFSET		897	/*  8b PE: L4 offset in the frame */
+#define HDRI_L3_OFFSET		913	/*  8b PE: L3 offset in the frame */
+#define HDRI_PKT_LEN		929	/* 14b PE: orig_packet_len */
+
+/* extract an LSB-first bitfield (width <= 32) from the 32 LE HDR_I words */
+static u32 rx_hdri_get(const u32 *w, unsigned int bit, unsigned int width)
+{
+	u64 v = ((u64)w[(bit >> 5) + 1] << 32) | w[bit >> 5];
+
+	v >>= bit & 31;
+	return v & (width < 32 ? (1u << width) - 1 : 0xffffffffu);
+}
+
+/* SW-decoded frame layering (explicit byte math, endianness-agnostic) */
+struct rx_stack_sw {
+	u8	tags;			/* VLAN tags found (2 recorded) */
+	u16	tpid[2], tci[2];	/* outermost first */
+	u16	ethertype;		/* after the last tag */
+	bool	pppoe;
+	u16	pppoe_sess, ppp_proto;
+	bool	ip, inner;		/* outer IPv4 seen / IP-in-IP seen */
+	u8	ipver, ihl;		/* outer version, outer IHL bytes */
+	u8	proto;			/* INNERMOST IPv4 protocol */
+	u32	sa, da;			/* INNERMOST IPv4, host-order value */
+	bool	l4;
+	u16	sp, dp;			/* innermost L4 ports */
+};
+
+static bool rx_stack_sw_parse(const u8 *p, int len, struct rx_stack_sw *s)
+{
+	int pos = 12, ip_pos, i;
+	u16 et = 0;
+
+	memset(s, 0, sizeof(*s));
+	if (len < 14)
+		return false;
+	for (i = 0; i < 3; i++) {	/* walk up to 3 stacked VLAN tags */
+		if (pos + 4 > len)
+			return false;
+		et = ((u16)p[pos] << 8) | p[pos + 1];
+		if (et != 0x8100 && et != 0x88a8 && et != 0x9100)
+			break;
+		if (s->tags < 2) {
+			s->tpid[s->tags] = et;
+			s->tci[s->tags] = ((u16)p[pos + 2] << 8) | p[pos + 3];
+		}
+		s->tags++;
+		pos += 4;
+	}
+	s->ethertype = et;
+	pos += 2;			/* now at the payload */
+
+	if (et == 0x8863) {		/* PPPoE discovery: no IP inside */
+		s->pppoe = true;
+		return true;
+	}
+	if (et == 0x8864) {		/* PPPoE session */
+		if (pos + 8 > len)
+			return false;
+		s->pppoe = true;
+		s->pppoe_sess = ((u16)p[pos + 2] << 8) | p[pos + 3];
+		s->ppp_proto = ((u16)p[pos + 6] << 8) | p[pos + 7];
+		if (s->ppp_proto != 0x0021)	/* descend only into PPP-IPv4 */
+			return true;
+		pos += 8;
+		et = 0x0800;
+	}
+	if (et != 0x0800)		/* v6/ARP/...: stack recorded, no v4 */
+		return true;
+
+	ip_pos = pos;
+	if (ip_pos + 20 > len)
+		return false;
+	s->ip = true;
+	s->ipver = p[ip_pos] >> 4;
+	s->ihl = (p[ip_pos] & 0xf) * 4;
+	s->proto = p[ip_pos + 9];
+	s->sa = get_unaligned_be32(p + ip_pos + 12);
+	s->da = get_unaligned_be32(p + ip_pos + 16);
+	if (s->proto == 4) {		/* IPv4-in-IPv4 */
+		ip_pos += s->ihl;
+		if (ip_pos + 20 > len)
+			return false;
+		s->inner = true;
+		s->proto = p[ip_pos + 9];
+		s->sa = get_unaligned_be32(p + ip_pos + 12);
+		s->da = get_unaligned_be32(p + ip_pos + 16);
+	}
+	/* L4 of the innermost IPv4 (proto 41 = 6in4: flagged, not descended) */
+	pos = ip_pos + (p[ip_pos] & 0xf) * 4;
+	if ((s->proto == 17 || s->proto == 6) && pos + 4 <= len) {
+		s->l4 = true;
+		s->sp = ((u16)p[pos] << 8) | p[pos + 1];
+		s->dp = ((u16)p[pos + 2] << 8) | p[pos + 3];
+	}
+	return true;
+}
+
+static noinline void cortina_ni_rx_stack_tap(struct cortina_ni *ni,
+					     const u8 *p, int len)
+{
+	static DEFINE_RATELIMIT_STATE(rs, 2 * HZ, 2);
+	static unsigned int hits;
+	struct net_device *ndev = ni->rx->netdev;
+	u32 w[CA_NI_HDRI_WORDS];
+	struct rx_stack_sw s;
+	u32 hw_dp, hw_sa, hw_da, hw_vcnt, hw_vld;
+	char fl[128];
+	unsigned int i;
+	int n = 0;
+
+	if (!rx_stack_sw_parse(p, len, &s))
+		return;
+	/* the offload probe: innermost IPv4/UDP dport 19555, any layering */
+	if (!s.ip || s.proto != 17 || !s.l4 || s.dp != 19555)
+		return;
+	if (!__ratelimit(&rs))
+		return;
+	hits++;
+
+	/* (a) actual frame stack + anomaly flags vs plain {Eth->IPv4->UDP} */
+	fl[0] = '\0';
+	if (s.tags)
+		n += scnprintf(fl + n, sizeof(fl) - n,
+			       " \xe2\x98\x85VLAN %04x/vid=0x%03x NOT untagged%s",
+			       s.tpid[0], s.tci[0] & 0xfff,
+			       s.tags > 1 ? " +QinQ" : "");
+	if (s.tags > 1)
+		n += scnprintf(fl + n, sizeof(fl) - n, " inner %04x/vid=0x%03x",
+			       s.tpid[1], s.tci[1] & 0xfff);
+	if (s.pppoe)
+		n += scnprintf(fl + n, sizeof(fl) - n,
+			       " \xe2\x98\x85PPPoE sess=0x%04x", s.pppoe_sess);
+	if (s.inner)
+		n += scnprintf(fl + n, sizeof(fl) - n, " \xe2\x98\x85IP-over-IP");
+	if (!n)
+		scnprintf(fl, sizeof(fl), " plain Eth/IPv4/UDP (as expected)");
+	netdev_info(ndev,
+		    "stack_tap#%u SW : eth{da=%pM sa=%pM} tags=%u et=%04x ip{v%u ihl=%u proto=%u sa=%08x da=%08x} l4{sp=%u dp=%u} |%s\n",
+		    hits, p, p + 6, s.tags, s.ethertype, s.ipver, s.ihl,
+		    s.proto, s.sa, s.da, s.sp, s.dp, fl);
+
+	/* (b) the HW's parse: HDR_I at the T2 (hash) input, via the debug mux */
+	for (i = 0; i < CA_NI_HDRI_WORDS; i++) {
+		writel((CA_NI_L3FE_DBG_TAP_T2IN << 5) | i,
+		       ni_base(ni) + CA_NI_L3FE_DBG_ADDR);
+		w[i] = readl(ni_base(ni) + CA_NI_L3FE_DBG_DATA);
+	}
+	hw_dp   = rx_hdri_get(w, HDRI_L4_DP, 16);
+	hw_sa   = rx_hdri_get(w, HDRI_IP_SA0, 32);
+	hw_da   = rx_hdri_get(w, HDRI_IP_DA0, 32);
+	hw_vcnt = rx_hdri_get(w, HDRI_VLAN_CNT, 2);
+	hw_vld  = rx_hdri_get(w, HDRI_IP_VLD, 1);
+	netdev_info(ndev,
+		    "stack_tap#%u HW : HDR_I@T2 lspid=%02lx(o=%02lx) et=%04lx(enc%lx) vlan_cnt=%u top{tpid%lx vid=0x%03lx p%lu d%lu} inner{tpid%lx vid=0x%03lx p%lu d%lu} pppoe{t%lu sess=0x%04lx enc%lx} ip{vld%u v%lu ihl=%lu proto=%lu l4t=%lu} sa=%08x da=%08x sp=%lu dp=%u l3{ck=%04lx err%lu len=%lu} pe_off{l3=%lu l4=%lu plen=%lu}\n",
+		    hits,
+		    (unsigned long)rx_hdri_get(w, HDRI_LSPID, 6),
+		    (unsigned long)rx_hdri_get(w, HDRI_O_LSPID, 6),
+		    (unsigned long)rx_hdri_get(w, HDRI_ETYPE, 16),
+		    (unsigned long)rx_hdri_get(w, HDRI_ETYPE_ENC, 4),
+		    hw_vcnt,
+		    (unsigned long)rx_hdri_get(w, HDRI_TOP_TPID_ENC, 3),
+		    (unsigned long)rx_hdri_get(w, HDRI_TOP_VID, 12),
+		    (unsigned long)rx_hdri_get(w, HDRI_TOP_1P, 3),
+		    (unsigned long)rx_hdri_get(w, HDRI_TOP_DEI, 1),
+		    (unsigned long)rx_hdri_get(w, HDRI_INNER_TPID_ENC, 3),
+		    (unsigned long)rx_hdri_get(w, HDRI_INNER_VID, 12),
+		    (unsigned long)rx_hdri_get(w, HDRI_INNER_1P, 3),
+		    (unsigned long)rx_hdri_get(w, HDRI_INNER_DEI, 1),
+		    (unsigned long)rx_hdri_get(w, HDRI_PPPOE_TYPE, 2),
+		    (unsigned long)rx_hdri_get(w, HDRI_PPPOE_SESS, 16),
+		    (unsigned long)rx_hdri_get(w, HDRI_PPP_PROTO_ENC, 4),
+		    hw_vld,
+		    (unsigned long)rx_hdri_get(w, HDRI_IP_VER, 1),
+		    (unsigned long)rx_hdri_get(w, HDRI_IP_IHL, 4),
+		    (unsigned long)rx_hdri_get(w, HDRI_IP_PROTO, 8),
+		    (unsigned long)rx_hdri_get(w, HDRI_IP_L4_TYPE, 3),
+		    hw_sa, hw_da,
+		    (unsigned long)rx_hdri_get(w, HDRI_L4_SP, 16),
+		    hw_dp,
+		    (unsigned long)rx_hdri_get(w, HDRI_L3_CKSUM, 16),
+		    (unsigned long)rx_hdri_get(w, HDRI_L3_CK_ERR, 1),
+		    (unsigned long)rx_hdri_get(w, HDRI_L3_TOTLEN, 14),
+		    (unsigned long)rx_hdri_get(w, HDRI_L3_OFFSET, 8),
+		    (unsigned long)rx_hdri_get(w, HDRI_L4_OFFSET, 8),
+		    (unsigned long)rx_hdri_get(w, HDRI_PKT_LEN, 14));
+
+	/* verdict: same frame?  (mux = LAST frame through STG1->T2) + diffs */
+	n = 0;
+	fl[0] = '\0';
+	if (hw_vcnt != s.tags)
+		n += scnprintf(fl + n, sizeof(fl) - n,
+			       " \xe2\x98\x85vlan_cnt HW=%u vs frame=%u",
+			       hw_vcnt, s.tags);
+	if (hw_vcnt)
+		n += scnprintf(fl + n, sizeof(fl) - n,
+			       " \xe2\x98\x85tag still present at T2");
+	if (!hw_vld)
+		n += scnprintf(fl + n, sizeof(fl) - n,
+			       " \xe2\x98\x85HW parsed NO IP header");
+	if (!((hw_sa == s.sa || hw_sa == swab32(s.sa)) &&
+	      (hw_da == s.da || hw_da == swab32(s.da))))
+		n += scnprintf(fl + n, sizeof(fl) - n,
+			       " \xe2\x98\x85HW sa/da != frame sa/da");
+	if (!n)
+		scnprintf(fl, sizeof(fl), " HW parse == SW stack");
+	netdev_info(ndev, "stack_tap#%u -->: %s;%s\n", hits,
+		    (hw_dp == 19555 || hw_dp == swab16(19555)) ?
+		    "same-frame" :
+		    "\xe2\x98\x85STALE snapshot (another frame raced the mux)",
+		    fl);
+
+	/* raw words for offline decode of anything not printed above */
+	if (hits <= 4)
+		print_hex_dump(KERN_INFO, "stack_tap HDR_I: ",
+			       DUMP_PREFIX_OFFSET, 16, 4, w, sizeof(w), false);
+}
+
 /* consume one CPU-EPP descriptor.  The frame sits in a software-populated DRAM buffer
  * inside our coherent CPU-pool region; copy it into a fresh skb and deliver, then
  * RE-PUSH that buffer's PA back to its EQ free-list (copy-break recycle).  cpu_eq=0
@@ -376,6 +704,50 @@ static void cortina_ni_rx_frame(struct cortina_ni *ni, u64 desc)
 			  sport, dport, buf[off], buf[off+1], buf[off+2],
 			  buf[off+3], buf[off+4], buf[off+5], len);
 	}
+
+	/*
+	 * ★ TEMPORARY DIAGNOSTIC crc_ntfy tap (rx_crc_tap gate; see the module
+	 * param above - REVERT once the divergence is pinned).  Match a punted
+	 * IPv4/UDP frame to the offload-test sink port (dport 19555, any
+	 * src - covers the transit probe 192.168.1.99:41099 and sport bumps)
+	 * and read the T2-computed lookup CRC the hardware wrote into THIS
+	 * frame's HEADER_CPU meta: crc32 = BE32 @buf+0x48, crc16 = BE16
+	 * @buf+0x4C (meaningful when HEADER_A.cpu_flg=1 - logged so a missing
+	 * HEADER_CPU is itself a finding).  Compare against the install-side
+	 * SWO crc for the same 5-tuple; install the read value verbatim via
+	 * /proc/cortina_l3fe "rawinst <crc32> <crc16>" for the guaranteed-hit
+	 * proof (age 1->2 + HS_CACHE_CNT climb).
+	 */
+	if (unlikely(rx_crc_tap && !swid && off + 38 <= buf_max &&
+		     buf[off + 12] == 0x08 && buf[off + 13] == 0x00 &&
+		     buf[off + 23] == 0x11 &&
+		     ((((u16)buf[off + 36] << 8) | buf[off + 37]) == 19555))) {
+		u32 c32 = get_unaligned_be32(buf + CA_NI_RX_HDRA_OFF + 8);
+		u16 c16 = get_unaligned_be16(buf + CA_NI_RX_HDRA_OFF + 12);
+		bool cpuf = !!(hdra_hi & CA_NI_HDRA_W0_CPU_FLG);
+
+		rx->tap_hits++;
+		rx->tap_crc32 = c32;
+		rx->tap_crc16 = c16;
+		rx->tap_cpuflg = cpuf;
+		net_info_ratelimited(
+			"%s: crc_tap %pI4:%u -> %pI4:19555 UDP lspid=%lu cpu_flg=%u HW crc32=%08x crc16=%04x (vs the install crc = the divergence)\n",
+			netdev_name(ndev), buf + off + 26,
+			(u16)(((u16)buf[off + 34] << 8) | buf[off + 35]),
+			buf + off + 30,
+			FIELD_GET(CA_NI_HDRA_W1_LSPID, hdra_lo),
+			cpuf, c32, c16);
+	}
+
+	/*
+	 * ★ TEMP DIAG packet-stack tap (rx_stack_tap gate - REVERT with
+	 * rx_crc_tap): SW-decoded frame layering vs the HW's HDR_I parse,
+	 * side by side.  Matches the probe through ANY VLAN/QinQ/PPPoE/
+	 * IP-in-IP layering (the fixed-offset crc tap above misses a
+	 * tag-shifted probe entirely - itself a symptom this tap exposes).
+	 */
+	if (unlikely(rx_stack_tap && !swid))
+		cortina_ni_rx_stack_tap(ni, buf + off, len);
 
 	/*
 	 * DS PON control frame (GPON OMCI): the PDC steers the OMCC DS GEM to
@@ -1093,10 +1465,22 @@ static void cortina_ni_rx_mc_group_init(struct cortina_ni *ni)
 
 /* Stage one static FDB entry {mac, vid/scind/dot1p=0} -> {ldpid, valid,
  * static, DA/SA permit}, APPEND it, then READ-verify (status 0x5 = HIT). */
-static void cortina_ni_rx_fdb_append(struct cortina_ni *ni, const u8 *mac,
-				     u32 ldpid)
+/*
+ * Program a STATIC L2FE FDB entry {mac -> ldpid} and RETURN its hash-table entry
+ * INDEX = CMD_RETURN.ext_status[16:4] (13-bit), or -1 on failure.
+ *
+ * ★ That index IS the L3FE forward action's mac_da_idx == the aal-77c "egr_lutidx"
+ * (hw_dump/l2 lutidx): on a HW-offloaded routed frame the engine fetches the
+ * next-hop DMAC from L2 FDB[idx] BY REFERENCE.  This is exactly how stock resolves
+ * the egress DMAC - no raw MAC write to any L3FE table, so no repeat of the
+ * aal-gen2 HS_LIGHT 0x3dc4 unmapped-register SError.
+ *
+ * `base` = the NI/NE register window (ni_base(ni) == cn_l3e->ne_base, the single
+ * 0xf4300000 window).  Exported for the flow-offload next-hop path.
+ */
+int cortina_ni_l2fe_fdb_add_idx(void __iomem *base, const u8 *mac, u32 ldpid)
 {
-	u32 d0, d1, d2, d3, acc;
+	u32 d0, d1, d2, d3, acc, cr;
 
 	/* key: MAC -> DATA1/2/3 (aal __aal_mac_2_fdb_data); vid/scind/dot1p = 0 */
 	d3 = (mac[0] >> 5) & 0x7;
@@ -1107,36 +1491,42 @@ static void cortina_ni_rx_fdb_append(struct cortina_ni *ni, const u8 *mac,
 	     CA_NI_L2FE_FDB_VALID | CA_NI_L2FE_FDB_STATIC |
 	     CA_NI_L2FE_FDB_DA_PERMIT | CA_NI_L2FE_FDB_SA_PERMIT;
 
-	/* APPEND (no cmd_return feedback - the vendor never reads it here) */
-	writel(0, ni_base(ni) + CA_NI_L2FE_FDB_CMD_RETURN);
-	writel(d3, ni_base(ni) + CA_NI_L2FE_FDB_DATA3);
-	writel(d2, ni_base(ni) + CA_NI_L2FE_FDB_DATA2);
-	writel(d1, ni_base(ni) + CA_NI_L2FE_FDB_DATA1);
-	writel(d0, ni_base(ni) + CA_NI_L2FE_FDB_DATA0);
+	writel(0, base + CA_NI_L2FE_FDB_CMD_RETURN);
+	writel(d3, base + CA_NI_L2FE_FDB_DATA3);
+	writel(d2, base + CA_NI_L2FE_FDB_DATA2);
+	writel(d1, base + CA_NI_L2FE_FDB_DATA1);
+	writel(d0, base + CA_NI_L2FE_FDB_DATA0);
 	writel(CA_NI_L2FE_FDB_GO | CA_NI_L2FE_FDB_OP_APPEND,
-	       ni_base(ni) + CA_NI_L2FE_FDB_ACCESS);
-	readl_poll_timeout(ni_base(ni) + CA_NI_L2FE_FDB_ACCESS, acc,
-			   !(acc & CA_NI_L2FE_FDB_GO), CA_NI_TX_POLL_US,
-			   CA_NI_TX_POLL_TIMEOUT_US);
+	       base + CA_NI_L2FE_FDB_ACCESS);
+	if (readl_poll_timeout(base + CA_NI_L2FE_FDB_ACCESS, acc,
+			       !(acc & CA_NI_L2FE_FDB_GO), CA_NI_TX_POLL_US,
+			       CA_NI_TX_POLL_TIMEOUT_US))
+		return -1;
 
-	/* READ-back the key to VERIFY the entry installed: READ returns
-	 * cmd_return.status[3:0]=0x5 (HIT) + the action in DATA0 if found. */
-	writel(0, ni_base(ni) + CA_NI_L2FE_FDB_CMD_RETURN);
-	writel(d3, ni_base(ni) + CA_NI_L2FE_FDB_DATA3);
-	writel(d2, ni_base(ni) + CA_NI_L2FE_FDB_DATA2);
-	writel(d1, ni_base(ni) + CA_NI_L2FE_FDB_DATA1);
+	/* READ back the key: CMD_RETURN.status[3:0]=0x5 HIT, ext_status[16:4]=idx */
+	writel(0, base + CA_NI_L2FE_FDB_CMD_RETURN);
+	writel(d3, base + CA_NI_L2FE_FDB_DATA3);
+	writel(d2, base + CA_NI_L2FE_FDB_DATA2);
+	writel(d1, base + CA_NI_L2FE_FDB_DATA1);
 	writel(CA_NI_L2FE_FDB_GO | CA_NI_L2FE_FDB_OP_READ,
-	       ni_base(ni) + CA_NI_L2FE_FDB_ACCESS);
-	readl_poll_timeout(ni_base(ni) + CA_NI_L2FE_FDB_ACCESS, acc,
-			   !(acc & CA_NI_L2FE_FDB_GO), CA_NI_TX_POLL_US,
-			   CA_NI_TX_POLL_TIMEOUT_US);
-	dev_info(ni->dev,
-		 "fdb-add: %pM -> ldpid 0x%02x : readback cmd_return=0x%08x (status=0x%lx, want 0x5 HIT) data0=0x%08x\n",
-		 mac, ldpid,
-		 readl(ni_base(ni) + CA_NI_L2FE_FDB_CMD_RETURN),
-		 FIELD_GET(GENMASK(3, 0),
-			   readl(ni_base(ni) + CA_NI_L2FE_FDB_CMD_RETURN)),
-		 readl(ni_base(ni) + CA_NI_L2FE_FDB_DATA0));
+	       base + CA_NI_L2FE_FDB_ACCESS);
+	if (readl_poll_timeout(base + CA_NI_L2FE_FDB_ACCESS, acc,
+			       !(acc & CA_NI_L2FE_FDB_GO), CA_NI_TX_POLL_US,
+			       CA_NI_TX_POLL_TIMEOUT_US))
+		return -1;
+	cr = readl(base + CA_NI_L2FE_FDB_CMD_RETURN);
+	if ((cr & 0xf) != 0x5)
+		return -1;			/* not HIT (append failed) */
+	return (int)((cr >> 4) & 0x1fff);	/* ext_status[16:4] = entry index */
+}
+
+static void cortina_ni_rx_fdb_append(struct cortina_ni *ni, const u8 *mac,
+				     u32 ldpid)
+{
+	int idx = cortina_ni_l2fe_fdb_add_idx(ni_base(ni), mac, ldpid);
+
+	dev_info(ni->dev, "fdb-add: %pM -> ldpid 0x%02x : entry_idx=%d %s\n",
+		 mac, ldpid, idx, idx < 0 ? "(FAILED)" : "(HIT)");
 }
 
 static void cortina_ni_rx_fdb_add_cpu(struct cortina_ni *ni)
@@ -1199,8 +1589,13 @@ static void cortina_ni_rx_fdb_add_cpu(struct cortina_ni *ni)
  * A (NI-global 0xa024/a028/a5c0) is the ACTIVE my-MAC; comparator B (0x3294/98) is
  * unused; chk_mymac_for_lan (0x3400 b21) = 0.  The rtl8277c STG0-SPB (0x3440) is
  * an UNMAPPED HOLE on Elnath and writing it async-SErrors (that was the panic) -
- * so we DROP it.  We program comparator A + my_mac_enable; the my-MAC-hit route
- * lives in the STG0 LPB profile vector, dumped here to decode/match stock.
+ * so we DROP it.  Gate-off (no HW L3-forwarding) programs comparator A +
+ * my_mac_enable = today's own-MAC CPU trap; under hw_l3_fwd the comparator A
+ * MAC is actively CLEARED (vendor Venus MYMAC=0 design - see the block comment
+ * below) so a my-MAC frame rides the static FDB into the L3FE instead, while
+ * my_mac_enable (0x3218 bit2) stays SET like stock - clearing it broke
+ * GPON/OMCI (OLT Deactivate churn).  The my-MAC-hit
+ * route lives in the STG0 LPB profile vector, dumped here to decode/match stock.
  * dev_emerg bisect markers bracket each write group so any residual fault pins
  * the exact register.
  */
@@ -1209,19 +1604,61 @@ static void cortina_ni_rx_mymac_trap(struct cortina_ni *ni)
 	static const u8 def_mac[ETH_ALEN] = { 0x02, 0x96, 0x07, 0xf0, 0x00, 0x01 };
 	const u8 *mac = (ni->tx && ni->tx->netdev) ?
 			ni->tx->netdev->dev_addr : def_mac;
+	bool l2_trap = !cortina_ni_hw_l3_fwd_active();
 	u32 det, ctrl, hi_p0;
 
-	/* (A) NI-global my-MAC: CFG0=bytes0-3, CFG1[7:0]=byte4, PT[31:24]=byte5 */
+	/* (A) NI-global my-MAC: CFG0=bytes0-3, CFG1[7:0]=byte4, PT[31:24]=byte5.
+	 *
+	 * ★ Under HW L3-forwarding (hw_l3_fwd) this own-MAC comparator must stay
+	 * UNARMED: a LAN->WAN transit frame's DST-MAC IS the gateway MAC, and the
+	 * armed comparator resolved it to the CPU BEFORE the DA-FDB, so it never
+	 * rode the static FDB {gwMAC -> L3_LAN 0x19} route into the L3FE and the
+	 * T2 main-hash never executed - no installed flow could ever HIT
+	 * (board-proven 2026-07-23: 47kpps matching transit flow, L3FE DBG
+	 * pkt-count flat at idle rate, 5-tuple absent from every L3FE stage
+	 * monitor, installed entry age never re-armed).  This is the Venus-family
+	 * design (vendor cortina-api special_packet.c: "we do NOT use L2 MY-MAC
+	 * but use STATIC FDB to forward MyMAC packets to L3FE" - MYMAC is set to
+	 * 00:00:00:00:00:00 to disable L2 my-MAC detection).  Comparator A = 0
+	 * IS that MYMAC=0 disable; terminating/mgmt frames then reach the CPU
+	 * via the L3FE T2-miss -> HS_DEF entry-0 CPU_0 punt.
+	 * ★ ONLY the comparator MAC is cleared - SPCL_PKT_DET.my_mac_enable
+	 * (0x3218 bit2) MUST STAY SET like stock (0x0739DC24): a first fix also
+	 * cleared bit2 and BROKE GPON (board 2026-07-23: O5 reached, then OLT
+	 * Deactivate_ONU-ID ~27s later, endless re-range churn, no WAN - bit2
+	 * gates the special-packet delivery of the GPON/OMCI control frames to
+	 * the CPU, exactly the vendor detect pipeline stock leaves enabled while
+	 * zeroing only the MYMAC compare value).
+	 * The clear is ACTIVE (not skipped) so a link-up/MAC re-arm undoes the
+	 * probe-time armed state (the first RX-init run precedes the l3fe engine
+	 * arm, so its gate reads inactive and still arms the comparator).
+	 * Gate-off keeps today's trap writes byte-identical. */
 	dev_emerg(ni->dev, "MYMAC 1: comparator A (0xa024/a028/a5c0)\n");
-	writel(((u32)mac[0] << 24) | ((u32)mac[1] << 16) | ((u32)mac[2] << 8) |
-	       mac[3], ni_base(ni) + CA_NI_L3FE_NI_MAC_CFG0);
-	ni_rmw(ni, CA_NI_L3FE_NI_MAC_CFG1, CA_NI_L3FE_NI_MAC_BYTE4, mac[4]);
-	ni_rmw(ni, CA_NI_L3FE_PT_PORT_STATIC_CFG, CA_NI_L3FE_PT_MAC_BYTE5,
-	       FIELD_PREP(CA_NI_L3FE_PT_MAC_BYTE5, mac[5]));
+	if (l2_trap) {
+		writel(((u32)mac[0] << 24) | ((u32)mac[1] << 16) |
+		       ((u32)mac[2] << 8) | mac[3],
+		       ni_base(ni) + CA_NI_L3FE_NI_MAC_CFG0);
+		ni_rmw(ni, CA_NI_L3FE_NI_MAC_CFG1, CA_NI_L3FE_NI_MAC_BYTE4,
+		       mac[4]);
+		ni_rmw(ni, CA_NI_L3FE_PT_PORT_STATIC_CFG,
+		       CA_NI_L3FE_PT_MAC_BYTE5,
+		       FIELD_PREP(CA_NI_L3FE_PT_MAC_BYTE5, mac[5]));
+	} else {
+		writel(0, ni_base(ni) + CA_NI_L3FE_NI_MAC_CFG0);
+		ni_rmw(ni, CA_NI_L3FE_NI_MAC_CFG1, CA_NI_L3FE_NI_MAC_BYTE4, 0);
+		ni_rmw(ni, CA_NI_L3FE_PT_PORT_STATIC_CFG,
+		       CA_NI_L3FE_PT_MAC_BYTE5, 0);
+	}
 
-	/* enable my-MAC detection (0x3400 b21 chk_mymac_for_lan left 0 = stock) */
+	/* enable my-MAC detection (0x3400 b21 chk_mymac_for_lan left 0 = stock).
+	 * Unconditional - kept SET under hw_l3_fwd too (stock keeps it set;
+	 * clearing it broke GPON/OMCI - see the block comment above). */
 	dev_emerg(ni->dev, "MYMAC 2: my_mac_enable (0x3218 bit2)\n");
 	ni_rmw(ni, CA_NI_L3FE_SPCL_PKT_DET_CFG, 0, CA_NI_L3FE_MY_MAC_EN);
+
+	if (!l2_trap)
+		dev_info(ni->dev,
+			 "mymac-trap: comparator A cleared under hw_l3_fwd (0x3218 my_mac_enable kept stock/set) -> transit rides FDB into L3FE\n");
 
 	/* ★ match stock STG0 LPB profiles + ldpid_map (tier-1; ours had spcl_pkt_en=0,
 	 * MID=0, prof2/3 empty, wrong ldpid_map).  bisect-from-working: stock with
@@ -1296,6 +1733,44 @@ static void cortina_ni_rx_mymac_trap(struct cortina_ni *ni)
 		 readl(ni_base(ni) + CA_NI_L3FE_STG0_LPB_LOW0),
 		 readl(ni_base(ni) + CA_NI_L3FE_STG0_LPB_MID0),
 		 readl(ni_base(ni) + CA_NI_L3FE_STG0_LDPID_MAP));
+}
+
+/*
+ * ★ Re-key every MAC-keyed admission/offload table from the CURRENT netdev
+ * MAC (called from .ndo_set_mac_address after eth_mac_addr commits dev_addr).
+ * The boot RX init and the link-up re-arms latch dev_addr into the tables,
+ * but netifd applies the per-board factory MAC (05_factory_mac) AFTER the
+ * LAST re-arm - on this rig the tracked port-0 PHY is uncabled, so once
+ * intf_done no further link-up fires - leaving everything keyed on the probe
+ * fallback 02:96:07:f0:00:01 (BOARD-MEASURED 2026-07-23: fdb-add/mymac-trap
+ * logged the fallback at t=4.9s AND t=17.5s while br-lan answered LAN ARP
+ * with the factory MAC).  A LAN transit frame to the factory gateway MAC then
+ * misses the FDB -> DLF flood -> CPU software forward, and never resolves to
+ * L3_LAN, so it cannot enter the L3FE flow engine; an offloaded US flow would
+ * also egress the stale fallback+1 SMAC (PP FIELD-CAM idx 1 via
+ * L3-IF[2].mac_sa_an_sel).  Four latches, re-armed in order:
+ *   1. offload backend router-MAC shadow (cortina-ni-flowoffload.c);
+ *   2. L2FE static FDB - fdb_add_cpu's OP_INIT wipes the stale fallback
+ *      entries, then re-appends LAN -> L3_LAN + (gated) WAN -> L3_WAN;
+ *   3. my-MAC comparator A + L3FE STG0 my-MAC (mymac_trap, idempotent);
+ *   4. PP FIELD-CAM router-MAC entries (intf_add: LAN idx 0, WAN idx 1) -
+ *      the ingress mac_da_an_sel stamp AND the IPoE egress SMAC source.
+ * hw_l3_fwd-gated: gate-off is byte-identical to today (own-MAC frames are
+ * then delivered by the DLF flood-to-CPU path regardless of the FDB key).
+ */
+void cortina_ni_rx_mac_rearm(struct cortina_ni *ni)
+{
+	if (!ni->rx || !ni->tx || !ni->tx->netdev ||
+	    !cortina_ni_hw_l3_fwd_active())
+		return;
+
+	cortina_ni_flowoffload_router_mac_set(ni->tx->netdev->dev_addr);
+	cortina_ni_rx_fdb_add_cpu(ni);
+	cortina_ni_rx_mymac_trap(ni);
+	cortina_l3fe_intf_add(ni_base(ni), ni->tx->netdev->dev_addr);
+	dev_info(ni->dev,
+		 "MAC-keyed admission re-armed for %pM (FDB + my-MAC + router-CAM)\n",
+		 ni->tx->netdev->dev_addr);
 }
 
 /* Program one REDIR_LDPID_CONFIG entry: idx (a redir-LDPID) -> real dest LDPID.
@@ -1951,67 +2426,24 @@ static void cortina_ni_rx_cls_init(struct cortina_ni *ni)
 	}
 
 	/*
-	 * ★ P3 T2 ADMISSION re-apply (gated hw_l3_fwd): the router-MAC CAM +
-	 * STG0 LPB mac_da_an_mask + the dedicated pri-6 routed CLS rules
-	 * (cortina_l3fe_intf_add - stock's ca_l3_intf_add scheme).  Must
-	 * re-run on every link-up because cortina_ni_rx_mymac_trap (above)
-	 * rewrites the LPB HIGH words with the stock constants, wiping the
-	 * an-mask bits.  The trap/golden rows stay byte-identical to stock:
-	 * an EARLIER build instead stamped t2_ctrl onto the catch-all FIBs
-	 * (256/257/260/264 + default 1028) - PROVEN INERT on-board
-	 * (HS_CACHE_CNT flat): a row carrying a full forwarding disposition
-	 * suppresses the T2 lookup; the admission needs the dedicated
-	 * clean-action pri-6 rule keyed on mac_da_an_sel != 0.
+	 * ★ Tier-1 stock-diff (2026-07-23, live devmem on stock NAND): under
+	 * hw_l3_fwd, re-provision ONLY the PP FIELD-CAM router-MAC entries
+	 * (intf_add).  The golden CLS rows written above (0/1/2 + 64/65/66)
+	 * already carry stock's t2_ctrl + CPU_0 miss disposition byte-for-byte
+	 * (cls_fib_golden == stock FIB 0/4/8/256/260/264), so they need NO
+	 * per-link-up rewrite.  The earlier build stamped t2_ctrl=3 onto the LAN
+	 * golden FIBs and added an STG0 an-mask + pri-6 routed rows - NONE of
+	 * which stock does (stock LPB an-mask=0, CLS rows 3/67 empty); that
+	 * corrupted the routed path on enable and is removed.  A routed frame
+	 * hits its golden CLS row -> runs T2 (t2_ctrl) -> HIT forwards, MISS
+	 * punts to CPU_0 (the row's own dpid) - exactly stock.
 	 */
 	if (cortina_ni_hw_l3_fwd_active() && ni->tx && ni->tx->netdev) {
 		int ret = cortina_l3fe_intf_add(ni_base(ni),
 						ni->tx->netdev->dev_addr);
 
-		dev_info(ni->dev,
-			 "cls: T2 admission re-applied (CAM+LPB+pri-6 routed rules) %s; lpb hi0/1/2=0x%08x/0x%08x/0x%08x\n",
-			 ret ? "FAILED" : "ok",
-			 readl(ni_base(ni) + CA_NI_L3FE_STG0_LPB_HIGH0),
-			 readl(ni_base(ni) + CA_NI_L3FE_STG0_LPB_HIGH1),
-			 readl(ni_base(ni) + CA_NI_L3FE_STG0_LPB_HIGH2));
-
-		/*
-		 * ★ P4 T2-RUN stamp on the rows a transit LAN unicast ACTUALLY
-		 * matches - the LAN cls-trap catch-alls (FIB 256/257/260/264;
-		 * the pri-6 mac_da_an_sel rules above do not key it yet).  Two
-		 * silicon facts (both proven the hard way last cycle) shape
-		 * this: (1) dpid_vld=0 DROPS at T1 on this die (it does NOT
-		 * defer to HS_DEF - clearing it black-holed SSH), so the FULL
-		 * CPU disposition is KEPT: words 0-5 stay golden {dpid_vld,
-		 * permit, mcgid=CPU_0}; a T2 HIT overrides the disposition and
-		 * forwards, a MISS leaves the CPU punt standing (stock's own
-		 * scheme - its WAN default row carries a disposition AND
-		 * t2_ctrl_vld).  (2) word6 bits [11]=t2_ctrl_vld, [15:12]=
-		 * t2_ctrl (RMW-anchor-verified on-board); profile 3 = the hash
-		 * profile the catch-all class feeds on stock (its live routed
-		 * rows carry t2_ctrl=3), and our gated enable re-points
-		 * profile 3's tuple at the 5-tuple mask 8 + traps its miss to
-		 * CPU_0.  Runs on every link-up cls re-init, so the stamp
-		 * survives the 17/21/26 s classify re-runs that reverted the
-		 * earlier probe-only pokes.
-		 */
-		for (e = 0; e < ARRAY_SIZE(cls_fib_golden); e++) {
-			u32 w6;
-
-			if (cls_fib_golden[e].idx < 256)
-				continue;	/* LAN partition rows only (US leg) */
-			w6 = (cls_fib_golden[e].w[6] & ~GENMASK(15, 11)) |
-			     BIT(11) | (3u << 12);
-			for (i = 0; i < CA_NI_L3FE_CLS_FIB_WORDS - 1; i++)
-				writel(cls_fib_golden[e].w[i],
-				       ni_base(ni) + CA_NI_L3FE_CLS_FIB_ACCESS +
-				       (CA_NI_L3FE_CLS_FIB_WORDS - i) * 4);
-			writel(w6, ni_base(ni) + CA_NI_L3FE_CLS_FIB_ACCESS + 1 * 4);
-			cortina_ni_rx_ind_store(ni, CA_NI_L3FE_CLS_FIB_ACCESS,
-						cls_fib_golden[e].idx);
-			dev_info(ni->dev,
-				 "cls: t2-run stamp FIB %u w6 0x%04x -> 0x%04x (CPU disposition kept)\n",
-				 cls_fib_golden[e].idx, cls_fib_golden[e].w[6], w6);
-		}
+		dev_info(ni->dev, "cls: PP MAC-DA router-CAM re-applied %s\n",
+			 ret ? "FAILED" : "ok");
 	}
 
 	/* read back the broadcast row (KEY[2]) for the boot log */
@@ -2128,11 +2560,18 @@ static int cortina_ni_rx_steer_init(struct cortina_ni *ni)
 	 * broadcast->L3_LAN(0x19) resolution. */
 	cortina_ni_rx_cls_init(ni);
 
-	/* full FE path: byp OFF, pass OAM, drop unknown opcodes (stock policy) */
-	ni_rmw(ni, CA_NI_PORT_RX_CNTRL_CFG(CA_NI_RX_PORT),
-	       CA_NI_RX_CNTRL_BYP_EN | CA_NI_RX_CNTRL_BYP_DPID |
-	       CA_NI_RX_CNTRL_BYP_COS | CA_NI_RX_CNTRL_UKOP_DROP_DIS,
-	       CA_NI_RX_CNTRL_OAM_DROP_DIS);
+	/* full FE path: byp OFF, pass OAM, drop unknown opcodes (stock policy).
+	 * ★ Apply to EVERY GPHY LAN port, not just CA_NI_RX_PORT, so whichever port
+	 * has the host cable runs the FE lookup (and hits the DLF trap below). */
+	{
+		unsigned int p;
+
+		for (p = 0; p < CA_NI_GPHY_COUNT; p++)
+			ni_rmw(ni, CA_NI_PORT_RX_CNTRL_CFG(p),
+			       CA_NI_RX_CNTRL_BYP_EN | CA_NI_RX_CNTRL_BYP_DPID |
+			       CA_NI_RX_CNTRL_BYP_COS | CA_NI_RX_CNTRL_UKOP_DROP_DIS,
+			       CA_NI_RX_CNTRL_OAM_DROP_DIS);
+	}
 
 	/* L3FE demux golden routing map (FE output -> L3QM CPU-EPP) */
 	writel(CA_NI_NIRX_L3FE_DEMUX0_VAL, ni_base(ni) + CA_NI_NIRX_L3FE_DEMUX0);
@@ -2193,16 +2632,24 @@ static int cortina_ni_rx_steer_init(struct cortina_ni *ni)
 	writel(CA_NI_QM_L3TM_NI_PORT_ENA_ALL,
 	       ni_base(ni) + CA_NI_QM_L3TM_NI_PORT_ENA);
 
-	/* DLF trap: every port-0 FE lookup miss (BC/UUC/UL2MC/UL3MC) -> CPU0.
-	 * This is how an ingress frame reaches the CPU WITHOUT the bypass. */
-	for (type = 0; type < CA_NI_PLE_TYPE_COUNT; type++) {
-		ret = cortina_ni_rx_ple_dft_fwd(ni, CA_NI_RX_PORT, type);
-		if (ret) {
-			dev_err(ni->dev,
-				"PLE dft-fwd (lspid %u type %d) timed out\n",
-				CA_NI_RX_PORT, type);
-			return ret;
-		}
+	/* DLF trap: every FE lookup miss (BC/UUC/UL2MC/UL3MC) -> CPU0.  This is how
+	 * an ingress frame reaches the CPU WITHOUT the bypass.  ★ Set it for EVERY
+	 * GPHY LAN port (lspid 0..3), not just CA_NI_RX_PORT: the host cable can be
+	 * on any port (this rig: port 3), and a port whose lspid has no DLF trap
+	 * drops its lookup-miss frames instead of trapping them to the CPU. */
+	{
+		unsigned int p;
+
+		for (p = 0; p < CA_NI_GPHY_COUNT; p++)
+			for (type = 0; type < CA_NI_PLE_TYPE_COUNT; type++) {
+				ret = cortina_ni_rx_ple_dft_fwd(ni, p, type);
+				if (ret) {
+					dev_err(ni->dev,
+						"PLE dft-fwd (lspid %u type %d) timed out\n",
+						p, type);
+					return ret;
+				}
+			}
 	}
 
 	/* ★ build99 ORDER TEST: re-arm the L2TE->L3FE ready handshake (NIRX_MISC rdy-bits
@@ -2705,6 +3152,15 @@ static int cortina_ni_rx_eq_init(struct cortina_ni *ni)
 	for (i = CA_NI_RX_DEEPQ_DEST_PORT_LO; i <= CA_NI_RX_DEEPQ_DEST_PORT_HI; i++)
 		writel(CA_NI_RX_CPU_PROFILE_VAL,
 		       ni_base(ni) + CA_NI_QM_DEST_PORT_EQ_CFG(i));
+	/* ★ 2026-07-23 (Fable RE): stock configures DEST_PORT_EQ_CFG for the whole
+	 * CPU/PON dest-port range up to 0x2f; ours left 16..0x2f at profile 0 -> EQ0
+	 * (empty).  A DS-into-L3FE frame (hw_l3_fwd + cg_hw_l3_ds) that resolves to a
+	 * CPU_0 dest port >= 16 then hit NO_BUFFER and head-of-line-blocked the shared
+	 * RMU -> the LAN CPU-delivery went 100% loss the instant the DS route installed.
+	 * Point the whole range at our configured CPU pool (EQ13/14) so nothing wedges. */
+	for (i = CA_NI_RX_DEEPQ_DEST_PORT_HI + 1; i <= CA_NI_QM_DEST_PORT_MAX; i++)
+		writel(CA_NI_RX_CPU_PROFILE_VAL,
+		       ni_base(ni) + CA_NI_QM_DEST_PORT_EQ_CFG(i));
 
 	/* 0x6ab0 = 0x300 (stock-matching; this is NOT the real ES_CTRL2 - kept as a
 	 * harmless match). */
@@ -3141,17 +3597,22 @@ static const u32 cortina_ni_rx_gphy_cal_off[CA_NI_RX_GPHY_CAL_REGS] = {
 
 static void cortina_ni_rx_gphy_cal_save(struct cortina_ni *ni)
 {
-	void __iomem *gphy = cortina_ni_rx_gphy(ni);
+	void __iomem *gphy = ni->win[CA_NI_WIN_GPHY];
+	unsigned int b;
 	int i;
 
 	if (!gphy)
 		return;
 
 	/* taken at probe: the U-Boot-initialized state that just TFTP'd the
-	 * kernel over this very port, i.e. a proven-working calibration */
-	for (i = 0; i < CA_NI_RX_GPHY_CAL_REGS; i++)
-		ni->rx->gphy_cal[i] = readl(gphy +
-					    cortina_ni_rx_gphy_cal_off[i]);
+	 * kernel over the cabled port, i.e. a proven-working calibration.
+	 * Snapshot EVERY bank so the per-port interface reinit can restore the
+	 * cabled port's cal (any of 0..3), not just port 0's. */
+	for (b = 0; b < CA_NI_GPHY_COUNT; b++)
+		for (i = 0; i < CA_NI_RX_GPHY_CAL_REGS; i++)
+			ni->rx->gphy_cal[b][i] =
+				readl(gphy + CA_NI_GPHY_BANK(b) +
+				      cortina_ni_rx_gphy_cal_off[i]);
 }
 
 static void cortina_ni_rx_gphy_intf_rst_pulse(struct cortina_ni *ni)
@@ -3215,7 +3676,7 @@ static void cortina_ni_rx_gphy_reinit(struct cortina_ni *ni)
 	/* restore the probe-time calibration snapshot (register file only;
 	 * the DSP-SRAM mirror is uC-patch-specific, see cortina-ni-regs.h) */
 	for (i = 0; i < CA_NI_RX_GPHY_CAL_REGS; i++)
-		writel(ni->rx->gphy_cal[i],
+		writel(ni->rx->gphy_cal[CA_NI_RX_PORT][i],
 		       gphy + cortina_ni_rx_gphy_cal_off[i]);
 
 	/* power the PHY back up + release the page-0xa46 hold bit */
@@ -3229,6 +3690,71 @@ static void cortina_ni_rx_gphy_reinit(struct cortina_ni *ni)
 	cortina_ni_rx_wrap_establish(ni);
 
 	mutex_unlock(&ni->mii->mdio_lock);
+}
+
+/* ★ Per-port GPHY<->MAC interface establishment (Fable RE 2026-07-22): the
+ * vendor per-port INTF_RST + EN1_IF-edge + 200ms-settle sequence that connects
+ * GPHY <port> to its MAC AFTER the port's SRAM bank is patched.  gphy_reinit
+ * above does this for CA_NI_RX_PORT=0 ONLY - so a cabled port other than 0 (this
+ * rig: port 3) LINKS but never delivers a frame into the L2FE, because its
+ * MAC-side GMII sync is left at the pre-patch state.  EN1_IF(port) is an
+ * edge/strobe (not a resting level), pulsed here between the two INTF_RSTs. */
+static void cortina_ni_rx_gphy_intf_establish(struct cortina_ni *ni,
+					      unsigned int port)
+{
+	void __iomem *gphy = ni->win[CA_NI_WIN_GPHY];
+	void __iomem *wrap = ni->win[CA_NI_WIN_GPHY_WRAP];
+	void __iomem *bank;
+	u32 val;
+	int i;
+
+	if (!gphy || !ni->mii || port >= CA_NI_GPHY_COUNT)
+		return;
+	bank = gphy + CA_NI_GPHY_BANK(port);
+
+	mutex_lock(&ni->mii->mdio_lock);
+
+	/* 1st INTF_RST pulse for THIS port */
+	writel(CA_NI_HV_INTF_RST_GPHY(port), ni_base(ni) + CA_NI_HV_INTF_RST);
+	usleep_range(1000, 1500);
+	writel(0, ni_base(ni) + CA_NI_HV_INTF_RST);
+
+	/* re-enable the uC patch/self-check on THIS bank */
+	val = readl(bank + CA_NI_GPHY_PATCH_EN);
+	writel(val | CA_NI_GPHY_PATCH_EN_BIT, bank + CA_NI_GPHY_PATCH_EN);
+
+	/* wrapper EN1_IF(port) 0->1 EDGE (connect THIS GPHY to its MAC) */
+	if (wrap) {
+		val = readl(wrap + CA_NI_GPHY_WRAP_EN1);
+		writel(val & ~CA_NI_GPHY_WRAP_EN1_IF(port),
+		       wrap + CA_NI_GPHY_WRAP_EN1);
+		writel(val | CA_NI_GPHY_WRAP_EN1_IF(port),
+		       wrap + CA_NI_GPHY_WRAP_EN1);
+	}
+
+	/* 2nd INTF_RST pulse + 200 ms settle (stock) */
+	writel(CA_NI_HV_INTF_RST_GPHY(port), ni_base(ni) + CA_NI_HV_INTF_RST);
+	usleep_range(1000, 1500);
+	writel(0, ni_base(ni) + CA_NI_HV_INTF_RST);
+	msleep(200);
+
+	/* restore THIS bank's probe-time analog cal */
+	for (i = 0; i < CA_NI_RX_GPHY_CAL_REGS; i++)
+		writel(ni->rx->gphy_cal[port][i],
+		       bank + cortina_ni_rx_gphy_cal_off[i]);
+
+	/* power up + release hold on THIS bank */
+	val = readl(bank + CA_NI_GPHY_BMCR);
+	writel(val & ~CA_NI_GPHY_BMCR_PDOWN, bank + CA_NI_GPHY_BMCR);
+	val = readl(bank + CA_NI_GPHY_HOLD);
+	writel(val & ~CA_NI_GPHY_HOLD_BIT, bank + CA_NI_GPHY_HOLD);
+
+	/* land the wrapper on stock steady EN1=0x1001 */
+	cortina_ni_rx_wrap_establish(ni);
+
+	mutex_unlock(&ni->mii->mdio_lock);
+	dev_info(ni->dev, "gphy port %u: MAC<->GPHY interface established\n",
+		 port);
 }
 
 /* 1 Hz self-rearming poll, stock cadence ("recover check first").  Runs
@@ -3251,6 +3777,57 @@ static void cortina_ni_rx_recovery_work(struct work_struct *work)
 		dev_info(ni->dev, "GPHY port %d reinit done (latch now 0x%04x)\n",
 			 CA_NI_RX_PORT, cortina_ni_rx_gphy_fault(ni));
 	}
+
+	/* ★ Decoupled datapath bring-up: until every GPHY bank is patched, run the
+	 * full link-up bring-up here (1 Hz) so the LAN ports ingress even when
+	 * eth0's connected PHY has no cable and never fires link-up.  Idempotent;
+	 * the GPHY SRAM patch is one-shot per bank (ni->gphy_patched[]); capped via
+	 * rearms so a never-lockable bank cannot spin the full reconfig forever. */
+	if (rx_decoupled_bringup && !rx->intf_done) {
+		unsigned int b;
+		bool all_patched;
+
+		/* keep driving the bring-up (patches the GPHY banks) until done */
+		if (rx->rearms < 30)
+			cortina_ni_rx_link_up(ni);
+
+		all_patched = true;
+		for (b = 0; b < CA_NI_GPHY_COUNT; b++)
+			if (!ni->gphy_patched[b]) {
+				all_patched = false;
+				break;
+			}
+
+		/* ★ once EVERY bank is patched, establish the MAC<->GPHY interface
+		 * for every port IN THIS SAME TICK (Fable RE #1) - do NOT defer to
+		 * a later recovery tick, which may never come if the netdev/poll
+		 * stops after port-0's PHY stays link-down.  The cabled port (any
+		 * of 0..3, this rig port 3) needs the per-port INTF_RST+EN1_IF edge
+		 * after its bank patch or it links but delivers no frame into the
+		 * L2FE.  Once. */
+		if (all_patched) {
+			unsigned int p;
+
+			rx->intf_done = true;
+			dev_info(ni->dev,
+				 "all GPHY banks patched -> establishing MAC<->GPHY interface on all ports\n");
+			for (p = 0; p < CA_NI_GPHY_COUNT; p++)
+				cortina_ni_rx_gphy_intf_establish(ni, p);
+		}
+	}
+
+	/* ★ Hold the CPU-port (eth0) carrier UP every tick once the datapath has been
+	 * armed (rx->rearms>0).  eth0 is the CPU<->switch port; a carrier-off bridge
+	 * member is disabled and br-lan drops all LAN frames the switch delivered.  Do
+	 * it here, not only in link_up (which stops once intf_done), so any later
+	 * netif_carrier_off (netifd re-ifup, phy_stop, a port-0 bounce) is undone
+	 * within 1 s.  The phy_link_change override stops phylib's own carrier-off. */
+	if (rx->rearms && rx->netdev && !netif_carrier_ok(rx->netdev)) {
+		netif_carrier_on(rx->netdev);
+		netdev_info(rx->netdev,
+			    "CPU-port carrier re-asserted (switch datapath up)\n");
+	}
+
 	schedule_delayed_work(&rx->recovery_work, HZ);
 }
 
@@ -3287,18 +3864,50 @@ void cortina_ni_rx_link_up(struct cortina_ni *ni)
 	 * but its ROM firmware does NOT forward).  Idempotent/one-shot. */
 	cortina_ni_gphy_patch_and_resume(ni);
 
+	/* ★ Once every GPHY bank is patched, establish the per-port MAC<->GPHY
+	 * interface (Fable RE #1) HERE - link_up is fired by adjust_link and DOES
+	 * run; recovery_work (the other candidate) is canceled when eth0/port-0 goes
+	 * carrier-down, so it never gets a tick.  The cabled port (any of 0..3, this
+	 * rig port 3) needs the per-port INTF_RST+EN1_IF edge after its bank patch or
+	 * it links but delivers no frame into the L2FE.  Once (ni->rx->intf_done). */
+	if (ni->rx && !ni->rx->intf_done) {
+		unsigned int b, p;
+		bool all_patched = true;
+
+		for (b = 0; b < CA_NI_GPHY_COUNT; b++)
+			if (!ni->gphy_patched[b]) {
+				all_patched = false;
+				break;
+			}
+		if (all_patched) {
+			ni->rx->intf_done = true;
+			dev_info(ni->dev,
+				 "all GPHY banks patched -> establishing MAC<->GPHY interface on all ports (in link_up)\n");
+			for (p = 0; p < CA_NI_GPHY_COUNT; p++)
+				cortina_ni_rx_gphy_intf_establish(ni, p);
+		}
+	}
+
 	if (!rx_skip_portcfg) {
+		unsigned int p;
+
 		/* ★ re-establish the GPHY->port-MAC datapath (wrapper EN1 bit12) FIRST:
 		 * this is the ingress determinism gate - without it the PHY links but no
 		 * frame reaches the MAC.  Idempotent; also heals any phylib disturbance. */
 		cortina_ni_rx_wrap_establish(ni);
 
-		/* re-assert the MAC<->GPHY internal GMII interface (0xa5c0): int_cfg=
-		 * GE_GMII, phy_mode=MAC, MAC-loopback OFF (writable fields only; upper byte
-		 * 0xCB is RO datapath-active status), idempotent */
-		ni_rmw(ni, CA_NI_PORT_STATIC_CFG(CA_NI_RX_PORT),
-		       CA_NI_PORT_STATIC_INT_CFG | CA_NI_PORT_STATIC_PHY_MODE |
-		       CA_NI_PORT_STATIC_LPBK_MODE, 0);
+		/* ★ re-assert the MAC<->GPHY internal GMII interface (int_cfg=GE_GMII,
+		 * phy_mode=MAC, MAC-loopback OFF) for EVERY GPHY LAN port, not just
+		 * CA_NI_RX_PORT.  The host cable can be on ANY physical port (this rig
+		 * links on port 3, phy4), and a port forwards line->MAC only once its
+		 * GMII interface is established - configuring only port 0 leaves the
+		 * cabled port dark (stock sets STATIC=0xcb000200 on all ports).  Upper
+		 * byte 0xCB is RO datapath-active status; writable fields only,
+		 * idempotent. */
+		for (p = 0; p < CA_NI_GPHY_COUNT; p++)
+			ni_rmw(ni, CA_NI_PORT_STATIC_CFG(p),
+			       CA_NI_PORT_STATIC_INT_CFG | CA_NI_PORT_STATIC_PHY_MODE |
+			       CA_NI_PORT_STATIC_LPBK_MODE, 0);
 
 		/* autosync = 0xF (match STOCK live-Linux; U-Boot's 0 was the
 		 * wrong reference for the CPU-EPP RX path) */
@@ -3312,15 +3921,25 @@ void cortina_ni_rx_link_up(struct cortina_ni *ni)
 	cortina_ni_rx_es_enable(ni);
 	cortina_ni_rx_es_cpu(ni, true);
 	ni_rmw(ni, CA_NI_QM_RMU0_CTRL, 0, CA_NI_QM_RMU0_RX_EN);
-	ni_rmw(ni, CA_NI_PORT_GLB_CFG(CA_NI_RX_PORT),
-	       CA_NI_PORT_GLB_PWR_DWN_RX, 0);
-	if (!rx_skip_portcfg)
-		ni_rmw(ni, CA_NI_PORT_RXMAC_CFG(CA_NI_RX_PORT),
-		       CA_NI_PORT_RXMAC_STOCK_CLR,
-		       CA_NI_PORT_RXMAC_RX_EN | CA_NI_PORT_RXMAC_STOCK_SET);
-	else	/* leave U-Boot's rxmac bits, just ensure RX_EN on */
-		ni_rmw(ni, CA_NI_PORT_RXMAC_CFG(CA_NI_RX_PORT), 0,
-		       CA_NI_PORT_RXMAC_RX_EN);
+	/* ★ power-up RX + enable RXMAC on EVERY GPHY LAN port (not just
+	 * CA_NI_RX_PORT) - same reason as the GMII loop above, so the cabled port
+	 * (any of 0..3) ingresses to the CPU. */
+	{
+		unsigned int p;
+
+		for (p = 0; p < CA_NI_GPHY_COUNT; p++) {
+			ni_rmw(ni, CA_NI_PORT_GLB_CFG(p),
+			       CA_NI_PORT_GLB_PWR_DWN_RX, 0);
+			if (!rx_skip_portcfg)
+				ni_rmw(ni, CA_NI_PORT_RXMAC_CFG(p),
+				       CA_NI_PORT_RXMAC_STOCK_CLR,
+				       CA_NI_PORT_RXMAC_RX_EN |
+				       CA_NI_PORT_RXMAC_STOCK_SET);
+			else	/* leave U-Boot's rxmac bits, just ensure RX_EN on */
+				ni_rmw(ni, CA_NI_PORT_RXMAC_CFG(p), 0,
+				       CA_NI_PORT_RXMAC_RX_EN);
+		}
+	}
 
 	rx->rearms++;
 	dev_info(ni->dev,
@@ -3331,6 +3950,18 @@ void cortina_ni_rx_link_up(struct cortina_ni *ni)
 		 readl(ni_base(ni) + CA_NI_PORT_RXMAC_CFG(CA_NI_RX_PORT)),
 		 readl(ni_base(ni) + CA_NI_QM_ES_CTRL),
 		 cortina_ni_rx_gphy_fault(ni));
+
+	/* ★ eth0 is the CPU<->switch port, NOT a single physical link.  Once the
+	 * switch datapath is armed here - via adjust_link on a real link-up AND via
+	 * the 1 Hz decoupled bring-up when the phylib-tracked PHY (port 0) is uncabled
+	 * and never fires link-up - force eth0's carrier UP.  The Linux bridge disables
+	 * (stops forwarding) a member port whose carrier is off, so leaving eth0's
+	 * carrier tied to port 0's link makes br-lan drop every LAN frame the switch
+	 * delivered (eth0 rx climbs, br-lan rx stays 0, host cannot reach the ONU).
+	 * The phy_link_change override keeps phylib from re-clearing it; per-physical-
+	 * port link/forwarding is handled by the switch HW itself. */
+	if (rx->netdev && !netif_carrier_ok(rx->netdev))
+		netif_carrier_on(rx->netdev);
 
 	/* fault check now instead of waiting for the next 1 Hz tick */
 	if (cortina_ni_rx_gphy(ni))
@@ -4436,6 +5067,12 @@ static int cortina_ni_rx_proc_show(struct seq_file *m, void *v)
 		   rx->drop_nobuf, rx->slot_dead);
 	seq_printf(m, "last_desc=%016llx last_hdra=%016llx\n",
 		   rx->last_desc, rx->last_hdra);
+	/* ★ TEMP DIAG (rx_crc_tap): machine-readable HW lookup-CRC witness */
+	if (rx_crc_tap)
+		seq_printf(m,
+			   "crc_tap: hits=%llu hw_crc32=%08x hw_crc16=%04x cpu_flg=%u (TEMP DIAG - diff vs install crc)\n",
+			   rx->tap_hits, rx->tap_crc32, rx->tap_crc16,
+			   rx->tap_cpuflg);
 	seq_puts(m, "irq_hits:");
 	for (i = 0; i < CA_NI_RX_NUM_IRQS; i++)
 		seq_printf(m, " %d:%llu", rx->irq[i], rx->irq_hits[i]);

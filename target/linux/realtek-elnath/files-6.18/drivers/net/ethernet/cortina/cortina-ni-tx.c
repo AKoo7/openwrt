@@ -44,8 +44,15 @@
 
 #include "cortina-ni.h"
 
-/* destination physical port for M2b: port 0 = LAN1, the U-Boot TFTP port */
-#define CA_NI_TX_PORT		0
+/* Destination for the eth0 LAN TX path.  eth0 TX is FE-bypass direct-TX: the
+ * descriptor's DEST field is an LDPID that the L2FE ARB resolves to a physical
+ * egress port via the PDPID map (see cortina_ni_arb_lan_map_init).  On this rig
+ * only port 3 (phy4) links; ports 0-2 are uncabled.  For LAN NI ports ldpid ==
+ * physical port (identity), so DEST=3 -> physical port 3.
+ * TODO(multi-port): to serve several LAN ports at once, FE-FORWARD eth0 TX
+ * through the L2FE (drop MODE_DIRECT + FEBYPASS) so it forwards by DA and floods
+ * broadcast, instead of this single fixed destination. */
+#define CA_NI_TX_PORT		3
 #define CA_NI_TX_COS		0
 #define CA_NI_TX_TXQ		0
 
@@ -54,6 +61,17 @@
 static bool tx_debug;
 module_param(tx_debug, bool, 0644);
 MODULE_PARM_DESC(tx_debug, "dump the first transmitted frames/descriptors");
+
+/* ★ 2026-07-23 host-free HW-forward test knob: when >= 0, stamp EVERY direct-TX
+ * descriptor's DEST = this ldpid instead of CA_NI_TX_PORT.  Set =0 briefly to
+ * egress an AF_PACKET-injected forged frame out (uncabled) port 0, which - with
+ * that port's MAC in internal loopback (PORT_STATIC_CFG bit12|15) - loops back
+ * and physically ingresses the L3FE as a real LAN client frame.  Default -1 =
+ * normal (DEST=port 3).  Global, so keep the window short + revert (it also
+ * mis-routes the held ssh session's TX while set). */
+static int force_dest_ldpid = -1;
+module_param(force_dest_ldpid, int, 0644);
+MODULE_PARM_DESC(force_dest_ldpid, "override direct-TX DEST ldpid for the HW-forward loopback test (-1=off)");
 
 /* fallback MAC when the DT carries none (locally administered) */
 static const u8 cortina_ni_default_mac[ETH_ALEN] = {
@@ -401,6 +419,39 @@ static int cortina_ni_arb_map_one(struct cortina_ni *ni, u32 idx, u32 pdpid)
 	return ret;
 }
 
+/* ★ Physical LAN NI ports 0-6: identity ldpid->pdpid so an eth0 direct-TX frame
+ * (whose descriptor DEST field is the ldpid) egresses physical port N (vendor
+ * aal_port.c global port init).  Left unmapped, the ARB PDPID map reads its reset
+ * value 0, so EVERY eth0 CPU-TX frame resolved to physical port 0 (uncabled/dead)
+ * regardless of the descriptor DEST - which is why LAN INGRESS worked but the
+ * router's ARP/ping/DHCP replies never reached the wired host, and why setting
+ * the descriptor DEST or the VP HDRA LDPID alone changed nothing.  dbuf=1 rows ->
+ * QM (US-PON data path); ldpid 7 (PON) -> blackhole, per the vendor map. */
+static void cortina_ni_arb_lan_map_init(struct cortina_ni *ni)
+{
+	u32 my_mac, ldpid;
+
+	for (my_mac = 0; my_mac <= 1; my_mac++) {
+		for (ldpid = 0; ldpid <= 6; ldpid++) {
+			if (cortina_ni_arb_map_one(ni, (my_mac << 7) | ldpid,
+						   ldpid))
+				return;
+			if (cortina_ni_arb_map_one(ni,
+						   (my_mac << 7) | BIT(6) | ldpid,
+						   CA_NI_PPORT_QM))
+				return;
+		}
+		if (cortina_ni_arb_map_one(ni, (my_mac << 7) | 7,
+					   CA_NI_PPORT_BLACKHOLE))
+			return;
+		if (cortina_ni_arb_map_one(ni, (my_mac << 7) | BIT(6) | 7,
+					   CA_NI_PPORT_BLACKHOLE))
+			return;
+	}
+	dev_info(ni->dev,
+		 "L2FE ARB: LAN ldpids 0x00-0x06 -> identity pdpid (eth0 egress)\n");
+}
+
 static void cortina_ni_arb_oam_map_init(struct cortina_ni *ni)
 {
 	u32 my_mac, dbuf, ldpid, idx;
@@ -491,6 +542,7 @@ static int cortina_ni_tx_hw_init(struct cortina_ni *ni)
 	cortina_ni_tx_tm_init(ni);
 	cortina_ni_tx_port_mac_init(ni);
 	cortina_ni_arb_oam_map_init(ni);	/* US PON control-frame egress route */
+	cortina_ni_arb_lan_map_init(ni);	/* LAN NI ldpid->pport egress route */
 	return 0;
 }
 
@@ -677,7 +729,8 @@ static netdev_tx_t cortina_ni_start_xmit(struct sk_buff *skb,
 		FIELD_PREP(CA_NI_TX_DESC1_CHK_SEL, CA_NI_TX_CHK_AUTO) |
 		FIELD_PREP(CA_NI_TX_DESC1_LEN, len) |
 		FIELD_PREP(CA_NI_TX_DESC1_COS, CA_NI_TX_COS) |
-		FIELD_PREP(CA_NI_TX_DESC1_DEST, CA_NI_TX_PORT);
+		FIELD_PREP(CA_NI_TX_DESC1_DEST,
+			   force_dest_ldpid >= 0 ? force_dest_ldpid : CA_NI_TX_PORT);
 
 	desc = q->desc + q->wptr * CA_NI_TX_DESC_WORDS;
 	desc[0] = cpu_to_le32(lower_32_bits(daddr));
@@ -1025,6 +1078,23 @@ static void cortina_ni_tx_adjust_link(struct net_device *ndev)
 		}
 	}
 	phy_print_status(phydev);
+	/* eth0 CPU-port carrier is forced up in cortina_ni_rx_link_up (reached via
+	 * this path on a real link-up AND via the decoupled bring-up), so nothing to
+	 * do here for the carrier - the phy_link_change override just prevents phylib
+	 * from clearing it on the tracked PHY's link-down. */
+}
+
+/* eth0 is the CPU<->switch port, NOT a single physical link.  phylib's default
+ * phy_link_change() netif_carrier_off()s eth0 whenever the one tracked PHY
+ * (phy_find_first = port 0, uncabled on this rig) reports link-down, and does
+ * NOT re-run adjust_link while the link stays down -- so eth0's carrier is stuck
+ * off, the Linux bridge disables the eth0 port, and br-lan drops every LAN frame
+ * the switch already delivered.  Override phy_link_change to run adjust_link but
+ * never carrier-off the CPU port: adjust_link forces the carrier back up once the
+ * datapath is armed, and per-physical-port link/forwarding is the switch's job. */
+static void cortina_ni_cpu_link_change(struct phy_device *phydev, bool up)
+{
+	phydev->adjust_link(phydev->attached_dev);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1051,6 +1121,9 @@ static int cortina_ni_open(struct net_device *ndev)
 		return ret;
 	}
 	phy_set_max_speed(phydev, SPEED_1000);
+	/* keep the CPU-port carrier from following the tracked PHY's link-down */
+	phydev->phy_link_change = cortina_ni_cpu_link_change;
+	netdev_info(ndev, "CPU-port carrier override installed (eth0 stays up once datapath armed)\n");
 	ni->tx->phydev = phydev;
 	ni->tx->announced = false;
 
@@ -1098,11 +1171,31 @@ static int cortina_ni_stop(struct net_device *ndev)
 	return 0;
 }
 
+/* ★ Commit a new MAC, then re-key the MAC-keyed HW tables (L2FE FDB, my-MAC
+ * comparator, PP FIELD-CAM, offload router-MAC shadow) from it.  netifd
+ * applies the per-board factory MAC (05_factory_mac) AFTER the boot RX init
+ * and the last link-up re-arm latched dev_addr into those tables, and no
+ * further link-up fires on this rig (tracked port-0 PHY uncabled) - so with
+ * plain eth_mac_addr the tables stayed keyed on the boot fallback and a LAN
+ * transit frame to the factory gateway MAC could never resolve to L3_LAN /
+ * enter the L3FE flow engine.  The re-arm is hw_l3_fwd-gated inside
+ * cortina_ni_rx_mac_rearm; gate-off = eth_mac_addr behaviour exactly. */
+static int cortina_ni_set_mac_address(struct net_device *ndev, void *addr)
+{
+	struct cortina_ni *ni = *(struct cortina_ni **)netdev_priv(ndev);
+	int ret = eth_mac_addr(ndev, addr);
+
+	if (ret)
+		return ret;
+	cortina_ni_rx_mac_rearm(ni);
+	return 0;
+}
+
 static const struct net_device_ops cortina_ni_netdev_ops = {
 	.ndo_open		= cortina_ni_open,
 	.ndo_stop		= cortina_ni_stop,
 	.ndo_start_xmit		= cortina_ni_start_xmit,
-	.ndo_set_mac_address	= eth_mac_addr,
+	.ndo_set_mac_address	= cortina_ni_set_mac_address,
 	.ndo_validate_addr	= eth_validate_addr,
 #if IS_ENABLED(CONFIG_CORTINA_NI_FLOWOFFLOAD)
 	/* L3FE flow-engine nf_flow_table offload (cortina-ni-flowoffload.c) */
@@ -1174,8 +1267,10 @@ static void cortina_ni_tx_set_mac(struct cortina_ni *ni,
 		 * ELAN_MAC_ADDR from the stock ubi_Config/config_hs.xml on
 		 * read-only NAND) is applied by the 05_factory_mac
 		 * uci-defaults script through netifd before the interface
-		 * comes up; the my-MAC comparator + FDB CPU entry re-program
-		 * from dev_addr on every link-up, so they follow. */
+		 * comes up; .ndo_set_mac_address then re-keys the MAC-keyed
+		 * HW tables (cortina_ni_rx_mac_rearm) - the link-up re-arms
+		 * alone do NOT follow it, they all fire before netifd (the
+		 * tracked port-0 PHY is uncabled on this rig). */
 		eth_hw_addr_set(ndev, cortina_ni_default_mac);
 		dev_warn(ni->dev, "no MAC in DT, using default %pM\n",
 			 ndev->dev_addr);
