@@ -4,7 +4,9 @@
  * (RTL9607F "Elnath", Stage C).  See omci_responder.h for the wire-format
  * provenance: the layout + ME attribute content mirror the responder proven
  * end-to-end (Online/normal + WAN) against the same HSGQ-G008 OLT on the
- * RTL9602C, with this board's identity (SN "XPON"+5C6CAFCB, X411AXF).
+ * RTL9602C.  The ONU identity is NOT part of this file: the 8-byte serial
+ * number is handed to omci_onu_init() by the caller, which reads it from the
+ * board (cortina-gpon.c, the cg_sn_* provisioning path).
  *
  * Pure functional core: no HW I/O, no locking (the caller serializes), no
  * allocation — everything lives in the caller-provided struct omci_onu.

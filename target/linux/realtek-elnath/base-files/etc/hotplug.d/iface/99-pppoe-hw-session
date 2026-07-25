@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Keep the L3FE's armed PPPoE session id in step with the WAN interface.
+#
+# The HW PPPoE encapsulation (cortina_ni.hw_pppoe) puts the negotiated session id
+# in one egress L3-IF table entry, and the driver learns the LIVE id from each
+# offloaded flow's rule.  Two things the driver cannot see, though, are "pppd
+# hung up" and "the WAN was reconfigured back to DHCP": both leave the last id
+# armed.  A stale id costs the IPoE path its HW offload (a flow whose rule
+# carries no PPPoE push is refused while a session is armed, because the frame
+# would leave un-encapsulated), so clear it on the exact events that mean the
+# session is gone.
+#
+# ifdown of the WAN, or an ifup that is NOT pppoe, both mean "no session".  An
+# ifup of a pppoe WAN needs nothing here: the driver picks the new id up from the
+# first offloaded flow, and reprogramming on a real change flushes the old flows
+# by itself.
+#
+# Harmless when the driver is absent or the mode was never used.
+
+[ -w /proc/cortina_l3fe ] || exit 0
+[ "$INTERFACE" = "wan" ] || exit 0
+
+case "$ACTION" in
+ifdown)
+	echo 'pppoe 0' > /proc/cortina_l3fe
+	;;
+ifup)
+	[ "$(uci -q get network.wan.proto)" = "pppoe" ] ||
+		echo 'pppoe 0' > /proc/cortina_l3fe
+	;;
+esac
+
+exit 0

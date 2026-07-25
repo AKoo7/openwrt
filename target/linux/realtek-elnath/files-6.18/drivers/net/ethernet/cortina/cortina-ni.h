@@ -230,6 +230,16 @@ int cortina_ni_rx_probe(struct cortina_ni *ni);
 int cortina_ni_l2fe_fdb_add_idx(void __iomem *base, const u8 *mac, u32 ldpid);
 
 /*
+ * LOOK UP {mac} in the L2FE FDB - no table write - and report its 13-bit entry
+ * index (= mac_da_idx / egr_lutidx) plus the entry's forward-to LDPID (for a
+ * LAN NI port: the physical port number).  Used by the DS (WAN->LAN) flow
+ * offload leg to resolve the LAN client's next-hop DMAC and egress port from
+ * the entry the switch already learned.  Returns -1 when absent.
+ */
+int cortina_ni_l2fe_fdb_lookup_idx(void __iomem *base, const u8 *mac,
+				   u32 *ldpid_out);
+
+/*
  * L3FE main-hash flow engine (nf_flow_table HW offload backend,
  * cortina-ni-flowoffload.c + cortina-l3fe.c).  The probe arms + verifies
  * the engine; any failure is non-fatal - the offload stays disabled and
@@ -257,6 +267,20 @@ int cortina_l3fe_intf_add(void __iomem *ne, const u8 *lan_mac);
  */
 void cortina_ni_gpon_data_path_set(u16 gem_id, u8 tcont_idx);
 /*
+ * ★ LIVE DS (PON->host) PDC ROUTE push (GPON -> offload backend).  The DS data
+ * GEM's PDC entry is written either as {LDPID L3_WAN, LSPID PON} - into the
+ * L3FE, so a DS hash entry can be reached - or as {LDPID CPU_0, FE_BYPASS,
+ * NO_DROP}, which delivers straight to the CPU and BYPASSES BOTH forwarding
+ * engines.  In the bypass case no DS main-hash entry can ever be hit, no
+ * matter how correct it is.  That is a precondition the offload backend cannot
+ * observe (the PDC lives in the GPON register window, another module), and
+ * without it /proc's DS stage verdict would blame the hash for a route that was
+ * switched off - the exact misdetection this project keeps paying for.  So the
+ * GPON driver reports it whenever it (re)writes the data-GEM PDC entry:
+ * into_l3fe = true for the L3_WAN route, false for CPU_0 + FE-bypass.
+ */
+void cortina_ni_gpon_ds_route_set(bool into_l3fe);
+/*
  * LIVE PPPoE WAN session push (offload backend): report the negotiated PPPoE
  * session id when the WAN runs PPPoE (0 = torn down / IPoE WAN).  US
  * hit-actions then HW-insert the 8-byte PPPoE header via the dedicated egress
@@ -264,6 +288,19 @@ void cortina_ni_gpon_data_path_set(u16 gem_id, u8 tcont_idx);
  * First bring-up feeds it via /proc/cortina_l3fe ("pppoe <sess>").
  */
 int cortina_ni_wan_pppoe_session_set(u16 session);
+/*
+ * ★ GAP-2 instrument: inspect a CPU-punted PPPoE session frame (@f = the start
+ * of the received Ethernet frame, @len its length) for SELF-CONSISTENCY - PPPoE
+ * length vs inner IPv4 total length, inner TCP data-offset plausibility, session
+ * id.  Answers "does the DS mangling regression still reproduce" from the frame
+ * the CPU actually got, which no register or hit counter can see.  Results in
+ * /proc/cortina_l3fe (`pppoe_punt:`).  Off unless
+ * cortina_ni.pppoe_punt_check=1, so the RX path pays one predicted branch:
+ * ALWAYS test cortina_ni_pppoe_punt_armed() at the call site.
+ */
+extern bool cortina_ni_pppoe_punt_check;
+#define cortina_ni_pppoe_punt_armed()	READ_ONCE(cortina_ni_pppoe_punt_check)
+void cortina_ni_pppoe_punt_inspect(const u8 *f, unsigned int len);
 /* refresh the backend's probe-time router-MAC shadow when the netdev MAC
  * changes (the HW consumers - FDB/comparator/FIELD-CAM - are re-programmed
  * by cortina_ni_rx_mac_rearm, which is the only caller) */
@@ -289,9 +326,16 @@ static inline int cortina_l3fe_intf_add(void __iomem *ne, const u8 *lan_mac)
 static inline void cortina_ni_gpon_data_path_set(u16 gem_id, u8 tcont_idx)
 {
 }
+static inline void cortina_ni_gpon_ds_route_set(bool into_l3fe)
+{
+}
 static inline int cortina_ni_wan_pppoe_session_set(u16 session)
 {
 	return -EOPNOTSUPP;
+}
+#define cortina_ni_pppoe_punt_armed()	false
+static inline void cortina_ni_pppoe_punt_inspect(const u8 *f, unsigned int len)
+{
 }
 static inline void cortina_ni_flowoffload_router_mac_set(const u8 *mac)
 {

@@ -198,8 +198,10 @@
 	 * NEVER write the NAND (stock firmware + per-board factory data live
 	 * there).  The read-only flags also force the UBI attach (bootargs
 	 * ubi.mtd=ubi_device) into ro mode.  ubi_Config/config_hs.xml is the
-	 * per-board provisioning source (ELAN_MAC_ADDR base MAC, GPON_SN),
-	 * read at boot by the factory-mac uci-defaults script.
+	 * per-board provisioning source, read at boot from userspace: the base
+	 * MAC (ELAN_MAC_ADDR) by the 05_factory_mac uci-defaults script, and the
+	 * GPON serial number (GPON_SN) by /etc/init.d/gpon-identity, which pushes
+	 * it into the GPON driver (cortina-gpon holds ranging off until it has it).
 	 */
 	spi@f4324000 {
 		compatible = "cortina,ca-qspi";

@@ -2153,9 +2153,46 @@ enum cortina_ni_win {
  * _monitor_get: for i, write CTRL={enable bit0=1, bus_sel=(MONITOR_CLS_RESULT=3)<<5 | i},
  * read RETURN.  cls_hit[i]==0 across all while frames flow = the CLS lookup is NOT
  * invoked for our ingress (an L3-ingress/enable gap, not a key-match issue). */
+/*
+ * ★★ L3FE GLOBAL DEBUG / MONITOR block - RESOLVED 2026-07-25, tier-2 (stock
+ * ca-ne.ko aal_l3fe_glb_cls_stg_monitor_get / _dbg_get / _dbg_latch_*)
+ * corroborated field-for-field by the vendor sibling header.  Two indirect
+ * READ ports {index, data} plus a one-shot descriptor latch:
+ *   0x30b0 CLS-monitor index: BIT(8) ENABLE | (vector << 5) | word   ★ the
+ *          enable is BIT(8) - an earlier probe used bit0, so the monitor was
+ *          never enabled and its "cls_hit[0..3]" output was meaningless; every
+ *          conclusion drawn from "cls_hit all 0" is VOID.  Up to 32 words, not 4.
+ *   0x30b4 CLS-monitor DATA (read-only)
+ *   0x30b8 DBG index: (vector << 5) | word, vector 0..31; no enable bit
+ *   0x30bc DBG DATA (read-only).  Vector 15 = four 10-bit per-stage packet
+ *          counters {L3FE_IN, L3FE_OUT, T1_T2, STG3_PE} = the real
+ *          "frame entered the engine" witness, unlike the NI_HV gauges.
+ *   0x30c0 latch trigger: BIT(1) mode, BIT(0) = an ARM TOGGLE (one capture per
+ *          flip).  0x30c4 latch index (vector << 5 | word), 0x30c8 latch DATA.
+ *          Vector 2 = HDR_I before the packet editor (all lookups resolved:
+ *          carries the engine's own key CRC32/CRC16, hash_idx, hash_profile,
+ *          the CLS hit class and hash_dbl_chk_fail).
+ * ★ The UNLATCHED taps are a read-mux over live pipeline shadow registers, so
+ * words of one dump can come from DIFFERENT packets (the vendor says so
+ * explicitly) - gauges, never coherent snapshots.  Use the latch for anything
+ * that compares fields of one frame.
+ *
+ * ★★ CONFLICT TO RESOLVE, recorded not silently "fixed": CA_NI_L3FE_GLB_LF_CFG
+ * (0x30b4) and CA_NI_L3FE_GLB_ILPB_00 (0x30bc) above name these same two
+ * addresses as the L3FE ingress-FIFO thresholds and the ingress-loopback VLAN
+ * config, and cortina_ni_rx_l3fe_glb_init() WRITES both.  Per the tier-2
+ * accessors they are read-data ports, so those writes are INERT and the claim
+ * that the "LF_CFG thresholds" unblocked the L3FE ingress FIFO is a false
+ * attribution.  The writes are left in place (shipping-proven boot path, not
+ * this change's business) but must not be trusted as the reason anything works.
+ * The offload backend's own copies of these offsets (cortina-ni-flowoffload.c
+ * CN_L3E_GLB_DBG_IDX/DAT and CN_L3E_GLB_LATCH_*) only ever READ them.
+ */
 #define CA_NI_L3FE_CLS_MON_CTRL		0x30b0
-#define CA_NI_L3FE_CLS_MON_RETURN	0x30b4
-#define CA_NI_L3FE_MON_CLS_RESULT	3	/* l3fe_glb_monitor_vector_e MONITOR_CLS_RESULT */
+#define  CA_NI_L3FE_CLS_MON_ENABLE	BIT(8)	/* ★ NOT bit0 */
+#define CA_NI_L3FE_MON_CLS_RESULT	3	/* l3fe_glb_monitor_vector_e: the
+						 * CLS result, split across
+						 * vectors 3 (123 B) + 4 (8 B) */
 #define CA_NI_L3FE_CLS_KEY_ACCESS	0x3380	/* GO|WR|idx; poll GO clear (CA_NI_IND_ACCESS_GO/WR) */
 #define CA_NI_L3FE_CLS_KEY_DATA_BASE	0x3384	/* 11 words 0x3384..0x33ac */
 #define CA_NI_L3FE_CLS_KEY_WORDS	11

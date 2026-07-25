@@ -2603,10 +2603,10 @@ config BUSYBOX_DEFAULT_FEATURE_TELNET_WIDTH
 	default n
 config BUSYBOX_DEFAULT_TELNETD
 	bool
-	default n
+	default y
 config BUSYBOX_DEFAULT_FEATURE_TELNETD_STANDALONE
 	bool
-	default n
+	default y
 config BUSYBOX_DEFAULT_FEATURE_TELNETD_PORT_DEFAULT
 	int
 	default 23

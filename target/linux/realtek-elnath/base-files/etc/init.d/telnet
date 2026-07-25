@@ -1,0 +1,47 @@
+#!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# LAN-only telnet management service for the Elnath (RTL9607F) ONU.
+#
+# Runs busybox telnetd bound to the LAN address only, so the login shell is
+# reachable from br-lan (192.168.1.1) but never from the GPON WAN side. This is
+# defense-in-depth on top of the firewall4 wan-zone input REJECT that already
+# refuses :23 from WAN: binding telnetd to the LAN address means it does not
+# even open a listening socket on the WAN interface, independent of firewall
+# state. Mirrors the LAN-only stance of 90-dropbear-lan-only for SSH.
+#
+# Auto-enabled at image build (rootfs.mk enables every /etc/init.d script with
+# the rc.common shebang), so no separate uci-defaults enable step is needed.
+
+START=50
+STOP=10
+
+USE_PROCD=1
+
+PROG=/usr/sbin/telnetd
+
+start_service() {
+	local lan_ip
+
+	# Bind to the current LAN address; fall back to the static default. On a
+	# static LAN the fallback already equals the real address, so telnetd
+	# never listens WAN-side even if netifd has not settled yet at boot.
+	. /lib/functions/network.sh
+	network_get_ipaddr lan_ip lan
+	[ -n "$lan_ip" ] || lan_ip="192.168.1.1"
+
+	procd_open_instance
+	# -F: run in foreground so procd supervises it (needs STANDALONE).
+	# -b ADDR:PORT: listen on the LAN address only (LAN-only, not WAN).
+	# -l /bin/login: authenticate every session through login(1).
+	procd_set_param command "$PROG" -F -b "${lan_ip}:23" -l /bin/login
+	procd_set_param respawn
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}
+
+service_triggers() {
+	# Rebind if the LAN address is reconfigured.
+	procd_add_reload_interface_trigger lan
+}

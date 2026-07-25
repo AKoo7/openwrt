@@ -26,10 +26,12 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/crc32.h>
+#include <linux/ctype.h>
 #include <linux/delay.h>
 #include <linux/etherdevice.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/platform_device.h>
@@ -455,6 +457,24 @@ struct cg_evt {
 
 #define CG_EVT_RING_SZ		16	/* power of 2 */
 
+/*
+ * Where the ONU's G.984.3 serial number came from, strongest first.  The serial
+ * number is the ONU's PON IDENTITY: the OLT keys ranging, authentication and the
+ * whole service profile on it, so two units announcing the same serial number
+ * collide on one PON.  It must therefore be read FROM THE BOARD and never be a
+ * compiled-in literal -- see the cg_sn_* block below for the provisioning path.
+ */
+enum cg_sn_src {
+	CG_SN_NONE = 0,		/* not provisioned yet: ranging is held off */
+	CG_SN_PARAM,		/* cortina_gpon.sn= (bring-up / A-B override) */
+	CG_SN_BOARD,		/* the board's own factory data, via /proc/gpon */
+	CG_SN_FALLBACK,		/* nothing readable: a placeholder, NOT an identity */
+};
+
+static const char *const cg_sn_src_name[] = {
+	"NONE", "module-param", "board", "FALLBACK",
+};
+
 struct cortina_gpon {
 	struct device *dev;
 	void __iomem *pon;		/* ioremap of the whole PON window */
@@ -520,6 +540,17 @@ struct cortina_gpon {
 	u16 hw_data_gem;		/* GEM port-id armed in DS-GEM CAM + US_PORT (0 = none) */
 	u32 omci_cfg_log;		/* config-ME body log budget used */
 	struct net_device *wan_ndev;	/* gpon0 */
+
+	/*
+	 * The per-board PON identity, single source of truth for BOTH the MAC's
+	 * vendor-id/vendor-specific registers and the OMCI responder's ME-256
+	 * serial number: they can no longer disagree by construction.
+	 */
+	struct mutex sn_lock;		/* serializes sn/sn_src/activated + activation */
+	u8 sn[8];			/* wire order: 4 ASCII vendor-id + 4 VSSN bytes */
+	enum cg_sn_src sn_src;
+	bool activated;			/* cg_mac_activate() has run at least once */
+	struct delayed_work sn_wait_work;	/* bounded wait for the board's serial */
 };
 
 static struct cortina_gpon *cg_singleton;
@@ -707,7 +738,109 @@ static void cg_psds_init(struct cortina_gpon *cg)
 
 static bool cg_activate = true;
 module_param_named(activate, cg_activate, bool, 0444);
-MODULE_PARM_DESC(activate, "program the SN + start GPON ranging at probe (default on)");
+MODULE_PARM_DESC(activate, "program the SN + start GPON ranging once the serial number is known (default on)");
+
+/*
+ * ===========================================================================
+ * The per-board GPON serial number (G.984.3 ONU-ID / "VSSN")
+ * ===========================================================================
+ *
+ * The serial number is 8 bytes on the wire: 4 ASCII vendor-id characters
+ * followed by 4 binary vendor-specific bytes ("XPON" + 5C 6C AF CB reads as
+ * XPON5C6CAFCB).  It is the ONU's identity on the PON, so it MUST come from the
+ * board, exactly like the factory MAC -- a compiled-in serial number makes every
+ * unit flashed with the same image announce one identity, which collides on a
+ * shared PON and breaks OLT provisioning/authentication.
+ *
+ * Where it lives on this board (tier-1 live read 2026-07-16, corroborated tier-2
+ * by the stock userspace):
+ *   NAND "ubi_device" -> UBI volume "ubi_Config" -> config_hs.xml:
+ *       <Value Name="GPON_SN" Value="XPON5C6CAFCB"/>
+ *   the same file and volume that carries ELAN_MAC_ADDR (the factory base MAC).
+ * Stock reads it from there in USERSPACE and hands it to its PON stack: rc2
+ * mounts ubi0:ubi_Config on /var/config, and runomci.sh does `mib get GPON_SN`
+ * (the MIB store is that XML) and passes it as `omci_app -s <SN>`; a second
+ * consumer splits the same string into vendor-id (chars 1-4) and VSSN (chars
+ * 5-12).  Nothing derives it from the MAC -- the vendor's built-in default is a
+ * generic "RTKG11111111" -- so the fact that this unit's VSSN happens to share
+ * three bytes with its MAC is factory numbering, not a rule, and is NOT used.
+ * Not a source either: the U-Boot env (generic placeholder), the runtime DTB (no
+ * bootloader fixup), the OTP (PCIe calibration only) or static_conf (blank).
+ *
+ * So the kernel cannot read it at probe (the volume is UBIFS, mountable only
+ * once userspace runs), and this mirrors the MAC path (05_factory_mac) and stock
+ * itself: userspace reads the board and pushes the value in.
+ *   /etc/init.d/gpon-identity  ->  echo "sn XPON5C6CAFCB" > /proc/gpon
+ * The driver holds ranging off until it has a serial number, then programs it and
+ * starts the FSM.  If nothing arrives within CG_SN_WAIT_SECS it shouts and ranges
+ * with a deliberately non-identity placeholder so the box never silently sits
+ * dark; a real serial number arriving later re-activates with it.
+ */
+#define CG_SN_WAIT_SECS		60
+
+/*
+ * The placeholder used when the board's serial number cannot be read at all.
+ * Vendor-id "XPON" is the fleet-wide vendor code (not per-unit) so the OLT still
+ * logs a parseable unknown ONU; the all-ones VSSN is the blank-flash value and
+ * can never be a factory-programmed unit, so this can never be mistaken for -- or
+ * collide with -- a provisioned board.  It is always accompanied by a dev_err and
+ * by "sn-source = FALLBACK" in /proc/gpon.
+ */
+static const u8 cg_sn_unprovisioned[8] = { 'X', 'P', 'O', 'N', 0xff, 0xff, 0xff, 0xff };
+
+static char *cg_sn_param;
+module_param_named(sn, cg_sn_param, charp, 0444);
+MODULE_PARM_DESC(sn, "GPON serial number override, \"VVVVHHHHHHHH\" (4 ASCII vendor-id chars + 8 hex VSSN digits). Bring-up/A-B use ONLY: the shipping path is the board's own config volume pushed in by /etc/init.d/gpon-identity, so never bake a serial number into an image's bootargs");
+
+/* One 32-bit register value from 4 wire-order bytes (endianness-agnostic). */
+static u32 cg_sn_word(const u8 *p)
+{
+	return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3];
+}
+
+static int cg_hex_nibble(char c)
+{
+	if (c >= '0' && c <= '9')
+		return c - '0';
+	if (c >= 'a' && c <= 'f')
+		return c - 'a' + 10;
+	if (c >= 'A' && c <= 'F')
+		return c - 'A' + 10;
+	return -1;
+}
+
+/*
+ * "VVVVHHHHHHHH" -> the 8 wire bytes.  Rejects anything that is not exactly 4
+ * printable non-space vendor-id characters followed by 8 hex digits, so a
+ * truncated/garbled provisioning read can never be programmed as an identity.
+ */
+static int cg_sn_parse(const char *s, u8 out[8])
+{
+	int i, hi, lo;
+
+	if (!s || strlen(s) != 12)
+		return -EINVAL;
+	for (i = 0; i < 4; i++) {
+		if (!isprint(s[i]) || isspace(s[i]))
+			return -EINVAL;
+		out[i] = s[i];
+	}
+	for (i = 0; i < 4; i++) {
+		hi = cg_hex_nibble(s[4 + 2 * i]);
+		lo = cg_hex_nibble(s[5 + 2 * i]);
+		if (hi < 0 || lo < 0)
+			return -EINVAL;
+		out[4 + i] = (hi << 4) | lo;
+	}
+	return 0;
+}
+
+/* The 8 wire bytes -> the printable "VVVVHHHHHHHH" form. */
+static void cg_sn_format(const u8 sn[8], char out[13])
+{
+	snprintf(out, 13, "%c%c%c%c%02X%02X%02X%02X",
+		 sn[0], sn[1], sn[2], sn[3], sn[4], sn[5], sn[6], sn[7]);
+}
 
 static bool cg_do_bosa_init = true;
 module_param_named(bosa_init, cg_do_bosa_init, bool, 0444);
@@ -724,11 +857,38 @@ MODULE_PARM_DESC(coldstart_wd, "stuck-O1 recovery watchdog: re-roll the SerDes/l
  * a still-open dynamic bug.  With it OFF, DS keeps the proven CPU_0+FE_BYPASS
  * delivery (SW fastpath) while only the US (LAN->WAN) direction attempts HW
  * offload; flip =1 to resume the DS-into-L3FE bring-up. */
-static bool cg_hw_l3_ds;	/* default OFF: DS-into-L3FE is premature - DS CPU-punts (no HW-forward
-				 * until A2) and starves the shared L3QM CPU pool under sustained load,
-				 * killing LAN even with the dest-port fix. Flip =1 only after DS HW-forward. */
+/*
+ * ★★ 2026-07-25 - THIS GATE IS THE DS-OFFLOAD PRECONDITION, and keeping it off
+ * while cortina_ni.hw_ds_offload=1 makes the DS measurement meaningless.
+ * With it OFF the data GEM's PDC entry carries FE_BYPASS, so the DS frame is
+ * handed straight to CPU port 0 and never visits the L2FE or the L3FE: no DS
+ * main-hash entry can be hit, l3fe_rx stays 0, downstream throughput is exactly
+ * the CPU-forward baseline, and none of that says anything about the DS hash
+ * key or the DS egress action.  (That is precisely the boot measured on
+ * 2026-07-24: DS entries installed, ds_flows 2, zero hits.)  The offload
+ * backend now reports the route to /proc/cortina_l3fe (ds_pdc=) and warns at
+ * arm time so the two gates can no longer be armed half-way by accident.
+ *
+ * The original reason for OFF is now partly obsolete: it read "DS-into-L3FE is
+ * premature - DS CPU-punts (no HW-forward until A2) and starves the shared L3QM
+ * CPU pool under sustained load, killing LAN".  A2 has landed (the DS leg
+ * carries a real next-hop rewrite), so once a flow is offloaded its DS packets
+ * never reach the L3QM CPU pool at all - the starvation premise is what the DS
+ * offload removes.  What is NOT yet retested: the PUNT WINDOW (the first
+ * packets of every flow, plus any DS traffic that is not an offloadable
+ * TCP/UDP 5-tuple) still traverses L3FE -> L3QM -> CPU, which is the path that
+ * broke the wired LAN (host->ONU ping 100% loss) when DS could ONLY punt.  So
+ * flipping this on is the right next experiment but must be run WITH a LAN
+ * health check in the same window, not as a shipping default.
+ */
+/* Default ON since 2026-07-25: routing the downstream data GEM into the L3FE
+ * (instead of CPU_0 + FE_BYPASS) is what lets the DS HW-flow leg be hit at all.
+ * Measured with it on: DS 956.2 Mbps at 0.4% ONU CPU (was 642 Mbps with a core
+ * pegged), upstream unchanged at 956.3 Mbps.  Set cortina_gpon.hw_l3_ds=0 to
+ * fall back to the CPU punt path. */
+static bool cg_hw_l3_ds = true;
 module_param_named(hw_l3_ds, cg_hw_l3_ds, bool, 0644);
-MODULE_PARM_DESC(hw_l3_ds, "route DS data GEM into the L3FE under hw_l3_fwd (default OFF: DS stays on the CPU path, only US HW-offloads; =1 breaks LAN, WIP)");
+MODULE_PARM_DESC(hw_l3_ds, "route the DS data GEM into the L3FE under hw_l3_fwd (default OFF = CPU_0 + FE_BYPASS). ★ REQUIRED for cortina_ni.hw_ds_offload to do anything: with it off, DS frames bypass both forwarding engines and no DS hash entry is reachable. Watch the wired LAN when enabling (the DS punt window once broke it)");
 
 /*
  * Enable the upstream laser.
@@ -1091,8 +1251,11 @@ static void cg_mac_activate(struct cortina_gpon *cg)
 
 	/* --- config while en=0 (serial number is range-critical) --- */
 	writel(CG_ONU_CFG_VAL, mac + CG_REG_ONU_CFG_REAL);	/* laser_on_align=0x12, pre_bias=18 */
-	writel(0x58504f4e, mac + CG_REG_VENDOR);	/* vendor-id "XPON" */
-	writel(0x5c6cafcb, mac + CG_REG_VENDOR_SPEC);	/* VSSN 5C6CAFCB */
+	/* The PON identity, from cg->sn (the board's serial number -- see the
+	 * cg_sn_* block).  Both halves come from the SAME 8 bytes the OMCI
+	 * responder is armed with, so the PLOAM and OMCI identities cannot drift. */
+	writel(cg_sn_word(cg->sn), mac + CG_REG_VENDOR);	/* 4 ASCII vendor-id chars */
+	writel(cg_sn_word(cg->sn + 4), mac + CG_REG_VENDOR_SPEC);	/* 4 VSSN bytes */
 	/* datapath: gpon_ds.max_packet_size (bits 29:16) = 0x3FFF */
 	v = readl(mac + CG_REG_GPON_DS);
 	v = (v & ~(0x3fffu << 16)) | (0x3fffu << 16);
@@ -1147,6 +1310,127 @@ static void cg_mac_activate(struct cortina_gpon *cg)
 	writel(v & ~(CG_MAC_CTRL_SW_RANDOM_EN | CG_MAC_CTRL_PTI_OMCI),
 	       mac + CG_REG_GPON_MAC_CTRL);
 	/* (the laser TX-disable net was de-asserted before the BOSA init above) */
+}
+
+/*
+ * Program the identity + start ranging, and verify the identity actually landed.
+ * Caller holds sn_lock and has put a valid serial number in cg->sn.
+ *
+ * The vendor-id readback doubles as the PON-window sanity check the old
+ * compiled-in strcmp(vendor, "XPON") used to provide -- but against what we just
+ * wrote rather than a literal, so it catches a wrong window base OR a write that
+ * did not stick, on any board.
+ */
+static void cg_activate_start(struct cortina_gpon *cg)
+{
+	char sn_str[13];
+	u32 vid;
+
+	cg_sn_format(cg->sn, sn_str);
+	dev_info(cg->dev, "activating with serial number %s (source: %s)\n",
+		 sn_str, cg_sn_src_name[cg->sn_src]);
+
+	cg_mac_activate(cg);
+	cg->activated = true;
+
+	vid = readl(cg->mac + CG_REG_VENDOR);
+	if (vid != cg_sn_word(cg->sn))
+		dev_warn(cg->dev,
+			 "vendor-id readback 0x%08x != programmed 0x%08x - PON window base wrong, or the MAC is still gated\n",
+			 vid, cg_sn_word(cg->sn));
+
+	/* Post-activation snapshot, on EVERY activation path (the probe's 30-line
+	 * ranging poll below only runs when the identity was known at probe).
+	 * /proc/gpon carries the full picture on demand. */
+	dev_info(cg->dev,
+		 "activate: vendor-id=0x%08x vendor-spec=0x%08x onu_cfg=0x%08x onu_ctl=0x%08x gpon_ds=0x%08x onu=0x%08x rgb8=0x%08x\n",
+		 vid, readl(cg->mac + CG_REG_VENDOR_SPEC),
+		 readl(cg->mac + CG_REG_ONU_CFG_REAL),
+		 readl(cg->mac + CG_REG_ONU_CTL),
+		 readl(cg->mac + CG_REG_GPON_DS),
+		 readl(cg->mac + CG_REG_GPON_ONU),
+		 readl(cg->pon + CG_PSDS_RGB8));
+
+	/* Arm the cold-start US-lock recovery watchdog: if the HW ranging FSM is
+	 * still stuck at O1 after a grace period (the cold TX-PLL metastability),
+	 * re-lock the SerDes CMU and re-arm ranging until it advances -- so every
+	 * cold boot reaches O5 (stock does, 100%). */
+	schedule_delayed_work(&cg->coldstart_work, 15 * HZ);
+}
+
+/*
+ * Latch a serial number and (re)start ranging with it.  The only entry point for
+ * a provisioned identity: the /proc write, the module-param path and the
+ * unprovisioned-timeout path all go through here, so the MAC registers and the
+ * OMCI responder are always armed from the same 8 bytes.
+ *
+ * Re-activating an already-ranging MAC is the proven cold-start recovery
+ * sequence (cg_coldstart_work does exactly this), so an identity that arrives
+ * late is applied by re-running it -- but only when it actually DIFFERS, so a
+ * duplicate provisioning write never disturbs a healthy link.
+ */
+static int cg_sn_set(struct cortina_gpon *cg, const char *s, enum cg_sn_src src)
+{
+	u8 sn[8];
+	char sn_str[13];
+	bool changed;
+	int ret;
+
+	ret = cg_sn_parse(s, sn);
+	if (ret) {
+		dev_err(cg->dev, "rejected GPON serial number \"%s\": expected 4 vendor-id characters + 8 hex digits\n",
+			s ? s : "");
+		return ret;
+	}
+
+	mutex_lock(&cg->sn_lock);
+	changed = cg->sn_src == CG_SN_NONE || memcmp(cg->sn, sn, sizeof(sn));
+	memcpy(cg->sn, sn, sizeof(sn));
+	cg->sn_src = src;
+	cg_sn_format(cg->sn, sn_str);
+
+	if (!cg_activate)
+		dev_info(cg->dev, "serial number %s latched (source: %s); activate=0, not ranging\n",
+			 sn_str, cg_sn_src_name[src]);
+	else if (cg->activated && !changed)
+		dev_info(cg->dev, "serial number %s re-confirmed (source: %s) - link untouched\n",
+			 sn_str, cg_sn_src_name[src]);
+	else {
+		if (cg->activated)
+			dev_warn(cg->dev, "serial number CHANGED to %s (source: %s) - re-ranging\n",
+				 sn_str, cg_sn_src_name[src]);
+		cancel_delayed_work(&cg->sn_wait_work);
+		cg_activate_start(cg);
+	}
+	mutex_unlock(&cg->sn_lock);
+	return 0;
+}
+
+/*
+ * Nothing provisioned a serial number in time.  Never leave the PON side dark
+ * and never guess this board's identity: shout, range with the non-identity
+ * placeholder so the failure is visible at the OLT too, and stay ready for the
+ * real serial number (a later /proc write re-ranges with it).
+ */
+static void cg_sn_wait_work(struct work_struct *work)
+{
+	struct cortina_gpon *cg = container_of(to_delayed_work(work),
+					       struct cortina_gpon, sn_wait_work);
+	char sn_str[13];
+
+	mutex_lock(&cg->sn_lock);
+	if (cg->sn_src != CG_SN_NONE) {		/* raced with a provisioning write */
+		mutex_unlock(&cg->sn_lock);
+		return;
+	}
+	memcpy(cg->sn, cg_sn_unprovisioned, sizeof(cg->sn));
+	cg->sn_src = CG_SN_FALLBACK;
+	cg_sn_format(cg->sn, sn_str);
+	dev_err(cg->dev,
+		"NO per-board GPON serial number after %ds: is /etc/init.d/gpon-identity running, and is ubi0:ubi_Config mountable? Ranging with the placeholder %s - this is NOT this board's identity, the OLT will not admit it. Push the real one:  echo \"sn <VVVVHHHHHHHH>\" > /proc/gpon\n",
+		CG_SN_WAIT_SECS, sn_str);
+	cg_activate_start(cg);
+	mutex_unlock(&cg->sn_lock);
 }
 
 /*
@@ -1338,7 +1622,11 @@ static void cg_coldstart_work(struct work_struct *work)
 	cg_glb_reset(cg);
 	cg_psds_init(cg);
 	cg_mac_intr_arm(cg);	/* the GTC reset cleared the MAC int enables */
+	/* sn_lock so a serial number arriving from userspace mid-re-roll cannot be
+	 * half-applied: cg_mac_activate programs the identity out of cg->sn. */
+	mutex_lock(&cg->sn_lock);
 	cg_mac_activate(cg);	/* re-config + re-assert onu_ctl.en (SN/ranging) */
+	mutex_unlock(&cg->sn_lock);
 	schedule_delayed_work(&cg->coldstart_work,
 			      cg->coldstart_tries >= CG_COLD_FAST_TRIES ?
 			      60 * HZ : 16 * HZ);
@@ -1643,7 +1931,21 @@ static void cg_data_try_install(struct cortina_gpon *cg)
 			dev_info(cg->dev,
 				 "PDC: data GEM idx %u -> L3_WAN (HW L3-forward DS armed)\n",
 				 idx);
+		} else if (i == 0) {
+			/* ★ Say it PLAINLY, because this is the DS-offload
+			 * precondition and its absence is invisible from the
+			 * L3FE side: with FE_BYPASS the DS data GEM goes
+			 * straight to CPU port 0 and skips BOTH forwarding
+			 * engines, so a DS main-hash entry can NEVER be hit
+			 * however correct it is.  Arming cortina_ni.hw_ds_offload
+			 * alone is not enough - hw_l3_ds must be on too. */
+			dev_info(cg->dev,
+				 "PDC: data GEM idx %u -> CPU_0 + FE_BYPASS (hw_l3_fwd=%d hw_l3_ds=%d) - DS frames BYPASS the L3FE, so no DS HW-flow entry can be hit; set cortina_gpon.hw_l3_ds=1 to route DS into the L3FE\n",
+				 idx, cortina_ni_hw_l3_fwd_active(),
+				 cg_hw_l3_ds);
 		}
+		if (i == 0)
+			cortina_ni_gpon_ds_route_set(!(d0 & CG_PDC_D0_FE_BYPASS));
 
 		if (cg_pdc_map_write(cg, idx, d0, CG_PDC_D1_POL_ID(idx)))
 			return;
@@ -1735,24 +2037,25 @@ static void cg_omcc_try_up(struct cortina_gpon *cg, u8 state)
 	dev_info(cg->dev, "OMCC link UP (alloc %u, gem %u) - ready for OMCI\n",
 		 cg->omcc_alloc, cg->omcc_gem);
 
-	/* Stage C: arm the G.988 responder on a fresh MIB.  SN = the PLOAM
-	 * identity programmed into the MAC ("XPON" + VSSN 5C6CAFCB).  The
-	 * MIB-Data-Sync seed 200 is a POISON: it must NOT match the OLT's
+	/* Stage C: arm the G.988 responder on a fresh MIB.  The ME-256 serial
+	 * number is cg->sn -- the very bytes cg_mac_activate() programmed into
+	 * the MAC's vendor-id/vendor-specific registers, so the identity the OLT
+	 * ranged cannot differ from the one OMCI reports (one source of truth).
+	 * The MIB-Data-Sync seed 200 is a POISON: it must NOT match the OLT's
 	 * stored lsync, so its ME2 audit mismatches and it re-provisions from
 	 * MIB-Reset (the X111W warm-readmit lesson; the on-wire MIB-Reset
 	 * then zeroes it).  Also start the ~31s VEIP oper-up AVC timer. */
 	if (cg->omci) {
-		static const u8 sn[8] = {
-			'X', 'P', 'O', 'N', 0x5c, 0x6c, 0xaf, 0xcb
-		};
+		char sn_str[13];
 
 		spin_lock_bh(&cg->omci_lock);
-		omci_onu_init(cg->omci, sn, 200);
+		omci_onu_init(cg->omci, cg->sn, 200);
 		cg->omci_active = true;
 		spin_unlock_bh(&cg->omci_lock);
 		schedule_delayed_work(&cg->veip_avc_work, 31 * HZ);
-		dev_info(cg->dev, "OMCI responder armed (%u MIB rows, mds seed 200)\n",
-			 cg->omci->nrows);
+		cg_sn_format(cg->sn, sn_str);
+		dev_info(cg->dev, "OMCI responder armed (%u MIB rows, mds seed 200, sn %s)\n",
+			 cg->omci->nrows, sn_str);
 	}
 }
 
@@ -2283,7 +2586,7 @@ static void cg_read_vendor(struct cortina_gpon *cg, char out[5])
 static int cg_proc_show(struct seq_file *m, void *v)
 {
 	struct cortina_gpon *cg = m->private;
-	char vendor[5];
+	char vendor[5], sn_str[13];
 	u32 onu, alarm;
 
 	cg_read_vendor(cg, vendor);
@@ -2295,6 +2598,14 @@ static int cg_proc_show(struct seq_file *m, void *v)
 	seq_printf(m, "vendor-id      = 0x%08x (\"%s\")\n",
 		   cg_mac_rd(cg, CG_REG_VENDOR), vendor);
 	seq_printf(m, "vendor-spec    = 0x%08x\n", cg_mac_rd(cg, CG_REG_VENDOR_SPEC));
+	/* The identity, and WHERE it came from: "board" is the only value that
+	 * means "read from this unit"; NONE = ranging is still held off waiting
+	 * for it, FALLBACK = a placeholder, not this board's serial number. */
+	cg_sn_format(cg->sn, sn_str);
+	seq_printf(m, "serial-number  = %s\n",
+		   cg->sn_src == CG_SN_NONE ? "(not provisioned)" : sn_str);
+	seq_printf(m, "sn-source      = %s%s\n", cg_sn_src_name[cg->sn_src],
+		   cg->activated ? "" : " (ranging not started)");
 	seq_printf(m, "gpon_ds        = 0x%08x\n", cg_mac_rd(cg, CG_REG_GPON_DS));
 	seq_printf(m, "onu(state+id)  = 0x%08x\n", onu);
 	seq_printf(m, "main(eqd)      = 0x%08x\n", cg_mac_rd(cg, CG_REG_GPON_MAIN));
@@ -2424,6 +2735,19 @@ static ssize_t cg_proc_write(struct file *file, const char __user *ubuf,
 		return -EFAULT;
 	buf[len] = '\0';
 	p = strim(buf);
+	/*
+	 * `echo "sn VVVVHHHHHHHH" > /proc/gpon`: hand the driver this board's GPON
+	 * serial number.  THE shipping provisioning path -- /etc/init.d/gpon-identity
+	 * reads GPON_SN out of the factory config volume and writes it here, the same
+	 * way 05_factory_mac feeds the factory MAC in via uci.  Until it arrives the
+	 * MAC is configured but ranging is held off, so the ONU never announces an
+	 * identity that is not its own.
+	 */
+	if (strncmp(p, "sn ", 3) == 0) {
+		int ret = cg_sn_set(cg, strim(p + 3), CG_SN_BOARD);
+
+		return ret ? ret : len;
+	}
 	/* one-shot full BOSA register dump to dmesg (cold-state diffing) */
 	if (strcmp(p, "bosa dump") == 0) {
 		cg_bosa_dump(cg->dev);
@@ -2478,8 +2802,10 @@ static int cortina_gpon_probe(struct platform_device *pdev)
 	 * OMCC-up path (which can fire during the probe's ranging poll) only
 	 * ever initializes it, never allocates.  ~7 KB. */
 	spin_lock_init(&cg->omci_lock);
+	mutex_init(&cg->sn_lock);
 	INIT_DELAYED_WORK(&cg->veip_avc_work, cg_veip_avc_work);
 	INIT_DELAYED_WORK(&cg->coldstart_work, cg_coldstart_work);
+	INIT_DELAYED_WORK(&cg->sn_wait_work, cg_sn_wait_work);
 	cg->omci = devm_kzalloc(dev, sizeof(*cg->omci), GFP_KERNEL);
 	if (!cg->omci)
 		dev_warn(dev, "no OMCI responder ctx - DS OMCI will not be answered\n");
@@ -2537,19 +2863,26 @@ static int cortina_gpon_probe(struct platform_device *pdev)
 				cg_intr_setup(cg, pdev);
 
 			if (cg_activate) {
+				/*
+				 * The identity gate.  Ranging announces the ONU's
+				 * serial number, so it may only start once we know
+				 * THIS board's -- which lives in the factory config
+				 * volume and is pushed in from userspace (see the
+				 * cg_sn_* block).  A bad/absent module-param serial
+				 * number defers to that path, bounded by
+				 * cg_sn_wait_work so the PON side is never left dark.
+				 */
+				if (!cg_sn_param ||
+				    cg_sn_set(cg, cg_sn_param, CG_SN_PARAM)) {
+					dev_warn(dev, "GPON serial number not known yet - MAC configured, ranging DEFERRED up to %ds for /etc/init.d/gpon-identity (echo \"sn <VVVVHHHHHHHH>\" > /proc/gpon)\n",
+						 CG_SN_WAIT_SECS);
+					schedule_delayed_work(&cg->sn_wait_work,
+							      CG_SN_WAIT_SECS * HZ);
+				}
+			}
+			if (cg->activated) {
 				int i;
 
-				cg_mac_activate(cg);
-				/* Arm the cold-start US-lock recovery watchdog: if the
-				 * HW ranging FSM is still stuck at O1 after a grace
-				 * period (the cold TX-PLL metastability), re-lock the
-				 * SerDes CMU and re-arm ranging until it advances -- so
-				 * every cold boot reaches O5 (stock does, 100%). */
-				schedule_delayed_work(&cg->coldstart_work, 15 * HZ);
-				dev_info(dev, "activate: onu_cfg=0x%08x onu_ctl=0x%08x gpon_ds=0x%08x\n",
-					 cg_mac_rd(cg, CG_REG_ONU_CFG_REAL),
-					 cg_mac_rd(cg, CG_REG_ONU_CTL),
-					 cg_mac_rd(cg, CG_REG_GPON_DS));
 				/* poll the HW ranging FSM: onu.state, RGB8 (bit15 BER_NOTIFY
 				 * = DS frame sync), and the superframe counter (advances =
 				 * DS frames received; NOT clear-on-read like the DS MIB).
@@ -2575,11 +2908,11 @@ static int cortina_gpon_probe(struct platform_device *pdev)
 
 	cg_read_vendor(cg, vendor);
 	onu = cg_mac_rd(cg, CG_REG_GPON_ONU);
+	/* Not a correctness check: before the identity is provisioned this reads
+	 * the reset value.  cg_activate_start() verifies the vendor-id readback
+	 * against what it programmed, which works on any board. */
 	dev_info(dev, "GPON MAC vendor-id \"%s\" onu=0x%08x alarm=0x%08x\n",
 		 vendor, onu, cg_mac_rd(cg, CG_REG_ALARM));
-
-	if (strcmp(vendor, "XPON") != 0)
-		dev_warn(dev, "vendor-id != \"XPON\" - PON window base may be wrong\n");
 
 	cg_singleton = cg;
 	/* Stage B: receive the DS OMCI PDUs the NI CPU-RX path classifies out
@@ -2604,6 +2937,7 @@ static void cortina_gpon_remove(struct platform_device *pdev)
 	}
 	cancel_delayed_work_sync(&cg->veip_avc_work);
 	cancel_delayed_work_sync(&cg->coldstart_work);
+	cancel_delayed_work_sync(&cg->sn_wait_work);
 	cg_intr_teardown(cg);
 	if (cg->wan_ndev) {
 		unregister_netdev(cg->wan_ndev);

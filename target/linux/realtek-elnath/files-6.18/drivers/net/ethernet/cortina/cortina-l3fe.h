@@ -118,16 +118,31 @@ int cortina_l3fe_swo_crc(void __iomem *ne, const u32 *words, int nwords,
 			 u32 mask_id, u32 *crc32_out, u16 *crc16_out);
 
 /*
- * PPPoE WAN egress encap: program (or clear, @session == 0) egress L3-IF
- * table entry @idx as a pure PPPoE ADD-header entry {pppoe_set, pppoe_vld,
- * pppoe_session_id=@session} (SMAC untouched, HW auto-length).  A US
- * hit-action selects it via GROUP_20 l3_if_vld1/egr_l3_if_idx1 to HW-insert
- * the 8-byte 0x8864 session header.  hw_l3_fwd-gated caller only; caller
- * serializes (reg_lock).  Returns 0 or -EINVAL/-ETIMEDOUT.
+ * PPPoE WAN egress encap: program egress L3-IF table entry @idx to substitute
+ * the egress SMAC named by @an_sel (the WAN MAC - my-MAC CAM idx + 1) AND ADD
+ * the 8-byte 0x8864 session header for @session.  A US hit-action selects the
+ * entry via GROUP_20 l3_if_vld1/egr_l3_if_idx1 and gets BOTH rewrites; the
+ * table entry on this die has no other fields, so one interface = one entry
+ * (see l3fe_l3if_entry() for the evidence and why the SMAC must be here).
+ * @session == 0 clears the session, leaving the plain SMAC-only IPoE shape.
+ * hw_l3_fwd-gated caller only; caller serializes (reg_lock).
+ * Returns 0 or -EINVAL/-ETIMEDOUT.
  */
-int cortina_l3fe_pppoe_l3if_set(void __iomem *ne, u32 idx, u16 session);
-/* A2 next-hop L2 rewrite: mac_da_idx MAC table + IPoE egress-SMAC L3-IF entry */
+int cortina_l3fe_pppoe_l3if_set(void __iomem *ne, u32 idx, u16 session,
+				u8 an_sel);
+/* A2 next-hop L2 rewrite: mac_da_idx MAC table + IPoE egress-SMAC L3-IF entry.
+ * cortina_l3fe_ipoe_l3if_set is used for BOTH egress directions - the entry is
+ * just "substitute the egress SMAC named by @an_sel": idx 2 / an_sel 2 = the
+ * WAN MAC (US leg), idx 3 / an_sel 1 = the LAN router MAC (DS leg). */
 int cortina_l3fe_macda_idx_set(void __iomem *ne, u32 idx, const u8 *mac);
 int cortina_l3fe_ipoe_l3if_set(void __iomem *ne, u32 idx, u8 an_sel);
+
+/*
+ * Point ONE main-hash profile's TUPLE0 maskptr at the routed 5-tuple mask (8),
+ * so a lookup stamped with that profile hashes the packet under the same mask
+ * every install uses.  hw_l3_fwd-gated callers only; see the definition for why
+ * the DS leg needs the profiles the US leg's step 2b does not cover.
+ */
+int cortina_l3fe_hash_profile_mask_repoint(void __iomem *ne, u32 profile);
 
 #endif /* _CORTINA_L3FE_H */

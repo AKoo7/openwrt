@@ -750,6 +750,17 @@ static void cortina_ni_rx_frame(struct cortina_ni *ni, u64 desc)
 		cortina_ni_rx_stack_tap(ni, buf + off, len);
 
 	/*
+	 * ★ PPPoE punt-integrity witness (GAP-2).  A DS PPPoE session frame that
+	 * reaches the CPU must be self-consistent (PPPoE length == inner IPv4
+	 * total length + 2); the 2026-07-20 regression made those frames arrive
+	 * with the TCP header shifted by the 8-byte encap, which is invisible to
+	 * every register and hit counter but obvious in the frame.  Default OFF -
+	 * one predicted-not-taken branch per received frame when disarmed.
+	 */
+	if (unlikely(cortina_ni_pppoe_punt_armed()))
+		cortina_ni_pppoe_punt_inspect(buf + off, len);
+
+	/*
 	 * DS PON control frame (GPON OMCI): the PDC steers the OMCC DS GEM to
 	 * CPU port 0 with a HW-prepended 16-byte PON header — DA 00:13:25:00:
 	 * 00:00, SA 00:13:25:00:00:01, ethertype bytes [12:13] = 0xff,0xf1
@@ -1478,15 +1489,55 @@ static void cortina_ni_rx_mc_group_init(struct cortina_ni *ni)
  * `base` = the NI/NE register window (ni_base(ni) == cn_l3e->ne_base, the single
  * 0xf4300000 window).  Exported for the flow-offload next-hop path.
  */
+/*
+ * Pack a MAC into the FDB key words (aal __aal_mac_2_fdb_data; vid/scind/dot1p
+ * = 0) - shared by the append and the lookup-only path below so both hash to
+ * the same bucket.
+ */
+static void cortina_ni_l2fe_fdb_key(const u8 *mac, u32 *d3, u32 *d2, u32 *d1)
+{
+	*d3 = (mac[0] >> 5) & 0x7;
+	*d2 = ((u32)(mac[0] & 0x1f) << 27) | ((u32)mac[1] << 19) |
+	      ((u32)mac[2] << 11) | ((u32)mac[3] << 3) | ((mac[4] >> 5) & 0x7);
+	*d1 = (u32)(((mac[4] & 0x1f) << 8) | mac[5]) << 19;
+}
+
+/*
+ * Issue one OP_READ (look-up) for the packed key and return the 13-bit entry
+ * index, or -1 when the key is not present / the engine times out.  DATA0 is
+ * deliberately NOT written here: on a HIT the engine returns the matched
+ * entry's ACTION word in it (that is how the append path can validate its own
+ * write without re-supplying the action), so @act_out - when non-NULL - yields
+ * the entry's stored forward-to LDPID + valid/static/permit bits.
+ */
+static int cortina_ni_l2fe_fdb_read_idx(void __iomem *base, u32 d3, u32 d2,
+					u32 d1, u32 *act_out)
+{
+	u32 acc, cr;
+
+	writel(0, base + CA_NI_L2FE_FDB_CMD_RETURN);
+	writel(d3, base + CA_NI_L2FE_FDB_DATA3);
+	writel(d2, base + CA_NI_L2FE_FDB_DATA2);
+	writel(d1, base + CA_NI_L2FE_FDB_DATA1);
+	writel(CA_NI_L2FE_FDB_GO | CA_NI_L2FE_FDB_OP_READ,
+	       base + CA_NI_L2FE_FDB_ACCESS);
+	if (readl_poll_timeout(base + CA_NI_L2FE_FDB_ACCESS, acc,
+			       !(acc & CA_NI_L2FE_FDB_GO), CA_NI_TX_POLL_US,
+			       CA_NI_TX_POLL_TIMEOUT_US))
+		return -1;
+	cr = readl(base + CA_NI_L2FE_FDB_CMD_RETURN);
+	if ((cr & 0xf) != CA_NI_L2FE_FDB_STATUS_HIT)
+		return -1;			/* not present */
+	if (act_out)
+		*act_out = readl(base + CA_NI_L2FE_FDB_DATA0);
+	return (int)((cr >> 4) & 0x1fff);	/* ext_status[16:4] = entry index */
+}
+
 int cortina_ni_l2fe_fdb_add_idx(void __iomem *base, const u8 *mac, u32 ldpid)
 {
-	u32 d0, d1, d2, d3, acc, cr;
+	u32 d0, d1, d2, d3, acc;
 
-	/* key: MAC -> DATA1/2/3 (aal __aal_mac_2_fdb_data); vid/scind/dot1p = 0 */
-	d3 = (mac[0] >> 5) & 0x7;
-	d2 = ((u32)(mac[0] & 0x1f) << 27) | ((u32)mac[1] << 19) |
-	     ((u32)mac[2] << 11) | ((u32)mac[3] << 3) | ((mac[4] >> 5) & 0x7);
-	d1 = (u32)(((mac[4] & 0x1f) << 8) | mac[5]) << 19;
+	cortina_ni_l2fe_fdb_key(mac, &d3, &d2, &d1);
 	d0 = FIELD_PREP(CA_NI_L2FE_FDB_LPID, ldpid) |
 	     CA_NI_L2FE_FDB_VALID | CA_NI_L2FE_FDB_STATIC |
 	     CA_NI_L2FE_FDB_DA_PERMIT | CA_NI_L2FE_FDB_SA_PERMIT;
@@ -1504,20 +1555,39 @@ int cortina_ni_l2fe_fdb_add_idx(void __iomem *base, const u8 *mac, u32 ldpid)
 		return -1;
 
 	/* READ back the key: CMD_RETURN.status[3:0]=0x5 HIT, ext_status[16:4]=idx */
-	writel(0, base + CA_NI_L2FE_FDB_CMD_RETURN);
-	writel(d3, base + CA_NI_L2FE_FDB_DATA3);
-	writel(d2, base + CA_NI_L2FE_FDB_DATA2);
-	writel(d1, base + CA_NI_L2FE_FDB_DATA1);
-	writel(CA_NI_L2FE_FDB_GO | CA_NI_L2FE_FDB_OP_READ,
-	       base + CA_NI_L2FE_FDB_ACCESS);
-	if (readl_poll_timeout(base + CA_NI_L2FE_FDB_ACCESS, acc,
-			       !(acc & CA_NI_L2FE_FDB_GO), CA_NI_TX_POLL_US,
-			       CA_NI_TX_POLL_TIMEOUT_US))
+	return cortina_ni_l2fe_fdb_read_idx(base, d3, d2, d1, NULL);
+}
+
+/*
+ * LOOK UP @mac in the L2FE FDB without touching the table, and report BOTH the
+ * entry index (= the L3FE forward action's mac_da_idx / aal-77c egr_lutidx) and
+ * the entry's stored forward-to LDPID.  Used by the DS (WAN->LAN) flow-offload
+ * leg: the LAN client's MAC is already in the FDB (it was learned from the
+ * client's own upstream traffic - the very traffic that created the conntrack),
+ * so the DS next-hop DMAC *and* the LAN egress port both come from the one L2
+ * entry the switch already resolved.  Deliberately lookup-ONLY: appending a
+ * static entry for a dynamically-learned client MAC would pin it to a guessed
+ * port and hijack normal bridging for that host.
+ *
+ * Returns the index, or -1 if the MAC is not present / the engine timed out.
+ * @ldpid_out (optional) = the entry action's forward-to LDPID; for a LAN NI
+ * port that equals the physical port number (cortina-ni-tx.c ARB identity map).
+ */
+int cortina_ni_l2fe_fdb_lookup_idx(void __iomem *base, const u8 *mac,
+				   u32 *ldpid_out)
+{
+	u32 d1, d2, d3, act = 0;
+	int idx;
+
+	cortina_ni_l2fe_fdb_key(mac, &d3, &d2, &d1);
+	idx = cortina_ni_l2fe_fdb_read_idx(base, d3, d2, d1, &act);
+	if (idx < 0)
 		return -1;
-	cr = readl(base + CA_NI_L2FE_FDB_CMD_RETURN);
-	if ((cr & 0xf) != 0x5)
-		return -1;			/* not HIT (append failed) */
-	return (int)((cr >> 4) & 0x1fff);	/* ext_status[16:4] = entry index */
+	if (!(act & CA_NI_L2FE_FDB_VALID) || !(act & CA_NI_L2FE_FDB_DA_PERMIT))
+		return -1;		/* present but not forwardable as a DA */
+	if (ldpid_out)
+		*ldpid_out = FIELD_GET(CA_NI_L2FE_FDB_LPID, act);
+	return idx;
 }
 
 static void cortina_ni_rx_fdb_append(struct cortina_ni *ni, const u8 *mac,
@@ -4576,20 +4646,33 @@ static int cortina_ni_rx_proc_show(struct seq_file *m, void *v)
 			   readl(ni_base(ni) + CA_NI_L3FE_MY_MAC_LO),
 			   readl(ni_base(ni) + CA_NI_L3FE_MY_MAC_HI));
 
-		/* ★ build74: cls_hit_0..3 - THE decisive "is the CLS consulted?" witness.
-		 * 0 across all while broadcast ARP flows = the L3-CLS lookup is never invoked
-		 * for our ingress (an enable/ingress gate, not a key-match failure). */
-		seq_puts(m, "build74 cls_hit[0..3]:");
-		for (e = 0; e < 4; e++) {
-			u32 bus_sel = (CA_NI_L3FE_MON_CLS_RESULT << 5) | e;
-
-			/* CTRL: enable(bit0)=1 + bus_sel field (bits[8:1]) */
-			writel(1u | (bus_sel << 1),
-			       ni_base(ni) + CA_NI_L3FE_CLS_MON_CTRL);
-			seq_printf(m, " [%u]=0x%08x", e,
-				   readl(ni_base(ni) + CA_NI_L3FE_CLS_MON_RETURN));
-		}
-		seq_puts(m, " (all 0 while ARP flows = CLS NOT consulted -> enable gap)\n");
+		/*
+		 * ★★ WITHDRAWN 2026-07-25 - the "build74 cls_hit[0..3]" probe was
+		 * MISDETECTION, of exactly the class this project keeps paying
+		 * for, and every conclusion ever drawn from it ("cls_hit all 0
+		 * => the CLS is never consulted") is VOID.  Two defects: it put
+		 * the monitor ENABLE at bit0 when it is BIT(8) (tier-2 stock
+		 * aal_l3fe_glb_cls_stg_monitor_get), so the monitor was never
+		 * enabled and 0x30b4 returned whatever was already there; and it
+		 * read only 4 words of a read-out port that carries up to 32.
+		 * Left as a read-only register dump here: the CORRECT monitor,
+		 * the DBG per-stage packet counters (0x30b8/0x30bc vector 15 =
+		 * L3FE_IN/OUT/T1_T2/STG3_PE) and the one-shot descriptor latch
+		 * (0x30c0/c4/c8) are implemented in cortina-ni-flowoffload.c and
+		 * surfaced through /proc/cortina_l3fe, which is where the
+		 * flow-offload stage discrimination belongs - duplicating them
+		 * here would just create a second thing to keep in sync.
+		 * ★ Note the naming conflict recorded in cortina-ni-regs.h:
+		 * 0x30b4/0x30bc are ALSO named GLB_LF_CFG / GLB_ILPB_00 and are
+		 * written by cortina_ni_rx_l3fe_glb_init(); per the tier-2
+		 * accessors they are read-data ports, so those writes are inert
+		 * and did NOT unblock the L3FE ingress FIFO.
+		 */
+		seq_printf(m,
+			   "l3fe_glb: cls_mon_ctrl(0x30b0)=0x%08x cls_mon_data(0x30b4)=0x%08x (also written as GLB_LF_CFG=0x%08x - see the conflict note in cortina-ni-regs.h; monitor enable is BIT(8), and the real stage counters live in /proc/cortina_l3fe)\n",
+			   readl(ni_base(ni) + CA_NI_L3FE_CLS_MON_CTRL),
+			   readl(ni_base(ni) + CA_NI_L3FE_GLB_LF_CFG),
+			   CA_NI_L3FE_GLB_LF_CFG_VAL);
 
 		/* ★ build75: profile-1 (LAN) CPU-trap rows - the LAN classifier searches
 		 * KEY[64..127]; KEY[66] (wildcard) is the LAN bcast/DLF catch-all -> FIB[264]
