@@ -6,6 +6,7 @@
 #include "coex.h"
 #include "debug.h"
 #include "fw.h"
+#include "led.h"
 #include "mac.h"
 #include "phy.h"
 #include "reg.h"
@@ -3036,6 +3037,10 @@ static const struct rtw89_chip_ops rtw8852c_chip_ops = {
 	.btc_wl_s1_standby	= rtw8852c_btc_wl_s1_standby,
 	.btc_set_wl_rx_gain	= rtw8852c_btc_set_wl_rx_gain,
 	.btc_set_policy		= rtw89_btc_set_policy_v1,
+#ifdef CONFIG_RTW89_LEDS
+	/* LED pad is MAC GPIO 8, same sequence as 8192XB -- see led.c. */
+	.led_set		= rtw89_led_set_gpio8,
+#endif
 };
 
 const struct rtw89_chip_info rtw8852c_chip_info = {

@@ -21,6 +21,7 @@ rtw89_core-y += core.o \
 		util.o
 
 rtw89_core-$(CONFIG_PM) += wow.o
+rtw89_core-$(CONFIG_RTW89_LEDS) += led.o
 
 obj-$(CONFIG_RTW89_8851B) += rtw89_8851b.o
 rtw89_8851b-objs := rtw8851b.o \

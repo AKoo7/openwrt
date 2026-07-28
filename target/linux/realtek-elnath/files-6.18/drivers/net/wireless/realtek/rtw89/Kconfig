@@ -153,6 +153,30 @@ config RTW89_8922AE
 
 	  The variant 8922AE-VS has the same features except 1024-QAM.
 
+config RTW89_LEDS
+	bool "Realtek rtw89 front-panel LED support"
+	depends on RTW89_CORE
+	depends on LEDS_CLASS=y || LEDS_CLASS=RTW89_CORE
+	help
+	  Expose the WiFi MAC's own LED pad as a /sys/class/leds device, for
+	  boards that wire a front-panel indicator to it.  Enable
+	  MAC80211_LEDS as well to have mac80211 light it while the radio is up
+	  and blink it on traffic; without that the LED is still controllable,
+	  just with no default trigger.
+
+	  Only chips whose LED wiring has been established provide the register
+	  sequence, so enabling this on other parts registers nothing.
+
+config RTW89_LED_NAME_PREFIX
+	string "Device-name segment for rtw89 LEDs"
+	depends on RTW89_LEDS
+	default "rtw89"
+	help
+	  First segment of the LED's sysfs name, which ends up as
+	  "<prefix>:<colour>:<function>" -- for example "rtw89:green:5g".  Set
+	  this to the board name to match the naming used by the board's other
+	  panel LEDs.
+
 config RTW89_DEBUG
 	bool
 

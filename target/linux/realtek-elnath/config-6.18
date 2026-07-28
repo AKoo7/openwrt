@@ -113,6 +113,14 @@ CONFIG_GENERIC_STRNCPY_FROM_USER=y
 CONFIG_GENERIC_STRNLEN_USER=y
 CONFIG_GENERIC_TIME_VSYSCALL=y
 CONFIG_GPIO_CDEV=y
+# Front panel.  The SoC's peripheral GPIO controller (gpio-cortina-ca77xx) is
+# what the ten panel LEDs and the reset/WPS buttons hang off; LEDS_GPIO turns
+# the DT leds node into /sys/class/leds entries.  Nothing else is needed here:
+# GPIOLIB, NEW_LEDS, LEDS_CLASS, LEDS_TRIGGERS and LEDS_TRIGGER_NETDEV already
+# come from the generic config, and the buttons are handled in userspace by the
+# kmod-gpio-button-hotplug package (already a target DEFAULT_PACKAGE), which
+# binds the gpio-keys-polled node directly and needs no INPUT subsystem.
+CONFIG_GPIO_CORTINA_CA77XX=y
 CONFIG_HARDIRQS_SW_RESEND=y
 CONFIG_HAS_DMA=y
 CONFIG_HAS_IOMEM=y
@@ -131,6 +139,7 @@ CONFIG_IRQ_FORCED_THREADING=y
 CONFIG_IRQ_MSI_IOMMU=y
 CONFIG_IRQ_MSI_LIB=y
 CONFIG_IRQ_WORK=y
+CONFIG_LEDS_GPIO=y
 CONFIG_LIBFDT=y
 CONFIG_LOCK_DEBUGGING_SUPPORT=y
 CONFIG_LOCK_SPIN_ON_OWNER=y
@@ -231,7 +240,10 @@ CONFIG_CFG80211_DEBUGFS=y
 CONFIG_CFG80211_USE_KERNEL_REGDB_KEYS=y
 CONFIG_MAC80211=y
 # CONFIG_MAC80211_MESH is not set
-# CONFIG_MAC80211_LEDS is not set
+# Needed by the panel's 2.4G/5G LEDs: mac80211's throughput LED trigger is what
+# holds each radio's LED on while that radio is up and blinks it on traffic.
+# Adds triggers only -- the LED devices themselves come from RTW89_LEDS below.
+CONFIG_MAC80211_LEDS=y
 # CONFIG_MAC80211_DEBUG_MENU is not set
 # CONFIG_MAC80211_HWSIM is not set
 CONFIG_MAC80211_HAS_RC=y
@@ -272,6 +284,13 @@ CONFIG_RTW89_8192XBE=y
 # CONFIG_RTW89_8852BE is not set
 # CONFIG_RTW89_8852BTE is not set
 # CONFIG_RTW89_8922AE is not set
+# Panel 2.4G/5G LEDs.  Both radios drive their indicator off the WiFi MAC's own
+# LED pad (MAC GPIO 8) rather than a SoC GPIO, so they cannot be gpio-leds DT
+# children like the other ten -- rtw89 has to register them itself.  The prefix
+# makes the sysfs names line up with the DT-provided ones:
+# x411axf:green:2.4g and x411axf:green:5g.
+CONFIG_RTW89_LEDS=y
+CONFIG_RTW89_LED_NAME_PREFIX="x411axf"
 CONFIG_RTW89_DEBUGMSG=y
 CONFIG_RTW89_DEBUG=y
 CONFIG_RTW89_DEBUGFS=y

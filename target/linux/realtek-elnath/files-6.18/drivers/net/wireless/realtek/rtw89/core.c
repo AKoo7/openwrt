@@ -11,6 +11,7 @@
 #include "core.h"
 #include "efuse.h"
 #include "fw.h"
+#include "led.h"
 #include "mac.h"
 #include "phy.h"
 #include "ps.h"
@@ -5546,6 +5547,13 @@ int rtw89_core_start(struct rtw89_dev *rtwdev)
 	rtw89_fw_h2c_init_ba_cam(rtwdev);
 	rtw89_tas_fw_timer_enable(rtwdev, true);
 
+	/* Radio is up and the chip is powered: light the panel LED.  Every path
+	 * that starts the radio lands here -- mac80211 .start, leaving IPS, and the
+	 * restart after a firmware-recovery reset -- so the LED cannot be left dark
+	 * while the radio runs.
+	 */
+	rtw89_led_radio_state(rtwdev, true);
+
 	return 0;
 }
 
@@ -5559,6 +5567,11 @@ void rtw89_core_stop(struct rtw89_dev *rtwdev)
 	/* Prvent to stop twice; enter_ips and ops_stop */
 	if (!test_bit(RTW89_FLAG_RUNNING, rtwdev->flags))
 		return;
+
+	/* Darken the panel LED first, while the chip is still powered and the write
+	 * can still reach the pad.
+	 */
+	rtw89_led_radio_state(rtwdev, false);
 
 	rtw89_tas_fw_timer_enable(rtwdev, false);
 	rtw89_btc_ntfy_radio_state(rtwdev, BTC_RFCTRL_WL_OFF);
@@ -6370,10 +6383,15 @@ static int rtw89_core_register_hw(struct rtw89_dev *rtwdev)
 
 	hw->wiphy->sar_capa = &rtw89_sar_capa;
 
+	/* Must precede ieee80211_register_hw(): the throughput LED trigger this
+	 * creates can only be created beforehand.
+	 */
+	rtw89_led_init(rtwdev);
+
 	ret = ieee80211_register_hw(hw);
 	if (ret) {
 		rtw89_err(rtwdev, "failed to register hw\n");
-		return ret;
+		goto err_led_deinit;
 	}
 
 	ret = rtw89_regd_init_hint(rtwdev);
@@ -6388,6 +6406,8 @@ static int rtw89_core_register_hw(struct rtw89_dev *rtwdev)
 
 err_unregister_hw:
 	ieee80211_unregister_hw(hw);
+err_led_deinit:
+	rtw89_led_deinit(rtwdev);
 
 	return ret;
 }
@@ -6398,6 +6418,7 @@ static void rtw89_core_unregister_hw(struct rtw89_dev *rtwdev)
 
 	rtw89_rfkill_polling_deinit(rtwdev);
 	ieee80211_unregister_hw(hw);
+	rtw89_led_deinit(rtwdev);
 }
 
 int rtw89_core_register(struct rtw89_dev *rtwdev)
