@@ -1214,7 +1214,15 @@ MODULE_PARM_DESC(hw_l3_fwd,
  * (keepalive "5 30").  Do not conflate the two -- with the aggressive OpenWrt
  * default keepalive the session still bounces regardless of this setting.
  */
-static bool hw_pppoe = true;
+/* ★ DEFAULT OFF again 2026-07-28.  This shipped as `= true` in the first public
+ * push by accident: the working tree was committed wholesale without auditing
+ * the defaults inside it.  It is not a free win - the measurements recorded
+ * above show upstream reaching 934.2 Mbps with it on while the DOWNSTREAM moved
+ * to the CPU, and a sub-percent frame-malformation question on the session path
+ * is still open.  That is a performance TRADE, which is the operator's call to
+ * make deliberately with numbers in hand, not something to inherit from an
+ * unreviewed commit.  Flip to 1 to measure it. */
+static bool hw_pppoe;
 static int hw_pppoe_set(const char *val, const struct kernel_param *kp);
 
 static const struct kernel_param_ops hw_pppoe_ops = {
