@@ -37,6 +37,7 @@
  */
 
 #include <linux/bitfield.h>
+#include <linux/crc32.h>	/* ★ TEMP DIAG rx_frag_tap - revert with it */
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/etherdevice.h>
@@ -68,6 +69,67 @@ module_param(rx_skip_portcfg, bool, 0644);
 static bool rx_debug;
 module_param(rx_debug, bool, 0644);
 MODULE_PARM_DESC(rx_debug, "dump the first received descriptors/frames");
+
+/* ★ TEMPORARY DIAGNOSTIC (rx_frag_tap, 2026-07-27 - REVERT once the IPv4
+ * fragment-reassembly defect is pinned).  The board reassembles no fragmented
+ * datagram while the vendor image on the same silicon reassembles every one:
+ * fragments all arrive (Ip.ReasmReqds exact), yet 2-fragment datagrams never
+ * complete and 3-fragment ones complete with a payload that fails the ICMP
+ * checksum.  The suspicion is that the frame buffer is reused before the CPU
+ * has copied out of it, so two descriptors resolve to the same buffer and the
+ * second frame overwrites the first.
+ *
+ * For the first N IPv4 FRAGMENTS this logs the descriptor's buffer address and
+ * pool id, the descriptor length against HEADER_A's, the fragment's IP identity
+ * - and then checksums the frame twice: once from the skb we just copied, and
+ * again from the pool buffer after a delay.  If both fragments of a datagram
+ * report the same pa, the buffer is being handed out under us; if the second
+ * checksum differs, the DMA landed after our copy.  Those are different bugs
+ * with different fixes, which is why the tap reports which one it is instead of
+ * one flag.
+ *
+ * rx_frag_tap_us=0 is the control: the tap's own delay runs inside NAPI, so a
+ * zero-delay run proves the delay is not itself creating what it reports. */
+static int rx_frag_tap;
+module_param(rx_frag_tap, int, 0644);
+MODULE_PARM_DESC(rx_frag_tap,
+	"TEMP DIAG: log buffer identity + re-read checksum for the first N IPv4 fragments (0 = off)");
+
+static int rx_frag_tap_us = 20;
+module_param(rx_frag_tap_us, int, 0644);
+MODULE_PARM_DESC(rx_frag_tap_us,
+	"TEMP DIAG: delay before the rx_frag_tap re-read, microseconds (0 = control run)");
+
+static void cortina_ni_rx_frag_tap(struct net_device *ndev, const u8 *buf,
+				   u32 off, int len, u64 desc, u32 pa, u32 dlen,
+				   u32 hdra_lo, const u8 *copied);
+
+/*
+ * ★ TEMPORARY DIAGNOSTIC (rx_ds_tap, 2026-07-28 - REVERT with rx_frag_tap).
+ * The open question is whether a GPON DOWNSTREAM frame reaches this driver at
+ * all under software pool ownership, and if it does, which pool its buffer
+ * came from.  Independent of rx_frag_tap so the fragment ladder stays
+ * measurable on the same build.
+ *
+ * ★ It MUST be sampled before the PON-control and WAN-netdev branches of
+ * cortina_ni_rx_frame(), which both return early: a tap placed at the eth0
+ * delivery site (where rx_frag_tap sits) can NEVER see a DS frame, so its
+ * silence there would mean nothing.  Placed where it is, silence is itself the
+ * answer - if LAN frames still print and DS frames do not, the DS frame died
+ * before the CPU and the pool is exonerated.
+ *
+ * Matches on HEADER_A alone (lspid = PON, or ldpid = L3_WAN under the HW-L3
+ * route), so it catches DS OMCI control frames, DS data frames, and anything
+ * the L3FE punts, whichever branch they would go on to take.
+ */
+static int rx_ds_tap;
+module_param(rx_ds_tap, int, 0644);
+MODULE_PARM_DESC(rx_ds_tap,
+	"TEMP DIAG: log descriptor+pool identity for the first N GPON downstream frames (HEADER_A lspid=PON or ldpid=L3_WAN), sampled before the PON/WAN delivery branches (0 = off)");
+
+static void cortina_ni_rx_ds_tap(struct net_device *ndev, const u8 *buf,
+				 u32 off, int len, u64 desc, u32 pa, u32 dlen,
+				 u32 hdra_hi, u32 hdra_lo);
 
 /* ★ TEMPORARY DIAGNOSTIC (P3 crc_ntfy tap, 2026-07-23 - REVERT once the T2
  * hash divergence is pinned).  HASH_INI.crc_ntfy_en=1 makes the T2 lookup
@@ -225,6 +287,254 @@ static bool ring_noncoh = true;
 module_param(ring_noncoh, bool, 0644);
 MODULE_PARM_DESC(ring_noncoh, "CPU-EPP ring AXI attr (1=non-coherent DDR_POOL 0x04000010; 0=coherent CPU_EPP 0x12008060)");
 
+/*
+ * ★★★ RX-buffer OWNERSHIP.  CFG2.cpu_eq (bit3) selects which side owns a CPU
+ * pool buffer:
+ *   0 = hardware-managed - the QM populates the pool itself from
+ *       CFG0.phy_addr_start and frees the bid at the EPP descriptor writeback;
+ *   1 = software-owned  - the buffer belongs to the CPU until the driver
+ *       stages it back through the CPU_PUSH_PADDR doorbell (the vendor model:
+ *       its CPU pools are cpu_eq=1 and it re-pushes one batch per NAPI poll).
+ *
+ * We shipped cpu_eq=0 on the belief that the QM reclaims a bid only when NAPI
+ * advances the EPP read pointer.  BOARD-MEASURED 2026-07-27, that belief is
+ * false.  Two frames admitted ~1 us apart - the two fragments of one IPv4
+ * datagram, which is the only traffic on this device that puts two frames
+ * back-to-back into the CPU punt path - were both DMA'd into the SAME buffer
+ * (pa=0x09400800) with no read-pointer advance in between: the descriptor for
+ * frame 1 resolved to a buffer already overwritten by frame 2 (descriptor
+ * pktlen 1530 against HEADER_A.pkt_size 570).  The stack then received two
+ * byte-identical copies of fragment 2 - an exact duplicate, which
+ * ip_frag_queue() drops on its IPFRAG_DUP path WITHOUT incrementing any
+ * counter - so the datagram never completed and expired 30 s later.  When the
+ * overwrite lands mid-copy instead, the frame keeps a valid header and gains a
+ * corrupt tail, which completes reassembly and fails the L4 checksum.
+ *
+ * A deeper pool cannot fix this: the free list behaves as a stack, so a bid
+ * freed at writeback is handed straight back out - measured, the two frames
+ * collided on one buffer even though 512 are configured per pool.  Only
+ * transferring ownership to the CPU closes the window, by construction.
+ *
+ * =0 restores the previous hardware-managed pool for an A/B (and as the
+ * fallback if a board ever fails to seed).  Read-only: the pool model is
+ * chosen once, at probe.
+ */
+/* ★ 2026-07-28 DEFAULT OFF pending one open regression.  Software ownership
+ * demonstrably fixes IPv4 fragment reassembly - every rung 5/5, matching the
+ * vendor image, where the hardware-managed pool gave 0/5, with stale_buf and
+ * push_fail both 0.  But on the same boot the WAN downstream punt stopped
+ * delivering entirely: gpon0 TX climbs (DHCP DISCOVERs go out) while its RX
+ * stays at exactly 0 packets, so no lease is ever obtained, even though the LAN
+ * path and O5/OMCI are healthy.  A defect traded for a defect is not a fix, so
+ * this ships off until the downstream punt path is understood - most likely a
+ * pool or return path the recycle does not cover (the WAN netdev branch of
+ * cortina_ni_rx_frame() is a separate delivery path from the eth0 one, and the
+ * deep-queue DS punt may draw from a pool other than EQ5/EQ6). */
+/* ★★ DEFAULT ON since 2026-07-28 - this is the buffer-ownership model the
+ * hardware actually requires, and it is now proven end to end on the board.
+ *
+ * With cpu_eq=0 the QM frees a buffer at descriptor writeback, so the CPU never
+ * owns it: a second frame arriving before NAPI drains lands on the SAME buffer.
+ * Measured directly - every frame at pa=09400800, fragment 1's descriptor
+ * (dlen=1530) resolving to a buffer already holding fragment 2
+ * (hdra_pkt_size=570), two byte-identical copies of fragment 2 under one IP id
+ * => IPFRAG_DUP => the datagram never completes.  IPv4 fragment reassembly was
+ * therefore broken outright (ping -s 2000/3000 = 0/5) while the vendor image on
+ * the same silicon reassembled every one.
+ *
+ * cpu_eq=1 + CPU_PUSH_PADDR recycle removes the window rather than narrowing
+ * it: the QM cannot reclaim a buffer until we re-push it, which happens after
+ * skb_put_data.  Result: 150/150 on every rung of the suite's fragment ladder,
+ * local and transit, matching the vendor numbers, with stale_buf and push_fail
+ * both 0.
+ *
+ * ★ It only works together with the dest-port 16..47 gate below: the per-GEM
+ * PDC map stamps DATA GEMs with ldpid 0x18 = L3_WAN = 24, which lands in that
+ * range, and a forwarding-engine consumer cannot draw from a cpu_eq=1 pool.
+ * Leaving that range on the software-owned pools killed the WAN downstream punt
+ * completely (gpon0 RX at exactly 0 from boot) while the LAN punt and DS OMCI -
+ * which enter at dest port 0 - stayed healthy.  Set to 0 to restore the old
+ * hardware-managed model, fragment defect included. */
+static bool cpu_pool_push = true;
+module_param(cpu_pool_push, bool, 0444);
+MODULE_PARM_DESC(cpu_pool_push,
+	"CPU RX pool ownership: 1 = software-owned (cpu_eq=1 + CPU_PUSH_PADDR recycle, vendor model; fixes IPv4 fragment reassembly but currently breaks the WAN downstream punt), 0 = hardware-managed self-populating pool (default; collides a back-to-back frame pair onto one buffer)");
+
+/*
+ * ★★ MULTI-BUFFER RECEIVE (the SOP..EOP descriptor chain).  Default OFF until a
+ * chained frame has been assembled on hardware.
+ *
+ * A pool buffer's usable payload window is NOT its buffer size: the QM reserves
+ * head_room at the front and tail_room at the back (see
+ * CA_NI_RX_BUF_USABLE_END), leaving 1600 bytes of a 2048-byte buffer.  A frame
+ * longer than that window is split across buffers - first descriptor SOP, last
+ * EOP, the ones between neither - and the vendor firmware assembles it.  We
+ * never did: cortina_ni_rx_frame() reads SOP only, so a chain's first segment
+ * was delivered short and its continuations counted as drop_nosop.
+ *
+ * Why it matters beyond long frames: it is what makes a SMALL-buffer pool
+ * viable.  The deep-queue pool has to stay hardware-managed on this silicon
+ * (CA_NI_RX_DQ_CFG2), and the only reason it also has to be 2048B is that we
+ * cannot chain; with chaining, stock's own 512B geometry becomes reachable.
+ *
+ * With this off the receive path is the one that shipped: the test below
+ * short-circuits on the parameter before reading EOP, so a descriptor's
+ * treatment is decided exactly as before.
+ */
+static bool rx_chain;
+module_param(rx_chain, bool, 0444);
+MODULE_PARM_DESC(rx_chain,
+	"assemble multi-buffer frames from the SOP..EOP descriptor chain (1) or treat a non-self-contained descriptor as today - deliver a SOP short, drop a continuation as nosop (0, default)");
+
+/*
+ * Whether a CONTINUATION buffer repeats HEADER_A at +0x40, or starts its payload
+ * there.  ESTABLISHED: it starts its payload there - a continuation carries no
+ * header of any kind, so all 1600 bytes of its window are frame bytes.
+ *
+ * Three independent readings of the shipped firmware agree, recovered by two
+ * separate passes over ca-ne.ko:
+ *   - both header parsers gate the HEADER_A read on the descriptor's SOP bit
+ *     (ca_ni_rx_napi_get_header +0xc8, ca_ni_rx_napi_get_header_from_64bit_epp
+ *     +0xa0), so no SOP means no header;
+ *   - the continuation reader (ca_ni_rx_napi_read_epp_64bit_mode) contains no
+ *     header parse at all - it invalidates buf+0x40 for 1600 bytes and returns;
+ *   - the pointer arithmetic differs decisively between the two cases: the first
+ *     buffer's payload is buf + 0x40 + K with K the 8- or 16-byte header block,
+ *     while a continuation does skb_push(64) with NO +K adjustment and then puts
+ *     min(remaining, 1600) bytes (ca_ni_rx_napi +0x640/+0x64c and the same shape
+ *     in ca_ni_rx_napi_fbm).
+ * The same 1600-byte window is independently confirmed by our own register
+ * config: QM_DEST_PORTn_PKT_BUF_CFG reserves 64 bytes of head and 384 of tail in
+ * a 2048-byte buffer, which is 1600 - see CA_NI_RX_BUF_USABLE_END.
+ *
+ * The parameter survives only as a one-bootarg A/B if a future chip's QM turns
+ * out to prepend a header per buffer; it is not a placeholder for a guess.
+ */
+static bool rx_chain_rest_hdra;
+module_param(rx_chain_rest_hdra, bool, 0444);
+MODULE_PARM_DESC(rx_chain_rest_hdra,
+	"a continuation buffer of a chain repeats HEADER_A at +0x40, so its payload starts at +0x48 (1), or its payload starts at +0x40 (0, default, and what the shipped firmware does)");
+
+/*
+ * ★★ The seed count is deliberately NOT a constant of its own: each pool must
+ * be handed exactly the CFG1.total_buf it was configured with, so the two are
+ * derived from one source and cannot drift.
+ *
+ * BOARD-MEASURED 2026-07-27, why this matters: a first cut seeded a separate
+ * 256 per pool while total_buf stayed 512, and the QM then sat permanently in
+ * "want buffers" - inactive_bid_cntr (0x6388+eqid*4, the vendor's
+ * aal_l3qm_get_inactive_bid_cntr, documented as the number of buffers the pool
+ * is SHORT) read 256 on BOTH pools under software ownership and 0 under
+ * hardware ownership.  512 - 256, exactly, and a difference the fix itself
+ * introduced.  Only the floor below stays a constant: it is the failure
+ * threshold, not a capacity.
+ */
+#define CA_NI_RX_PUSH_SEED_MIN		64
+/* A full seed must fit inside the sub-region the PA->VA math maps, whatever a
+ * future total_buf or buffer size is set to. */
+static_assert(CA_NI_RX_EQ_TOTAL_BUF * CA_NI_RX_CPU_POOL0_BUFSZ <=
+	      CA_NI_RX_CPU_POOL0_BYTES,
+	      "CPU pool0: total_buf x buffer_size overflows its sub-region");
+static_assert(CA_NI_RX_CPU_POOL0_BYTES +
+	      CA_NI_RX_EQ2_TOTAL_BUF * CA_NI_RX_CPU_POOL1_BUFSZ <=
+	      CA_NI_RX_CPU_DRAM_SIZE,
+	      "CPU pool1: total_buf x buffer_size overflows the reserved region");
+/* Per-poll recycle batch.  The NAPI budget is clamped to this so a poll can
+ * never consume more buffers than we can hand back - an overflow would leak
+ * buffers out of the pool until RX starves. */
+#define CA_NI_RX_RECYCLE_MAX		64
+/*
+ * ★★★ DEEP-QUEUE pool (EQ12), required by the software-owned CPU pools.
+ *
+ * These belong beside the other pool addresses in cortina-ni-regs.h and are
+ * kept here only to avoid colliding with concurrent edits to that header -
+ * please move them when convenient; nothing else references them.
+ *
+ * WHY a second pool exists at all.  Two consumers reach the CPU through the QM:
+ * the DIRECT punt and the DEEP-QUEUE punt (dest ports 8..15, deep_q=1).  Our
+ * config collapsed both onto EQ5/EQ6.
+ *
+ * ★ The mechanism of that collapse, stated correctly: DEST_PORT_EQ_CFG.prof_sel
+ * is CA_NI_QM_DEST_PORT_PROF_SEL = GENMASK(3, 0), a FOUR-bit field at bit 0
+ * that indexes EQ_PROFILE DIRECTLY (0..15) - it is NOT a 3-bit field, and there
+ * is no masking.  So the deep-queue dest ports, programmed 0x0D, select
+ * EQ_PROFILE(13), and profile 13 is written with {EQ5, EQ6}.  Evidence, three
+ * ways that agree: the field definition; the live readback prof13(0x615c) =
+ * 0x00000065 = {eqp0=5, eqp1=6} alongside destp8 = destp15 = 0x0D; and stock's
+ * own pairing destp8 = 0x0C with prof12 = 0xEC = {EQ12, EQ14}, which is the
+ * documented deep-queue pool pair and only lines up under direct indexing.
+ * (A "3-bit, so 0x0D & 7 = profile 5" reading elsewhere in this file reaches
+ * the same pool by accident, because the 0..7 loop happens to fill profile 5
+ * with {EQ5, EQ6} too.  It is wrong, and it made a coincidence look like a
+ * derivation.)  Stock keeps the two consumers SEPARATE: prof12 = {EQ12, EQ14},
+ * prof13 = {EQ13, EQ14}.
+ *
+ * That collapse is fine while both pools are hardware-managed, and fatal once
+ * they are not: this chip's deep-queue enqueue CANNOT consume a CPU-pushed
+ * buffer - it needs a self-populated DRAM one (A/B-proven earlier on EQ12, see
+ * CA_NI_QM_EQ12_CFG2).  BOARD-MEASURED 2026-07-28: with EQ5/EQ6 flipped to
+ * cpu_eq=1, NO downstream frame of any kind reached the driver (not data, not
+ * OMCI control; 30-frame DS tap silent, zero OMCI cfg messages) while the LAN
+ * path and the fragment ladder were perfect - and 40 samples of rmu0_rx_hdr
+ * taken on the WORKING image with no LAN traffic in flight showed DS producing
+ * deep_q=1 admissions in 17 of 40.  So the deep queue lost its only DRAM-backed
+ * pool.  Giving it its own hardware-managed pool is what lets the direct punt
+ * be software-owned.
+ */
+#define CA_NI_RX_DQ_POOL_OFF		CA_NI_RX_CPU_DRAM_SIZE
+#define CA_NI_RX_DQ_POOL_PHYS \
+	(CA_NI_RX_CPU_POOL_PHYS + CA_NI_RX_DQ_POOL_OFF)
+/* One mapping covers both CPU pools AND the deep-queue pool, so the PA->VA
+ * math and the bounds check in cortina_ni_rx_frame() need no special case. */
+#define CA_NI_RX_MAP_SIZE \
+	(CA_NI_RX_CPU_DRAM_SIZE + CA_NI_RX_DQ_DRAM_SIZE)
+/* ★ NOT stock's CFG2 0x0000ff02.  Buffer-size index 2 is 512B on this die, and
+ * a 512B buffer cannot hold a full frame plus the 64B head and 384B tail the QM
+ * reserves - stock copes because it has a multi-buffer receive path
+ * (aal_l3qm_*_jumbo_buf, SOP..EOP chain) and we do not; our copy-break assumes
+ * one buffer per frame.  So index 4 = 2048B, matching the CPU pools, and
+ * cpu_eq=0 + refill_en=0 kept from stock. */
+#define CA_NI_RX_DQ_CFG2		0x0000ff04u
+/* The EQ profile the deep queue gets.  prof_sel is a 4-bit DIRECT index, so any
+ * of 0..15 is reachable; use 12 - stock's own deep-queue profile index, and the
+ * only choice that collides with nothing this driver writes.  Profiles 0..7 are
+ * filled wholesale by a loop in eq_init and 13 is the direct punt's, so a low
+ * index would need write-ordering care and would also change what profile means
+ * for dest ports 1..7, which we never program.  12 needs neither. */
+#define CA_NI_RX_DQ_PROFILE_SEL		CA_NI_RX_EQ12_PROFILE	/* = 12 */
+/* the deep-queue pool is hardware-managed, so BOTH halves of the profile point
+ * at it - there is no software-owned overflow reserve for this consumer */
+#define CA_NI_RX_DQ_PROFILE_VAL \
+	(FIELD_PREP(CA_NI_QM_EQ_PROF_EQP0, CA_NI_RX_EQ12_ID) | \
+	 FIELD_PREP(CA_NI_QM_EQ_PROF_EQP1, CA_NI_RX_EQ12_ID))
+static_assert(CA_NI_RX_EQ12_TOTAL_BUF * 2048u <= CA_NI_RX_DQ_DRAM_SIZE,
+	      "deep-queue pool: total_buf x buffer_size overflows its region");
+
+/* Ready-poll bound for the NAPI recycle path.  Deliberately far tighter than
+ * CA_NI_RX_PUSH_TIMEOUT_US: that one bounds the bring-up seed in process
+ * context, whereas this runs in softirq once per recycled buffer, so a whole
+ * batch at the generous bound would spin ~64 ms inside one poll.  A stuck gate
+ * must degrade (push_fail, pool shrinks, logged) rather than hang the CPU. */
+#define CA_NI_RX_PUSH_TIMEOUT_NAPI_US	20
+
+/* head_room_rest == head_room_first and tail_room_rest == tail_room_first in the
+ * value we program, so one window serves both the first and the continuation
+ * buffers (see CA_NI_RX_BUF_USABLE_END in cortina-ni.h).  Should they ever be
+ * programmed apart, the chain path must compute the first and continuation
+ * windows separately - this assert is the tripwire. */
+static_assert(CA_NI_QM_PKT_BUF_HEAD_UNITS * 16 == CA_NI_RX_BUF_HEADROOM,
+	      "pkt-buf head_room does not put HEADER_A at CA_NI_RX_HDRA_OFF");
+static_assert(CA_NI_RX_CHAIN_MAX_SEGS *
+	      (CA_NI_RX_BUF_USABLE_END(CA_NI_RX_CPU_POOL0_BUFSZ) -
+	       CA_NI_RX_FRAME_OFF) >= CA_NI_RX_CHAIN_MAX_LEN,
+	      "chain: MAX_SEGS cannot carry MAX_LEN out of a CPU-pool buffer");
+/* The shipped firmware hardcodes this same window as the literal 1600 in both of
+ * its receive polls; our derivation from the pkt-buf config must agree with it on
+ * the 2048-byte pools, and unlike the literal it stays correct if a pool is ever
+ * given a different buffer size - which is the point of the chain path. */
+static_assert(CA_NI_RX_BUF_USABLE_END(CA_NI_RX_CPU_POOL0_BUFSZ) -
+	      CA_NI_RX_BUF_HEADROOM == 1600,
+	      "CPU-pool usable window is not the firmware's 1600 bytes");
 
 static inline void __iomem *ni_base(struct cortina_ni *ni)
 {
@@ -234,6 +544,50 @@ static inline void __iomem *ni_base(struct cortina_ni *ni)
 static inline void ni_rmw(struct cortina_ni *ni, u32 off, u32 clr, u32 set)
 {
 	writel((readl(ni_base(ni) + off) & ~clr) | set, ni_base(ni) + off);
+}
+
+/* Which CPU pool a buffer belongs to: pool0 (EQ5) occupies the first
+ * POOL0_BYTES of the reserved region, pool1 (EQ6) the rest. */
+static inline u32 cortina_ni_rx_pool_eqid(struct cortina_ni *ni, u32 pa)
+{
+	u32 off = pa - lower_32_bits(ni->rx->cpu_dram_dma);
+
+	return off < CA_NI_RX_CPU_POOL0_BYTES ? CA_NI_RX_EQ_ID :
+					        CA_NI_RX_EQ_ID2;
+}
+
+/*
+ * Stage one 128-byte-aligned buffer PA into EQ pool <eqid> through the CPU
+ * push doorbell.  CA_NI_QM_CPU_PUSH_READY bit31 is a MANDATORY gate: a blind
+ * write while the shallow push stage is full back-pressures the AXI write and
+ * hangs the CPU, so the ready poll is bounded and a timeout is reported rather
+ * than spun on.  In the steady state the stage is empty and this costs one
+ * readl plus one writel.  Returns 0, or -EBUSY if no slot ever freed.
+ */
+/* @timeout_us bounds the mandatory ready poll.  It is a parameter, not the
+ * shared constant, because the two callers have very different budgets: the
+ * bring-up seed runs in process context and can afford the generous
+ * CA_NI_RX_PUSH_TIMEOUT_US, while the NAPI recycle runs in softirq and repeats
+ * this once per buffer - a whole batch at the generous bound would spin for
+ * tens of milliseconds inside the poll and trip the watchdog. */
+static int cortina_ni_rx_push_buf(struct cortina_ni *ni, u32 eqid, u32 pa,
+				  unsigned int timeout_us)
+{
+	void __iomem *rdy = ni_base(ni) +
+			    CA_NI_QM_CPU_PUSH_READY(CA_NI_RX_CPU_PORT);
+	unsigned int i;
+
+	for (i = 0; i < timeout_us; i++) {
+		if (readl(rdy) & CA_NI_QM_PUSH_READY) {
+			writel((pa & CA_NI_QM_PUSH_ADDR) |
+			       FIELD_PREP(CA_NI_QM_PUSH_EQID, eqid),
+			       ni_base(ni) +
+			       CA_NI_QM_CPU_PUSH_PADDR(CA_NI_RX_CPU_PORT));
+			return 0;
+		}
+		udelay(1);
+	}
+	return -EBUSY;
 }
 
 /* ------------------------------------------------------------------ */
@@ -249,7 +603,31 @@ static inline void ni_rmw(struct cortina_ni *ni, u32 off, u32 clr, u32 set)
  * (inactive climbed +1/frame, NAPI read 0xdeadbeef poison).  We back both pools
  * with the reserved DRAM region (rx->cpu_dram) and run copy-break: NAPI copies
  * each delivered frame out of its pool buffer into a fresh skb; the buffer
- * returns to the pool by the EPP-rdptr advance alone - no push path exists. */
+ * returns to the pool by the EPP-rdptr advance alone - no push path exists.
+ *
+ * ★★ 2026-07-27 THE PARAGRAPH ABOVE IS WRONG AND IS KEPT ONLY AS A WARNING.
+ * "Stock NEVER software-pushes" was concluded from reading CPU_PUSH_PADDR - a
+ * WRITE-ONLY doorbell - and finding zero.  A write-only register reads zero on
+ * a working system too, so that observation carried no information at all.  The
+ * vendor does push: aal_l3qm_set_cpu_push_paddr writes {pa[31:7]<<7 | eqid} to
+ * 0x63cc + cpu_port*8, batched once per NAPI poll.
+ *
+ * The cost of believing it was the IPv4 fragment defect.  With cpu_eq=0 the QM
+ * frees the bid at descriptor writeback, so the CPU never owns the buffer: a
+ * second frame arriving before NAPI drains lands on the SAME bid.  Measured
+ * directly - every frame at pa=09400800, fragment 1's descriptor (dlen=1530)
+ * resolving to a buffer already holding fragment 2 (hdra_pkt_size=570), two
+ * byte-identical copies of fragment 2 with one IP id => IPFRAG_DUP => the
+ * datagram never completes.  Longer bursts instead show the buffer changing
+ * under the copy, which completes reassembly with a payload that fails its
+ * checksum.  The vendor image reassembles every one on this same silicon.
+ *
+ * cpu_eq=1 removes the window rather than narrowing it: the QM cannot reclaim a
+ * buffer until we re-push it, which happens after skb_put_data.  The earlier
+ * attempt failed because it pushed dynamically allocated skb addresses, which
+ * lie outside the NE's DDR window; we push PAs from the same reserved region
+ * the RMU is provably writing to now.  Selectable: cpu_pool_push=0 restores the
+ * self-populating behaviour described above, defect included. */
 
 /* ------------------------------------------------------------------ */
 /* interrupt mask / ack                                                */
@@ -596,13 +974,342 @@ static noinline void cortina_ni_rx_stack_tap(struct cortina_ni *ni,
 			       DUMP_PREFIX_OFFSET, 16, 4, w, sizeof(w), false);
 }
 
+/* ------------------------------------------------------------------ */
+/* multi-buffer receive: the SOP..EOP descriptor chain                  */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Where a frame with this HEADER_A is delivered: the GPON WAN netdev, or NULL
+ * for the eth0 one.  A de-encapsulated data-GEM frame carries lspid = PON; once
+ * the DS data GEM is routed through the L3FE, a terminating or not-yet-offloaded
+ * frame reaches the CPU as lspid = L3_WAN instead, because STG0's LPB profile has
+ * already rewritten it.  Both are WAN-only lspids, so neither can steal a LAN
+ * frame.  A NULL return with *is_l3 untouched means "no WAN lspid"; a NULL return
+ * after a WAN lspid means no WAN netdev is registered yet, and both fall back to
+ * eth0 - which is what the single-buffer path did inline before this became the
+ * ONE copy of the decision shared with the chain path.
+ */
+static inline struct net_device *cortina_ni_rx_wan_dest(u32 hdra_lo, bool *is_l3)
+{
+	u32 lspid = FIELD_GET(CA_NI_HDRA_W1_LSPID, hdra_lo);
+	bool pon = (lspid == CA_NI_LSPID_PON);
+	bool l3 = (lspid == CA_NI_LSPID_L3_WAN) &&
+		  cortina_ni_hw_l3_fwd_active();
+
+	if (!pon && !l3)
+		return NULL;
+	*is_l3 = l3;
+	return READ_ONCE(cortina_ni_pon_wan_ndev);
+}
+
+/* what one descriptor of a chain contributes */
+struct ca_ni_chain_seg {
+	u32	off;		/* payload offset inside this buffer */
+	u32	len;		/* payload bytes to take from it */
+	u32	dlen_expect;	/* what this descriptor's own pkt_size should read */
+};
+
+enum ca_ni_chain_act {
+	CA_NI_CHAIN_OPEN,	/* SOP accepted, more segments expected */
+	CA_NI_CHAIN_APPEND,	/* continuation accepted, more expected */
+	CA_NI_CHAIN_DONE,	/* EOP accepted, the frame is complete */
+	/* ---- malformations; the caller drops the partial frame for each ---- */
+	CA_NI_CHAIN_ORPHAN,	/* continuation with no chain open on this voq */
+	CA_NI_CHAIN_BADTOTAL,	/* SOP pkt_size out of range, or no room in the window */
+	CA_NI_CHAIN_TOOLONG,	/* segment cap hit, or the segments overran total */
+	CA_NI_CHAIN_SHORT,	/* EOP with fewer bytes than pkt_size promised */
+};
+
+/*
+ * The chain state machine, as pure arithmetic: no skb, no MMIO, no netdev.  Given
+ * this descriptor's SOP/EOP bits, the SOP buffer's HEADER_A words, the usable
+ * window of the buffer and where a continuation's payload starts, decide what
+ * this segment contributes and whether the chain is still well formed.
+ *
+ * The caller must have dropped any previously held partial frame when @st->open
+ * is true and @sop is set - the SOP branch below re-initialises the accounting
+ * unconditionally, which is what bounds an unterminated chain: it cannot outlive
+ * the next frame that arrives on the same voq.
+ *
+ * Every malformation return leaves @st dirty on purpose; the caller resets it.
+ *
+ * ★ The arithmetic is the shipped firmware's, arrived at independently: it takes
+ * min(bytes still owed, 1600) per segment, with the first segment's window
+ * shortened by the 8- or 16-byte header block, and treats HEADER_A.pkt_size on
+ * the SOP buffer as the sole authority for the total.  Expressed here in terms of
+ * the buffer's usable window rather than a literal 1600, so it stays correct for
+ * a pool with a different buffer size - which is the reason this path exists.
+ *
+ * @out->dlen_expect is the byte count we derive for this segment, reported so the
+ * caller can record it beside what the descriptor actually said.  It is NOT used
+ * to decide anything: the firmware discards the per-segment descriptor length
+ * outright, so there is no evidence of what the hardware writes there.
+ */
+static enum ca_ni_chain_act
+ca_ni_chain_step(struct ca_ni_chain_state *st, bool sop, bool eop,
+		 u32 hdra_hi, u32 hdra_lo, u32 buf_end, u32 rest_off,
+		 struct ca_ni_chain_seg *out)
+{
+	u32 off, want, avail;
+
+	out->off = out->len = out->dlen_expect = 0;
+
+	if (sop) {
+		int total = FIELD_GET(CA_NI_HDRA_W1_PKT_SIZE, hdra_lo);
+
+		off = CA_NI_RX_FRAME_OFF;
+		if (hdra_hi & CA_NI_HDRA_W0_CPU_FLG) {
+			off += CA_NI_RX_HDR_CPU_LEN;
+			total -= CA_NI_RX_HDR_CPU_LEN;
+		}
+		if (total < (int)ETH_HLEN ||
+		    total > (int)CA_NI_RX_CHAIN_MAX_LEN || off >= buf_end)
+			return CA_NI_CHAIN_BADTOTAL;
+		st->total = total;
+		st->got = 0;
+		st->segs = 0;
+		st->open = true;
+	} else {
+		if (!st->open)
+			return CA_NI_CHAIN_ORPHAN;
+		off = rest_off;
+		if (off >= buf_end)
+			return CA_NI_CHAIN_BADTOTAL;
+	}
+
+	if (++st->segs > CA_NI_RX_CHAIN_MAX_SEGS)
+		return CA_NI_CHAIN_TOOLONG;
+
+	avail = buf_end - off;
+	want = st->total - st->got;
+	out->off = off;
+	out->len = min(want, avail);
+	out->dlen_expect = (off - CA_NI_RX_HDRA_OFF) + out->len;
+	st->got += out->len;
+
+	if (eop) {
+		if (st->got != st->total)
+			return CA_NI_CHAIN_SHORT;
+		/* the frame is complete, so this voq holds no chain any more.
+		 * Cleared HERE and not only in the caller: leaving it set would
+		 * make a delivered chain indistinguishable from an open one, so
+		 * the next continuation to arrive would be appended to a frame
+		 * that has already gone up the stack instead of being counted as
+		 * the orphan it is. */
+		st->open = false;
+		return CA_NI_CHAIN_DONE;
+	}
+	/*
+	 * Not the last segment, so it must have FILLED its window: if the frame
+	 * owes fewer bytes than this buffer can hold and yet more descriptors
+	 * are coming, pkt_size and the hardware have already disagreed.  This is
+	 * also the test that makes overrun impossible - st->got can never pass
+	 * st->total, so the skb allocated for st->total is never outgrown.
+	 */
+	if (out->len != avail)
+		return CA_NI_CHAIN_TOOLONG;
+	return sop ? CA_NI_CHAIN_OPEN : CA_NI_CHAIN_APPEND;
+}
+
+/* free a held partial frame WITHOUT touching the accounting (the SOP path has
+ * already re-initialised it for the new chain) */
+static void cortina_ni_rx_chain_free(struct cortina_ni_rx *rx,
+				     struct cortina_ni_rx_chain *ch)
+{
+	if (!ch->skb)
+		return;
+	dev_kfree_skb_any(ch->skb);
+	ch->skb = NULL;
+	rx->chain_abort++;
+}
+
+/* abandon a chain entirely: free the partial frame and clear the accounting */
+static void cortina_ni_rx_chain_reset(struct cortina_ni_rx *rx,
+				      struct cortina_ni_rx_chain *ch)
+{
+	cortina_ni_rx_chain_free(rx, ch);
+	memset(&ch->st, 0, sizeof(ch->st));
+}
+
+/*
+ * Consume one descriptor of a multi-buffer frame.  Reached only with rx_chain=1
+ * and only for a descriptor that is not a self-contained frame, so the
+ * single-buffer path is left alone.
+ *
+ * Returns the PA to recycle, ALWAYS - on delivery, on a malformation, on an
+ * allocation failure.  Every buffer of a chain is therefore handed back exactly
+ * once, because the caller collects one PA per descriptor and each segment is
+ * copied out before the batch push at the end of the poll: a buffer is free the
+ * moment its own segment has been copied, and nothing in a chain defers that.
+ */
+static noinline u32 cortina_ni_rx_chain_seg(struct cortina_ni *ni,
+					    unsigned int voq, u64 desc,
+					    const u8 *buf, u32 buf_end, u32 rpa)
+{
+	struct cortina_ni_rx *rx = ni->rx;
+	struct cortina_ni_rx_chain *ch = &rx->chain[voq];
+	struct net_device *ndev = rx->netdev;
+	u32 lo = lower_32_bits(desc);
+	bool sop = !!(lo & CA_NI_RX_DESC_SOP);
+	bool eop = !!(lo & CA_NI_RX_DESC_EOP);
+	u32 dlen = FIELD_GET(CA_NI_RX_DESC_LEN, desc);
+	u32 hdra_hi = 0, hdra_lo = 0;
+	struct ca_ni_chain_seg seg;
+	enum ca_ni_chain_act act;
+	struct net_device *wan;
+	bool is_l3 = false;
+
+	/* The headerless (sw_id != 0) format's chain geometry is unknown - its
+	 * frame starts at +0x10, inside the head_room the chain arithmetic is
+	 * built on, and no such descriptor has ever been observed on this board.
+	 * Refuse it rather than guess; a non-zero counter here is a finding. */
+	if (unlikely(FIELD_GET(CA_NI_RX_DESC_SWID, desc))) {
+		rx->chain_swid++;
+		ndev->stats.rx_errors++;
+		net_warn_ratelimited("%s: RX chain: headerless (sw_id) segment, geometry unknown - dropped\n",
+				     netdev_name(ndev));
+		return rpa;
+	}
+
+	if (sop) {
+		hdra_hi = get_unaligned_be32(buf + CA_NI_RX_HDRA_OFF);
+		hdra_lo = get_unaligned_be32(buf + CA_NI_RX_HDRA_OFF + 4);
+		rx->last_hdra = ((u64)hdra_hi << 32) | hdra_lo;
+		/* a chain still open here never got its EOP: drop the partial
+		 * frame and let this SOP start over */
+		if (unlikely(ch->st.open)) {
+			cortina_ni_rx_chain_free(rx, ch);
+			rx->chain_reopen++;
+			ndev->stats.rx_errors++;
+		}
+		ch->hdra_lo = hdra_lo;
+	}
+
+	act = ca_ni_chain_step(&ch->st, sop, eop, hdra_hi, hdra_lo, buf_end,
+			       rx->chain_rest_off, &seg);
+
+	switch (act) {
+	case CA_NI_CHAIN_OPEN:
+	case CA_NI_CHAIN_APPEND:
+	case CA_NI_CHAIN_DONE:
+		break;
+	case CA_NI_CHAIN_ORPHAN:
+		rx->chain_orphan++;
+		ndev->stats.rx_errors++;
+		net_warn_ratelimited("%s: RX chain: continuation with no chain open on voq %u (desc %016llx)\n",
+				     netdev_name(ndev), voq, desc);
+		return rpa;
+	case CA_NI_CHAIN_BADTOTAL:
+		rx->chain_badtotal++;
+		goto drop;
+	case CA_NI_CHAIN_TOOLONG:
+		rx->chain_toolong++;
+		goto drop;
+	case CA_NI_CHAIN_SHORT:
+		rx->chain_short++;
+		goto drop;
+	}
+
+	/*
+	 * ★ The per-segment descriptor pkt_size is RECORDED, not judged.
+	 *
+	 * The shipped firmware's chain reader discards it outright - it returns
+	 * only the low 32 bits of the continuation descriptor and never looks at
+	 * bits [45:32] - so there is no evidence of what the hardware puts there
+	 * for a segment, and a mismatch against our derived byte count would be
+	 * a claim, not a measurement.  Treating it as an error counter would
+	 * manufacture exactly the kind of witness that reads like a fault while
+	 * measuring nothing.
+	 *
+	 * So: store what each segment's descriptor actually reported, expose it
+	 * beside the value we derived, and let the FIRST chained frame on
+	 * hardware establish the convention.  chain_dlen_diff counts the
+	 * disagreements only so the /proc line can say whether there were any.
+	 */
+	if (ch->st.segs <= CA_NI_RX_CHAIN_MAX_SEGS) {
+		rx->chain_dlen_seen[ch->st.segs - 1] = dlen;
+		rx->chain_dlen_calc[ch->st.segs - 1] = seg.dlen_expect;
+	}
+	if (dlen != seg.dlen_expect)
+		rx->chain_dlen_diff++;
+
+	if (sop) {
+		/* ONE allocation per frame, sized from the SOP's pkt_size and
+		 * never grown - the arithmetic above cannot exceed it */
+		ch->skb = napi_alloc_skb(&rx->napi, ch->st.total);
+		if (unlikely(!ch->skb)) {
+			rx->drop_nobuf++;
+			ndev->stats.rx_dropped++;
+			memset(&ch->st, 0, sizeof(ch->st));
+			return rpa;
+		}
+	} else if (unlikely(!ch->skb)) {
+		/* accounting says a chain is open but the allocation failed
+		 * earlier: swallow the rest of it quietly */
+		if (eop)
+			memset(&ch->st, 0, sizeof(ch->st));
+		return rpa;
+	}
+
+	skb_put_data(ch->skb, buf + seg.off, seg.len);
+
+	if (act != CA_NI_CHAIN_DONE)
+		return rpa;
+
+	/* complete frame: same delivery decision as the single-buffer path.
+	 * A PON control frame is never chained (an OMCI PDU is tens of bytes),
+	 * so this path deliberately does not re-test the 0xfff1 link type. */
+	{
+		struct sk_buff *skb = ch->skb;
+		u32 segs = ch->st.segs;
+		/* the frame length must be taken BEFORE the skb is handed over:
+		 * eth_type_trans() pulls the Ethernet header off it and
+		 * napi_gro_receive() consumes it outright */
+		u32 flen = ch->st.total;
+
+		ch->skb = NULL;
+		memset(&ch->st, 0, sizeof(ch->st));
+		rx->chain_frames++;
+		rx->chain_segs += segs;
+		if (segs > rx->chain_max_segs)
+			rx->chain_max_segs = segs;
+		wan = cortina_ni_rx_wan_dest(ch->hdra_lo, &is_l3);
+		if (wan) {
+			if (is_l3)
+				rx->wan_l3_frames++;
+			else
+				rx->wan_frames++;
+			wan->stats.rx_packets++;
+			wan->stats.rx_bytes += flen;
+			skb->protocol = eth_type_trans(skb, wan);
+			napi_gro_receive(&rx->napi, skb);
+			return rpa;
+		}
+		rx->frames++;
+		rx->bytes += flen;
+		ndev->stats.rx_packets++;
+		ndev->stats.rx_bytes += flen;
+		skb->protocol = eth_type_trans(skb, ndev);
+		napi_gro_receive(&rx->napi, skb);
+	}
+	return rpa;
+
+drop:
+	ndev->stats.rx_errors++;
+	net_warn_ratelimited("%s: RX chain: malformed (act %d, segs %u got %u of %u) - partial frame dropped\n",
+			     netdev_name(ndev), act, ch->st.segs, ch->st.got,
+			     ch->st.total);
+	cortina_ni_rx_chain_reset(rx, ch);
+	return rpa;
+}
+
 /* consume one CPU-EPP descriptor.  The frame sits in a software-populated DRAM buffer
  * inside our coherent CPU-pool region; copy it into a fresh skb and deliver, then
  * RE-PUSH that buffer's PA back to its EQ free-list (copy-break recycle).  cpu_eq=0
  * pools are NOT hardware-recycled - the vendor refills them by software push (stock
  * ca_ni_refill_eq_buf_pool), so every buffer we consume must be pushed back or the
  * free-list drains and RMU0 stops admitting. */
-static void cortina_ni_rx_frame(struct cortina_ni *ni, u64 desc)
+static u32 cortina_ni_rx_frame(struct cortina_ni *ni, unsigned int voq, u64 desc)
 {
 	struct cortina_ni_rx *rx = ni->rx;
 	struct net_device *ndev = rx->netdev;
@@ -611,6 +1318,7 @@ static void cortina_ni_rx_frame(struct cortina_ni *ni, u64 desc)
 	u32 swid = FIELD_GET(CA_NI_RX_DESC_SWID, desc);
 	u32 base = lower_32_bits(rx->cpu_dram_dma);
 	u32 hdra_hi = 0, hdra_lo = 0, off_in_region, buf_max;
+	u32 rpa;	/* the PA to hand back, or 0 if this buffer is not ours */
 	struct sk_buff *skb;
 	const u8 *buf;
 	unsigned int off;
@@ -618,29 +1326,62 @@ static void cortina_ni_rx_frame(struct cortina_ni *ni, u64 desc)
 
 	rx->last_desc = desc;
 
-	/* bufPA (128B-aligned, low 7 bits are flags) must land inside our CPU pool */
-	if (unlikely(pa < base || pa >= base + CA_NI_RX_CPU_DRAM_SIZE)) {
+	/* bufPA (128B-aligned, low 7 bits are flags) must land inside the mapped
+	 * window: the two CPU pools, then the deep-queue pool after them */
+	if (unlikely(pa < base || pa >= base + CA_NI_RX_MAP_SIZE)) {
 		rx->drop_badpa++;
 		ndev->stats.rx_errors++;
 		net_err_ratelimited("%s: RX desc %016llx: PA outside CPU pool\n",
 				    netdev_name(ndev), desc);
-		return;		/* unknown PA: cannot safely recycle it */
+		return 0;	/* unknown PA: cannot safely recycle it */
 	}
 	off_in_region = pa - base;
 	buf = (const u8 *)rx->cpu_dram + off_in_region;
-	/* one buffer's span: EQ5 (pool0) below POOL0_BYTES, EQ6 (pool1) above.
-	 * No recycle bookkeeping: the self-populating pool reclaims the bid when
-	 * cortina_ni_rx_poll_voq advances the EPP read pointer. */
-	if (off_in_region < CA_NI_RX_CPU_POOL0_BYTES)
-		buf_max = CA_NI_RX_CPU_POOL0_BUFSZ;
-	else
-		buf_max = CA_NI_RX_CPU_POOL1_BUFSZ;
+	/*
+	 * One buffer's span, and who owns it.  EQ5 (pool0) below POOL0_BYTES,
+	 * EQ6 (pool1) above it, and the DEEP-QUEUE pool (EQ12) above both.
+	 *
+	 * Under cpu_pool_push the caller returns a CPU-pool PA to its free list
+	 * once the frame has been copied out - that ownership interval is what
+	 * stops the next frame landing on top of this one.  ★ The deep-queue
+	 * pool is deliberately hardware-managed (this chip's deep-queue enqueue
+	 * cannot consume a pushed buffer), so its buffers are NOT ours to hand
+	 * back: pushing one into a CPU pool's free list would put the same
+	 * buffer in two allocators at once and corrupt both.  rpa = 0 for those.
+	 */
+	/* ★ buf_max is the end of the buffer's USABLE PAYLOAD WINDOW, not the
+	 * buffer size: the QM reserves CA_NI_RX_BUF_TAILROOM at the back and the
+	 * frame DMA never writes there, so the 384 bytes this used to allow were
+	 * memory the hardware had not written.  See CA_NI_RX_BUF_USABLE_END. */
+	if (off_in_region < CA_NI_RX_CPU_POOL0_BYTES) {
+		buf_max = CA_NI_RX_BUF_USABLE_END(CA_NI_RX_CPU_POOL0_BUFSZ);
+		rpa = pa;
+	} else if (off_in_region < CA_NI_RX_DQ_POOL_OFF) {
+		buf_max = CA_NI_RX_BUF_USABLE_END(CA_NI_RX_CPU_POOL1_BUFSZ);
+		rpa = pa;
+	} else {
+		/* DQ pool, same 2048B buffers */
+		buf_max = CA_NI_RX_BUF_USABLE_END(CA_NI_RX_CPU_POOL0_BUFSZ);
+		rpa = 0;				/* hardware-managed */
+		rx->dq_frames++;
+	}
+
+	/* ★ multi-buffer receive (rx_chain, default off).  A descriptor that is
+	 * not a self-contained frame - SOP without EOP, or neither - belongs to a
+	 * chain.  The test short-circuits on the parameter, so with the feature
+	 * disabled EOP is not even read and the descriptor is treated exactly as
+	 * it was before: a SOP is delivered short, a continuation counted nosop. */
+	if (unlikely(rx_chain &&
+		     (lower_32_bits(desc) & (CA_NI_RX_DESC_SOP |
+					     CA_NI_RX_DESC_EOP)) !=
+		     (CA_NI_RX_DESC_SOP | CA_NI_RX_DESC_EOP)))
+		return cortina_ni_rx_chain_seg(ni, voq, desc, buf, buf_max, rpa);
 
 	if (unlikely(!(lower_32_bits(desc) & CA_NI_RX_DESC_SOP))) {
 		/* SOP-less descriptor = jumbo continuation or desync; drop */
 		rx->drop_nosop++;
 		ndev->stats.rx_errors++;
-		return;
+		return rpa;
 	}
 
 	if (likely(!swid)) {
@@ -652,6 +1393,28 @@ static void cortina_ni_rx_frame(struct cortina_ni *ni, u64 desc)
 		rx->last_hdra = ((u64)hdra_hi << 32) | hdra_lo;
 
 		len = FIELD_GET(CA_NI_HDRA_W1_PKT_SIZE, hdra_lo);
+
+		/* ★ Staleness witness, free: the descriptor's own pktlen and
+		 * HEADER_A.pkt_size describe the SAME frame from two
+		 * INDEPENDENT places - the ring, written by the EPP writeback
+		 * engine, and the buffer, written by the RMU frame DMA - and on
+		 * every good frame differ by exactly the 8-byte HEADER_A
+		 * (pktlen counts from buf+0x40, pkt_size from buf+0x48;
+		 * board-measured 414/406, 1530/1522, 578/570).  A mismatch
+		 * means the buffer no longer holds the frame this descriptor
+		 * was written for - the exact condition the ownership fix
+		 * removes, so this counter must read 0.  Both values are
+		 * already in registers here, so the check costs one compare.
+		 * Counted and logged, NOT dropped: dropping would turn a
+		 * duplicate into a hole, the datagram fails either way, and a
+		 * silent behaviour change would muddy the A/B. */
+		if (unlikely(dlen != len + (CA_NI_RX_FRAME_OFF -
+					    CA_NI_RX_HDRA_OFF))) {
+			rx->stale_buf++;
+			net_warn_ratelimited("%s: RX stale buffer: desc pktlen=%u vs HEADER_A.pkt_size=%d at pa=%08x (buffer reused before the copy)\n",
+					     netdev_name(ndev), dlen, len, pa);
+		}
+
 		off = CA_NI_RX_FRAME_OFF;
 		if (hdra_hi & CA_NI_HDRA_W0_CPU_FLG) {
 			off += CA_NI_RX_HDR_CPU_LEN;
@@ -679,10 +1442,27 @@ static void cortina_ni_rx_frame(struct cortina_ni *ni, u64 desc)
 
 	if (unlikely(len < (int)ETH_HLEN || off + len > buf_max)) {
 		rx->drop_len++;
+		/* ★ split, because the two causes mean opposite things and the
+		 * aggregate cannot tell them apart: a runt is a bad frame, while
+		 * an oversize one is a good frame that does not fit a buffer's
+		 * usable window and needs rx_chain.  Distinguishing them is what
+		 * makes the buffer-window fix measurable rather than a claim. */
+		if (len < (int)ETH_HLEN)
+			rx->drop_runt++;
+		else
+			rx->drop_oversize++;
 		ndev->stats.rx_length_errors++;
 		ndev->stats.rx_errors++;
-		return;
+		return rpa;
 	}
+
+	/* ★ TEMPORARY DIAGNOSTIC (rx_ds_tap) - revert with rx_frag_tap.  Sampled
+	 * HERE, ahead of the PON-control and WAN-netdev branches below, both of
+	 * which return early: a downstream frame must be visible to the tap
+	 * whichever branch it goes on to take. */
+	if (unlikely(rx_ds_tap > 0 && !swid))
+		cortina_ni_rx_ds_tap(ndev, buf, off, len, desc, pa, dlen,
+				     hdra_hi, hdra_lo);
 
 	/*
 	 * DS-WAN delivery spy (rx_debug): a DHCP frame (UDP src/dst 67/68) is
@@ -778,7 +1558,7 @@ static void cortina_ni_rx_frame(struct cortina_ni *ni, u64 desc)
 		rx->pon_frames++;
 		if (fn && len > 16)
 			fn(buf + off + 16, len - 16);
-		return;
+		return rpa;
 	}
 
 	/*
@@ -799,44 +1579,46 @@ static void cortina_ni_rx_frame(struct cortina_ni *ni, u64 desc)
 	 * engine so gate-off behaviour is byte-identical.
 	 */
 	if (unlikely(!swid)) {
-		u32 lspid = FIELD_GET(CA_NI_HDRA_W1_LSPID, hdra_lo);
-		bool is_pon = (lspid == CA_NI_LSPID_PON);
-		bool is_l3wan = (lspid == CA_NI_LSPID_L3_WAN) &&
-				cortina_ni_hw_l3_fwd_active();
+		/* ONE copy of this decision, shared with the chain path's
+		 * completion handler - see cortina_ni_rx_wan_dest() */
+		bool is_l3wan = false;
+		struct net_device *wan = cortina_ni_rx_wan_dest(hdra_lo,
+								&is_l3wan);
 
-		if (is_pon || is_l3wan) {
-			struct net_device *wan =
-				READ_ONCE(cortina_ni_pon_wan_ndev);
-
-			if (wan) {
-				if (is_l3wan)
-					rx->wan_l3_frames++;
-				else
-					rx->wan_frames++;
-				skb = napi_alloc_skb(&rx->napi, len);
-				if (unlikely(!skb)) {
-					rx->drop_nobuf++;
-					wan->stats.rx_dropped++;
-					return;
-				}
-				skb_put_data(skb, buf + off, len);
-				skb->protocol = eth_type_trans(skb, wan);
-				napi_gro_receive(&rx->napi, skb);
-				wan->stats.rx_packets++;
-				wan->stats.rx_bytes += len;
-				return;
+		if (wan) {
+			if (is_l3wan)
+				rx->wan_l3_frames++;
+			else
+				rx->wan_frames++;
+			skb = napi_alloc_skb(&rx->napi, len);
+			if (unlikely(!skb)) {
+				rx->drop_nobuf++;
+				wan->stats.rx_dropped++;
+				return rpa;
 			}
-			/* no WAN netdev registered: fall through to eth0 */
+			skb_put_data(skb, buf + off, len);
+			skb->protocol = eth_type_trans(skb, wan);
+			napi_gro_receive(&rx->napi, skb);
+			wan->stats.rx_packets++;
+			wan->stats.rx_bytes += len;
+			return rpa;
 		}
+		/* no WAN netdev registered: fall through to eth0 */
 	}
 
 	skb = napi_alloc_skb(&rx->napi, len);
 	if (unlikely(!skb)) {
 		rx->drop_nobuf++;
 		ndev->stats.rx_dropped++;
-		return;
+		return rpa;
 	}
 	skb_put_data(skb, buf + off, len);
+	/* ★ TEMPORARY DIAGNOSTIC (rx_frag_tap) - revert with the params above.
+	 * Must run before eth_type_trans(), which pulls the Ethernet header off
+	 * the skb; skb->data still points at the copied frame here. */
+	if (unlikely(rx_frag_tap > 0))
+		cortina_ni_rx_frag_tap(ndev, buf, off, len, desc, pa, dlen,
+				       hdra_lo, skb->data);
 	skb->protocol = eth_type_trans(skb, ndev);
 	napi_gro_receive(&rx->napi, skb);
 
@@ -844,6 +1626,106 @@ static void cortina_ni_rx_frame(struct cortina_ni *ni, u64 desc)
 	rx->bytes += len;
 	ndev->stats.rx_packets++;
 	ndev->stats.rx_bytes += len;
+	return rpa;
+}
+
+/* ★ TEMPORARY DIAGNOSTIC (rx_frag_tap) - revert with the module params above.
+ * noinline and called under an unlikely() guard so the disabled cost is one
+ * global load and a predicted-not-taken branch on the 1 Gbps hot path.
+ * Wire bytes are read with explicit byte math (the stack must stay
+ * endianness-agnostic), never a struct cast. */
+static noinline void cortina_ni_rx_frag_tap(struct net_device *ndev,
+					    const u8 *buf, u32 off, int len,
+					    u64 desc, u32 pa, u32 dlen,
+					    u32 hdra_lo, const u8 *copied)
+{
+	static atomic_t seen = ATOMIC_INIT(0);
+	const u8 *f = buf + off;
+	u32 ip_id, frag, tot_len, crc_skb, crc_reread, hdra_lo2;
+	const u8 *ip;
+	int n;
+
+	if (len < ETH_HLEN + 20)
+		return;
+	/* plain Ethernet/IPv4 only: the ladder is a ping, no tag expected */
+	if (f[12] != 0x08 || f[13] != 0x00)
+		return;
+	ip = f + ETH_HLEN;
+	if ((ip[0] >> 4) != 4)
+		return;
+	frag = ((u32)ip[6] << 8) | ip[7];
+	/* a fragment carries a non-zero offset or the more-fragments bit */
+	if (!(frag & 0x3fff) && !(frag & 0x2000))
+		return;
+
+	n = atomic_inc_return(&seen);
+	if (n > rx_frag_tap)
+		return;
+
+	ip_id = ((u32)ip[4] << 8) | ip[5];
+	tot_len = ((u32)ip[2] << 8) | ip[3];
+
+	/* the bytes as we handed them to the stack, then the same range read
+	 * back out of the pool buffer after a delay */
+	crc_skb = crc32(0, copied, len);
+	if (rx_frag_tap_us > 0)
+		udelay(rx_frag_tap_us);
+	crc_reread = crc32(0, buf + off, len);
+	hdra_lo2 = get_unaligned_be32(buf + CA_NI_RX_HDRA_OFF + 4);
+
+	netdev_info(ndev,
+		    "frag_tap#%d pa=%08x eqid=%u sop=%u eop=%u csum_err=%u dlen=%u hdra_pkt_size=%u len=%d off=%u ip{id=%04x frag=%04x tot_len=%u} crc=%08x/%08x %s%s\n",
+		    n, pa, (u32)(desc & CA_NI_RX_DESC_EQID),
+		    !!(desc & CA_NI_RX_DESC_SOP), !!(desc & CA_NI_RX_DESC_EOP),
+		    !!(desc & CA_NI_RX_DESC_CSUM_ERR), dlen,
+		    (u32)FIELD_GET(CA_NI_HDRA_W1_PKT_SIZE, hdra_lo),
+		    len, off, ip_id, frag, tot_len,
+		    crc_skb, crc_reread,
+		    crc_skb == crc_reread ? "STABLE" : "CHANGED-AFTER-COPY",
+		    hdra_lo2 != hdra_lo ? " HDRA-ALSO-CHANGED" : "");
+}
+
+/*
+ * ★ TEMPORARY DIAGNOSTIC (rx_ds_tap) - revert with rx_frag_tap.  Identity only:
+ * which pool the buffer came from (the descriptor's OWN eqid, not one derived
+ * from the address), the two independent length sources, and the HEADER_A
+ * routing fields that decide which delivery branch this frame is about to take.
+ * No re-read and no delay - the question here is arrival, not stability.
+ */
+static noinline void cortina_ni_rx_ds_tap(struct net_device *ndev,
+					  const u8 *buf, u32 off, int len,
+					  u64 desc, u32 pa, u32 dlen,
+					  u32 hdra_hi, u32 hdra_lo)
+{
+	static atomic_t seen = ATOMIC_INIT(0);
+	u32 lspid = FIELD_GET(CA_NI_HDRA_W1_LSPID, hdra_lo);
+	u32 ldpid = FIELD_GET(CA_NI_HDRA_W1_LDPID, hdra_lo);
+	u32 etype;
+	int n;
+
+	/* downstream = the PON source lspid, or the L3_WAN ldpid the HW-L3 DS
+	 * route stamps.  Everything else (the LAN lspids) is not our question. */
+	if (lspid != CA_NI_LSPID_PON && ldpid != CA_NI_LSPID_L3_WAN)
+		return;
+
+	n = atomic_inc_return(&seen);
+	if (n > rx_ds_tap)
+		return;
+
+	/* 0xfff1 = the vendor PON link-type marker on a DS OMCI control frame;
+	 * anything else here is a de-encapsulated data-GEM frame */
+	etype = ((u32)buf[off + 12] << 8) | buf[off + 13];
+
+	netdev_info(ndev,
+		    "ds_tap#%d pa=%08x eqid=%u sop=%u eop=%u csum_err=%u dlen=%u hdra_pkt_size=%u len=%d off=%u lspid=%u ldpid=0x%02x cpu_flg=%u deep_q=%u etype=%04x %s\n",
+		    n, pa, (u32)(desc & CA_NI_RX_DESC_EQID),
+		    !!(desc & CA_NI_RX_DESC_SOP), !!(desc & CA_NI_RX_DESC_EOP),
+		    !!(desc & CA_NI_RX_DESC_CSUM_ERR), dlen,
+		    (u32)FIELD_GET(CA_NI_HDRA_W1_PKT_SIZE, hdra_lo),
+		    len, off, lspid, ldpid,
+		    !!(hdra_hi & CA_NI_HDRA_W0_CPU_FLG),
+		    !!(hdra_hi & CA_NI_HDRA_W0_DEEP_Q), etype,
+		    etype == 0xfff1 ? "OMCI-control" : "data/punt");
 }
 
 /* drain one voq's CPU-EPP ring; returns work done, updates rx->rptr[voq] */
@@ -854,15 +1736,30 @@ static int cortina_ni_rx_poll_voq(struct cortina_ni *ni, unsigned int voq,
 	__le64 *vring = rx->ring +
 		(rx_ring_hi ? CA_NI_RX_RING_HI_OFFSET / sizeof(__le64) : 0) +
 		voq * CA_NI_RX_RING_SLOTS_PER_VOQ;
+	u32 recycle[CA_NI_RX_RECYCLE_MAX];
+	unsigned int nrecycle = 0, i;
 	u32 rptr = rx->rptr[voq];
 	u32 wptr;
 	int work = 0;
+
+	/* never consume more buffers in one poll than we can hand back: an
+	 * overflow would leak them out of the pool until RX starves.  This clamp
+	 * is also why a chain must be able to span two polls: it can cut one in
+	 * half, so the per-voq chain state persists rather than the poll spinning
+	 * on for the rest of the segments.  (The shipped firmware takes the other
+	 * route - it keeps chain state on the stack and walks the ring for the
+	 * continuations without re-reading the write pointer or checking
+	 * availability, so it can read descriptors the hardware has not written
+	 * yet.  Persisting the state is both bounded and cheaper.) */
+	if (budget > CA_NI_RX_RECYCLE_MAX)
+		budget = CA_NI_RX_RECYCLE_MAX;
 
 	wptr = cortina_ni_rx_wptr_voq(ni, voq);
 	dma_rmb();	/* descriptor reads after the pointer read */
 
 	while (work < budget) {
 		u64 desc;
+		u32 pa;
 
 		if (rptr == wptr) {
 			wptr = cortina_ni_rx_wptr_voq(ni, voq);
@@ -876,7 +1773,19 @@ static int cortina_ni_rx_poll_voq(struct cortina_ni *ni, unsigned int voq,
 		rptr = (rptr + CA_NI_RX_DESC_SIZE) & (CA_NI_RX_RING_BYTES - 1);
 		work++;
 
-		cortina_ni_rx_frame(ni, desc);
+		pa = cortina_ni_rx_frame(ni, voq, desc);
+		if (cpu_pool_push && pa)
+			/* Return the buffer to the pool the HARDWARE says it
+			 * came from - desc[3:0] - not one derived from its
+			 * address.  Deriving it assumes a pool layout instead
+			 * of reading the one fact the descriptor already
+			 * carries, and every descriptor observed on this board
+			 * reports eqid 0xF while the driver only configures
+			 * EQ5/EQ6, so the two disagree.  Packed exactly as the
+			 * doorbell encodes it: the PA is 128-byte aligned, so
+			 * the low nibble is free for the eqid. */
+			recycle[nrecycle++] = (pa & CA_NI_QM_PUSH_ADDR) |
+					      (u32)(desc & CA_NI_RX_DESC_EQID);
 	}
 
 	dma_wmb();	/* stock: dmb oshst before the rdptr store */
@@ -884,6 +1793,26 @@ static int cortina_ni_rx_poll_voq(struct cortina_ni *ni, unsigned int voq,
 	       CA_NI_QM_EPP64_RDPTR(CA_NI_RX_CPU_PORT, voq));
 	rx->rptr[voq] = rptr;
 	rx->voq_frames[voq] += work;	/* spy: flow→voq spread (order check) */
+
+	/*
+	 * Return the buffers we have finished with, one batch per poll (the
+	 * vendor's ca_ni_alloc_scatter_refill mode-3 batch, after the read
+	 * pointer).  ORDER IS THE WHOLE POINT: every frame above has already
+	 * been copied into its skb, so from admission until this loop the
+	 * buffer belongs to the CPU and the QM cannot hand it to an incoming
+	 * frame.  That interval is what the hardware-managed pool never had.
+	 */
+	for (i = 0; i < nrecycle; i++) {
+		if (unlikely(cortina_ni_rx_push_buf(ni,
+				recycle[i] & CA_NI_QM_PUSH_EQID,
+				recycle[i],
+				CA_NI_RX_PUSH_TIMEOUT_NAPI_US))) {
+			rx->push_fail++;
+			net_err_ratelimited("%s: RX pool push timeout for pa=%08x - buffer lost, pool will shrink\n",
+					    netdev_name(rx->netdev),
+					    recycle[i]);
+		}
+	}
 	return work;
 }
 
@@ -3061,6 +3990,72 @@ static void cortina_ni_rx_eq_cfg_pool(struct cortina_ni *ni, unsigned int eqid,
 	writel(0, ni_base(ni) + CA_NI_QM_CFG4_EQ(eqid));
 }
 
+/*
+ * Hand the software-owned CPU pools their buffers (cpu_pool_push only).
+ *
+ * MUST run AFTER the EQ commit AND after the RMU0 RX master is enabled: the
+ * CPU push stage is only a few entries deep and does not drain until then, so
+ * seeding any earlier stalls on the ready gate (see CA_NI_QM_CPU_PUSH_READY).
+ *
+ * The PAs are the same 2048-byte-strided addresses inside the reserved region
+ * that the hardware-managed pool used, so cortina_ni_rx_frame()'s PA->VA math
+ * and its bounds check need no change.  This is also the one difference from
+ * the earlier cpu_eq=1 attempt, which pushed dynamically allocated skb
+ * addresses: those land outside the NE's DDR window, so the RMU never DMA'd
+ * into them (every frame arrived on a bid whose PA matched nothing and NAPI
+ * read poison).  These PAs are the window the RMU is provably writing to right
+ * now - drop_badpa is 0 and the live descriptors name this region.
+ */
+static int cortina_ni_rx_push_seed(struct cortina_ni *ni)
+{
+	/* nbufs MUST equal the total_buf each pool was configured with (the same
+	 * constants cortina_ni_rx_eq_init passes to CFG1) - see the note at
+	 * CA_NI_RX_PUSH_SEED_MIN. */
+	static const struct {
+		u32 eqid, base_off, bufsz, nbufs;
+	} pools[] = {
+		{ CA_NI_RX_EQ_ID,  0,
+		  CA_NI_RX_CPU_POOL0_BUFSZ, CA_NI_RX_EQ_TOTAL_BUF },
+		{ CA_NI_RX_EQ_ID2, CA_NI_RX_CPU_POOL0_BYTES,
+		  CA_NI_RX_CPU_POOL1_BUFSZ, CA_NI_RX_EQ2_TOTAL_BUF },
+	};
+	unsigned int p, i, want = 0, done = 0;
+	int ret = 0;
+
+	for (p = 0; p < ARRAY_SIZE(pools); p++)
+		want += pools[p].nbufs;
+
+	for (p = 0; p < ARRAY_SIZE(pools) && !ret; p++) {
+		for (i = 0; i < pools[p].nbufs; i++) {
+			u32 pa = CA_NI_RX_CPU_POOL_PHYS + pools[p].base_off +
+				 i * pools[p].bufsz;
+
+			ret = cortina_ni_rx_push_buf(ni, pools[p].eqid, pa,
+						     CA_NI_RX_PUSH_TIMEOUT_US);
+			if (ret)
+				break;
+			done++;
+		}
+	}
+
+	if (done < CA_NI_RX_PUSH_SEED_MIN) {
+		dev_err(ni->dev,
+			"RX: CPU pool seed FAILED - staged only %u of %u buffers (push stage never freed a slot).  RX would starve; boot with cortina_ni_rx.cpu_pool_push=0 to fall back to the hardware-managed pool.\n",
+			done, want);
+		return -EBUSY;
+	}
+	if (ret)
+		dev_warn(ni->dev,
+			 "RX: CPU pool seed SHORT - staged %u of %u buffers; the pools will report an inactive-bid shortfall\n",
+			 done, want);
+	else
+		dev_info(ni->dev,
+			 "RX: CPU pool seeded %u software-owned buffers (EQ%u=%u + EQ%u=%u, = CFG1.total_buf; expect inactive=0 ready=0)\n",
+			 done, CA_NI_RX_EQ_ID, CA_NI_RX_EQ_TOTAL_BUF,
+			 CA_NI_RX_EQ_ID2, CA_NI_RX_EQ2_TOTAL_BUF);
+	return 0;
+}
+
 /* Log QM_PHY_PORT_STS with the handshake bits decoded (all should climb from
  * 0 toward the 0xa5ffffff default as the NI/TE/ES/AXI blocks come up). */
 static void cortina_ni_rx_log_qm_sts(struct cortina_ni *ni, const char *stage)
@@ -3275,6 +4270,7 @@ static void __maybe_unused cortina_ni_rx_match_stock_qm(struct cortina_ni *ni)
 static int cortina_ni_rx_eq_init(struct cortina_ni *ni)
 {
 	struct cortina_ni_rx *rx = ni->rx;
+	u32 cfg0_p0, cfg0_p1, cfg2_p0, cfg2_p1;
 	u32 sts;
 	int i, ret;
 
@@ -3322,19 +4318,118 @@ static int cortina_ni_rx_eq_init(struct cortina_ni *ni)
 	 * (32-bit pool PA, axi_top_bit 0).
 	 * Target values: EQ5 CFG0@0x62ac=0x09400001 CFG1=0x02001200 CFG2=0x0000ff04;
 	 *                EQ6 CFG0@0x62c0=0x09500001 CFG1=0x020017dc CFG2=0x0000ff04. */
-	cortina_ni_rx_eq_cfg_pool(ni, CA_NI_RX_EQ_ID,
-				  (CA_NI_RX_CPU_POOL_PHYS &
-				   CA_NI_QM_CFG0_PHY_ADDR_START) |
-				  CA_NI_QM_CFG0_EQ_EN,
+	/*
+	 * ★★★ 2026-07-27 buffer-ownership fix (cpu_pool_push, currently OFF).
+	 * cpu_eq=1 makes each buffer software-owned: the QM hands it out once
+	 * and cannot take it back until the driver re-pushes it, which is the
+	 * interval the copy-break needs and the hardware-managed pool never
+	 * provided.  ONLY CFG2 differs between the two models.
+	 *
+	 * ★ CFG0.phy_addr_start is now kept at the real region base in BOTH
+	 * models.  A first cut zeroed it under cpu_pool_push, on the reasoning
+	 * that a non-zero base would leave the QM self-populating the very bids
+	 * we push and hand the same buffer out twice.  That reasoning rested on
+	 * an UNTIERED comment ("0 for SW-push pools" at CA_NI_QM_CFG0_PHY_ADDR_
+	 * START) plus an inference of mine - neither is a measurement, and if
+	 * the QM also uses that base to map or validate a PUSHED PA then zeroing
+	 * it breaks buffer delivery for some consumers and not others.  That is
+	 * the shape of the open DS-punt regression, so restoring the base is the
+	 * discriminator: if the WAN downstream punt returns, the zeroing was the
+	 * cause; if stale_buf starts climbing again, the double-population risk
+	 * was real and the zeroing was right for the wrong reason.
+	 */
+	if (cpu_pool_push) {
+		/* ★ A software-owned pool carries NO base: the QM maps bid n only
+		 * for a pool it populates itself, and a pushed buffer arrives with
+		 * its own full address.  Leaving a base here would have the QM
+		 * self-populate the very bids we push.  This is what stock does -
+		 * its CPU pools write a literal 1 (eq_en alone, no address field)
+		 * while every hardware-managed pool writes a real base, and live
+		 * stock reads cfg0=0x00000001 on all three of its cpu_eq=1 pools.
+		 * An earlier revision here kept the real base on an untiered
+		 * comment plus an inference; the binary settles it. */
+		/* ★ REVERTED 2026-07-28: keep the REAL base here too.  Stock does
+		 * write a bare eq_en (cfg0=0x00000001) on its cpu_eq=1 pools, and
+		 * that is well evidenced - but shipping it here cost the 2.4 GHz
+		 * radio: the case that proves the WiFi LED pad is routed went
+		 * PASS -> FAIL across exactly this change, phy1 came up with
+		 * txpower 0.00 dBm and never beaconed, and only the 5 GHz AP
+		 * reached the air.  A zero base points the QM's mapping at
+		 * physical address 0, so anything that still self-populates writes
+		 * over low memory.  We have no defect that the alignment fixes, so
+		 * it is not worth a regression: the real base is what the working
+		 * configuration was verified with (fragments 150/150, WAN up,
+		 * both radios on air). */
+		cfg0_p0 = (CA_NI_RX_CPU_POOL_PHYS &
+			   CA_NI_QM_CFG0_PHY_ADDR_START) | CA_NI_QM_CFG0_EQ_EN;
+		cfg0_p1 = ((CA_NI_RX_CPU_POOL_PHYS + CA_NI_RX_CPU_POOL0_BYTES) &
+			   CA_NI_QM_CFG0_PHY_ADDR_START) | CA_NI_QM_CFG0_EQ_EN;
+		cfg2_p0 = CA_NI_QM_EQ13_CFG2 | CA_NI_QM_CFG2_CPU_EQ;
+		cfg2_p1 = CA_NI_QM_EQ14_CFG2 | CA_NI_QM_CFG2_CPU_EQ;
+	} else {
+		cfg0_p0 = (CA_NI_RX_CPU_POOL_PHYS &
+			   CA_NI_QM_CFG0_PHY_ADDR_START) | CA_NI_QM_CFG0_EQ_EN;
+		cfg0_p1 = ((CA_NI_RX_CPU_POOL_PHYS + CA_NI_RX_CPU_POOL0_BYTES) &
+			   CA_NI_QM_CFG0_PHY_ADDR_START) | CA_NI_QM_CFG0_EQ_EN;
+		cfg2_p0 = CA_NI_QM_EQ13_CFG2;
+		cfg2_p1 = CA_NI_QM_EQ14_CFG2;
+	}
+	cortina_ni_rx_eq_cfg_pool(ni, CA_NI_RX_EQ_ID, cfg0_p0,
 				  CA_NI_RX_EQ_BID_START, CA_NI_RX_EQ_TOTAL_BUF,
-				  CA_NI_QM_EQ13_CFG2);
-	cortina_ni_rx_eq_cfg_pool(ni, CA_NI_RX_EQ_ID2,
-				  ((CA_NI_RX_CPU_POOL_PHYS +
-				    CA_NI_RX_CPU_POOL0_BYTES) &
-				   CA_NI_QM_CFG0_PHY_ADDR_START) |
-				  CA_NI_QM_CFG0_EQ_EN,
+				  cfg2_p0);
+	cortina_ni_rx_eq_cfg_pool(ni, CA_NI_RX_EQ_ID2, cfg0_p1,
 				  CA_NI_RX_EQ2_BID_START, CA_NI_RX_EQ2_TOTAL_BUF,
-				  CA_NI_QM_EQ14_CFG2);
+				  cfg2_p1);
+	dev_info(ni->dev,
+		 "RX: CPU pools EQ%u/EQ%u %s (cfg0=0x%08x/0x%08x cfg2=0x%08x/0x%08x)\n",
+		 CA_NI_RX_EQ_ID, CA_NI_RX_EQ_ID2,
+		 cpu_pool_push ? "SOFTWARE-OWNED (cpu_eq=1, push recycle)" :
+				 "hardware-managed (cpu_eq=0, self-populating)",
+		 cfg0_p0, cfg0_p1, cfg2_p0, cfg2_p1);
+
+	/*
+	 * ★★★ (3a) The DEEP-QUEUE pool, EQ12, hardware-managed - only needed when
+	 * the CPU pools are software-owned.  See the CA_NI_RX_DQ_POOL_OFF block for
+	 * the full account; in one line: the deep-queue enqueue on this chip cannot
+	 * consume a CPU-pushed buffer, and the GPON downstream punt is deep-queued
+	 * (17 of 40 rmu0_rx_hdr samples on the working image, no LAN traffic in
+	 * flight), so the deep queue needs a self-populating pool of its own once
+	 * EQ5/EQ6 stop being one.
+	 *
+	 * cpu_eq=0 + a CFG0.phy_addr_start inside the same proven DDR reserve means
+	 * the QM builds this free list itself at the EQ_CFG_LOAD commit below - no
+	 * push, no seed, and nothing for the NAPI recycle to hand back (which is
+	 * why cortina_ni_rx_frame() returns 0 for a PA in this region).
+	 *
+	 * With cpu_pool_push off, none of this is written and the routing below
+	 * stays exactly as it was, so gate-off behaviour is byte-identical.
+	 */
+	if (cpu_pool_push) {
+		cortina_ni_rx_eq_cfg_pool(ni, CA_NI_RX_EQ12_ID,
+					  (CA_NI_RX_DQ_POOL_PHYS &
+					   CA_NI_QM_CFG0_PHY_ADDR_START) |
+					  CA_NI_QM_CFG0_EQ_EN,
+					  CA_NI_RX_EQ12_BID_START,
+					  CA_NI_RX_EQ12_TOTAL_BUF,
+					  CA_NI_RX_DQ_CFG2);
+		/* BOTH halves of the profile point at EQ12, deliberately: this
+		 * consumer has no software-owned overflow reserve, and pointing
+		 * eqp1 at EQ6 (as the pre-existing CA_NI_RX_EQ12_PROFILE_VAL
+		 * does) would hand the deep queue a pushed buffer - the exact
+		 * thing it cannot use.  Safe to write here: profile 12 is
+		 * outside the 0..7 range the loop further down fills, and
+		 * nothing else in this driver writes EQ_PROFILE(12). */
+		writel(CA_NI_RX_DQ_PROFILE_VAL,
+		       ni_base(ni) +
+		       CA_NI_QM_EQ_PROFILE(CA_NI_RX_DQ_PROFILE_SEL));
+		dev_info(ni->dev,
+			 "RX: deep-queue pool EQ%u hardware-managed @0x%08x (%u bufs, bid 0x%x, cfg2=0x%08x) -> EQ_PROFILE(%u)=0x%02x\n",
+			 CA_NI_RX_EQ12_ID, (u32)CA_NI_RX_DQ_POOL_PHYS,
+			 CA_NI_RX_EQ12_TOTAL_BUF,
+			 (u32)CA_NI_RX_EQ12_BID_START,
+			 (u32)CA_NI_RX_DQ_CFG2, CA_NI_RX_DQ_PROFILE_SEL,
+			 (u32)CA_NI_RX_DQ_PROFILE_VAL);
+	}
 
 	/* (3b) Steer the CPU-bound frame to our pool via EQ_PROFILE(13) = {eqp0=EQ13,
 	 * eqp1=EQ14} = 0xED (stock 0x615c=0xED).  DEST_PORT_EQ_CFG.prof_sel is a 4-bit
@@ -3358,7 +4453,21 @@ static int cortina_ni_rx_eq_init(struct cortina_ni *ni)
 	 * size-selects an EMPTY EQ -> NO_BUFFER (frame reached RMU0, pool auto-filled, but the
 	 * SELECTED profile pointed at EQ0).  Program ALL 8 3-bit-reachable profiles (0..7) =
 	 * 0xED={EQ13,EQ14} so whichever profile the CPU frame picks maps to our live pools.
-	 * (Documented at CA_NI_RX_EQ_PROFILE_SEL=5 but the write was missing.) */
+	 * (Documented at CA_NI_RX_EQ_PROFILE_SEL=5 but the write was missing.)
+	 *
+	 * ★ CORRECTION 2026-07-28: the "3-BIT field, 0x0d & 0x7 = profile 5" premise
+	 * above is WRONG, and it contradicts the (correct) 4-bit note a few lines up.
+	 * CA_NI_QM_DEST_PORT_PROF_SEL is GENMASK(3, 0) - four bits at bit 0, a DIRECT
+	 * index into EQ_PROFILE(0..15), no masking.  So destp8=0x0D selects profile 13,
+	 * not 5.  Live readback agrees: prof13(0x615c)=0x65={EQ5,EQ6} with
+	 * destp8=destp15=0x0D; and stock's destp8=0x0C with prof12=0xEC={EQ12,EQ14},
+	 * its documented deep-queue pair, only lines up under direct indexing.
+	 * THE WRITE BELOW IS STILL RIGHT AND STILL NEEDED - dest port 0 selects
+	 * profile 2, which lives in this 0..7 range and would otherwise be empty - so
+	 * build47's fix worked, but for a different reason than it recorded.  Kept
+	 * because a filled 0..7 is harmless and covers the dest ports 1..7 we never
+	 * program; corrected because the next reader should not re-derive the wrong
+	 * field width from it. */
 	for (i = 0; i < 8; i++)
 		writel(CA_NI_RX_EQ_PROFILE_VAL,
 		       ni_base(ni) + CA_NI_QM_EQ_PROFILE(i));
@@ -3371,9 +4480,28 @@ static int cortina_ni_rx_eq_init(struct cortina_ni *ni)
 	writel((CA_NI_NI_DESTPORT0_STOCK_VAL & ~CA_NI_QM_DEST_PORT_PROF_SEL) |
 	       FIELD_PREP(CA_NI_QM_DEST_PORT_PROF_SEL, 2),
 	       ni_base(ni) + CA_NI_QM_DEST_PORT_EQ_CFG(0));
-	/* the deep-queue dest-ports (8..15, incl. the CPU slot 15) all -> EQ_PROFILE(13) */
+	/*
+	 * The deep-queue dest-ports (8..15, incl. the CPU slot 15).
+	 *
+	 * Historically these carried CA_NI_RX_CPU_PROFILE_VAL (0x0D).  prof_sel is
+	 * a 4-bit DIRECT index (GENMASK(3,0), no masking), so 0x0D selects
+	 * EQ_PROFILE(13) - which holds {EQ5, EQ6}, the same pools as the direct CPU
+	 * punt (live: prof13(0x615c)=0x65 with destp8=destp15=0x0D).
+	 *
+	 * ★ Under cpu_pool_push that sharing is fatal: EQ5/EQ6 are then
+	 * software-owned and the deep-queue enqueue cannot consume a pushed buffer,
+	 * so point this range at the hardware-managed deep-queue profile instead.
+	 * Stock likewise keeps the two consumers apart (prof12 = {EQ12, EQ14},
+	 * prof13 = {EQ13, EQ14}); the collapse onto one profile was ours.
+	 * FIELD_PREP rather than a bare value so the field placement is explicit
+	 * instead of relying on prof_sel sitting at bit 0.
+	 * Gate off => the historic value, byte-identical.
+	 */
 	for (i = CA_NI_RX_DEEPQ_DEST_PORT_LO; i <= CA_NI_RX_DEEPQ_DEST_PORT_HI; i++)
-		writel(CA_NI_RX_CPU_PROFILE_VAL,
+		writel(cpu_pool_push ?
+		       FIELD_PREP(CA_NI_QM_DEST_PORT_PROF_SEL,
+				  CA_NI_RX_DQ_PROFILE_SEL) :
+		       CA_NI_RX_CPU_PROFILE_VAL,
 		       ni_base(ni) + CA_NI_QM_DEST_PORT_EQ_CFG(i));
 	/* ★ 2026-07-23 (Fable RE): stock configures DEST_PORT_EQ_CFG for the whole
 	 * CPU/PON dest-port range up to 0x2f; ours left 16..0x2f at profile 0 -> EQ0
@@ -3381,8 +4509,22 @@ static int cortina_ni_rx_eq_init(struct cortina_ni *ni)
 	 * CPU_0 dest port >= 16 then hit NO_BUFFER and head-of-line-blocked the shared
 	 * RMU -> the LAN CPU-delivery went 100% loss the instant the DS route installed.
 	 * Point the whole range at our configured CPU pool (EQ13/14) so nothing wedges. */
+	/* ★★ This range carries the DOWNSTREAM DATA punt, and leaving it on the
+	 * software-owned pools is what killed the WAN under cpu_pool_push=1: gpon0
+	 * RX sat at exactly 0 packets from boot while the LAN punt and DS OMCI were
+	 * both fine.  The per-GEM PDC map stamps data GEMs (8..255) with
+	 * ldpid 0x18 = L3_WAN = 24, which lands here, while OMCI GEMs (0..7) are
+	 * stamped CPU_0 with fe_bypass=1 and go to dest port 0 alongside the LAN
+	 * punt - which is exactly why control frames kept arriving while data
+	 * frames never did.  A forwarding-engine consumer cannot draw from a
+	 * cpu_eq=1 pool, so under software ownership this range must point at the
+	 * hardware-managed pool instead.  Stock likewise gives 16..47 a different
+	 * pool pair from its CPU ports. */
 	for (i = CA_NI_RX_DEEPQ_DEST_PORT_HI + 1; i <= CA_NI_QM_DEST_PORT_MAX; i++)
-		writel(CA_NI_RX_CPU_PROFILE_VAL,
+		writel(cpu_pool_push ?
+		       FIELD_PREP(CA_NI_QM_DEST_PORT_PROF_SEL,
+				  CA_NI_RX_DQ_PROFILE_SEL) :
+		       CA_NI_RX_CPU_PROFILE_VAL,
 		       ni_base(ni) + CA_NI_QM_DEST_PORT_EQ_CFG(i));
 
 	/* 0x6ab0 = 0x300 (stock-matching; this is NOT the real ES_CTRL2 - kept as a
@@ -4218,6 +5360,8 @@ void cortina_ni_rx_open(struct cortina_ni *ni)
 
 void cortina_ni_rx_stop(struct cortina_ni *ni)
 {
+	unsigned int i;
+
 	if (!ni->rx)
 		return;
 
@@ -4232,6 +5376,13 @@ void cortina_ni_rx_stop(struct cortina_ni *ni)
 	cortina_ni_rx_es_cpu(ni, false);	/* disarm the CPU-port drain */
 	cortina_ni_rx_irq_set(ni, false);
 	napi_disable(&ni->rx->napi);
+
+	/* NAPI is quiesced, so nothing can be mid-chain any more: release any
+	 * partially assembled frame instead of carrying it across a close/open
+	 * (the accounting would be reset by the next SOP, but the skb would not
+	 * be - one per voq, held until the interface came back up). */
+	for (i = 0; i < CA_NI_RX_VOQ_COUNT; i++)
+		cortina_ni_rx_chain_reset(ni->rx, &ni->rx->chain[i]);
 }
 
 /* ------------------------------------------------------------------ */
@@ -5036,7 +6187,11 @@ static int cortina_ni_rx_proc_show(struct seq_file *m, void *v)
 	/* self-populating pool health: inactive MUST be 0 and stay 0 (a bid that
 	 * goes inactive without a refill source = a leaked buffer) */
 	pa_req = readl(ni_base(ni) + CA_NI_QM_EQM_PA_REQ(CA_NI_RX_EQ_ID));
-	seq_printf(m, "pool: self-pop eq%d ready=%lu inactive=%lu (want 0)\n",
+	/* "self-pop" was hardcoded and became a lie once the pool model was made
+	 * selectable; print the live mode instead.  inactive = buffers the pool is
+	 * SHORT, so 0 is the healthy reading in both models. */
+	seq_printf(m, "pool: %s eq%d ready=%lu inactive=%lu (want 0)\n",
+		   cpu_pool_push ? "sw-owned" : "self-pop",
 		   CA_NI_RX_EQ_ID,
 		   (unsigned long)FIELD_GET(CA_NI_QM_PA_REQ_READY, pa_req),
 		   (unsigned long)FIELD_GET(CA_NI_QM_PA_INACTIVE_CNT, pa_req));
@@ -5092,7 +6247,16 @@ static int cortina_ni_rx_proc_show(struct seq_file *m, void *v)
 	/* pool1 (EQ14) PA-request + the CPU-EPP ring pointers: if eq13 ready=1
 	 * and the ring wptr advances past rdptr, the delivery chain is live */
 	pa_req = readl(ni_base(ni) + CA_NI_QM_EQM_PA_REQ(CA_NI_RX_EQ_ID2));
-	seq_printf(m, "eq%d ready=%lu inactive=%lu cfg1=0x%08x cfg2=0x%08x (eq13/14 cfg2 want 0xff0d: cpu_eq=1,bufsz=5,refill_ths=0xff)\n",
+	/* ★ The old annotation here recommended "cfg2 want 0xff0d: bufsz=5".  That
+	 * is WRONG on this die - buffer_size index 5 is 4096B, not 2048 (the live
+	 * decode at CA_NI_QM_EQ13_CFG2 records idx5 as a fixed stride bug), and
+	 * the PA->VA math shears if the index does not match the pool stride.  The
+	 * correct software-owned value is 0xff0c (cpu_eq=1, bufsz idx4 = 2048).
+	 * ready/inactive are a per-pool GAUGE, not a cumulative counter: inactive
+	 * = how many buffers the pool is SHORT, so it must read 0 once the seed
+	 * matches CFG1.total_buf.  If you need to know whether it is clear-on-read,
+	 * cat this file twice with no traffic between - a gauge repeats. */
+	seq_printf(m, "eq%d ready=%lu inactive=%lu cfg1=0x%08x cfg2=0x%08x (sw-owned wants 0x0000ff0c: cpu_eq=1 bufsz idx4=2048)\n",
 		   CA_NI_RX_EQ_ID2,
 		   (unsigned long)FIELD_GET(CA_NI_QM_PA_REQ_READY, pa_req),
 		   (unsigned long)FIELD_GET(CA_NI_QM_PA_INACTIVE_CNT, pa_req),
@@ -5348,9 +6512,72 @@ static int cortina_ni_rx_proc_show(struct seq_file *m, void *v)
 	for (i = 0; i < CA_NI_RX_VOQ_COUNT; i++)
 		seq_printf(m, " %d:%llu", i, rx->voq_frames[i]);
 	seq_puts(m, "\n");
-	seq_printf(m, "drops: nosop=%llu badpa=%llu len=%llu nobuf=%llu dead=%llu\n",
+	seq_printf(m, "drops: nosop=%llu badpa=%llu len=%llu (runt=%llu oversize=%llu) nobuf=%llu dead=%llu\n",
 		   rx->drop_nosop, rx->drop_badpa, rx->drop_len,
+		   rx->drop_runt, rx->drop_oversize,
 		   rx->drop_nobuf, rx->slot_dead);
+	/*
+	 * Multi-buffer receive.  What each number means for a verdict:
+	 *   frames>0        a chain was assembled and delivered - the witness
+	 *                   that this path works at all;
+	 *   nosop / oversize above should STOP climbing once it is on, because
+	 *                   both are what an unassembled chain looked like;
+	 *   abort/reopen/orphan/badtotal/toolong/short  MUST stay 0 - each is a
+	 *                   distinct malformation, named so a non-zero one says
+	 *                   which;
+	 *   dlen seen vs calc  an OBSERVATION, not a verdict: the shipped
+	 *                   firmware discards the per-segment descriptor length,
+	 *                   so what the hardware puts there is unestablished and
+	 *                   the first chained frame is what settles it.
+	 */
+	{
+		unsigned int open = 0;
+
+		for (i = 0; i < CA_NI_RX_VOQ_COUNT; i++)
+			if (rx->chain[i].st.open)
+				open++;
+		seq_printf(m, "chain: mode=%s rest_off=+0x%02x frames=%llu segs=%llu max_segs=%llu open_now=%u\n",
+			   rx_chain ? "on" : "OFF", rx->chain_rest_off,
+			   rx->chain_frames, rx->chain_segs,
+			   rx->chain_max_segs, open);
+		seq_printf(m, "chain-bad: abort=%llu reopen=%llu orphan=%llu badtotal=%llu toolong=%llu short=%llu swid=%llu (all want 0)\n",
+			   rx->chain_abort, rx->chain_reopen, rx->chain_orphan,
+			   rx->chain_badtotal, rx->chain_toolong,
+			   rx->chain_short, rx->chain_swid);
+		if (rx->chain_frames) {
+			seq_printf(m, "chain-dlen: diff=%llu seen/calc", rx->chain_dlen_diff);
+			for (i = 0; i < CA_NI_RX_CHAIN_MAX_SEGS &&
+				    rx->chain_dlen_calc[i]; i++)
+				seq_printf(m, " %u:%u/%u", i,
+					   rx->chain_dlen_seen[i],
+					   rx->chain_dlen_calc[i]);
+			seq_puts(m, " (observation, not a fault)\n");
+		}
+	}
+	/* pool ownership: stale_buf MUST be 0 - non-zero means a buffer was
+	 * reused before NAPI copied it out (the fragmented-datagram defect) */
+	seq_printf(m, "pool-own: mode=%s stale_buf=%llu (want 0) push_fail=%llu (want 0)\n",
+		   cpu_pool_push ? "sw-owned(cpu_eq=1)" : "hw-managed(cpu_eq=0)",
+		   rx->stale_buf, rx->push_fail);
+	/* deep-queue pool witness: dq_frames > 0 proves EQ12 is populated and the
+	 * deep-queue admission path is delivering (the GPON DS punt rides it);
+	 * inactive is the usual shortfall gauge, 0 = the QM self-populated it. */
+	{
+		u32 dq_req = readl(ni_base(ni) +
+				   CA_NI_QM_EQM_PA_REQ(CA_NI_RX_EQ12_ID));
+
+		seq_printf(m, "pool-dq: eq%u frames=%llu cfg0=0x%08x cfg1=0x%08x cfg2=0x%08x prof%u=0x%08x ready=%lu inactive=%lu (want inactive 0; frames>0 once DS flows)\n",
+			   CA_NI_RX_EQ12_ID, rx->dq_frames,
+			   readl(ni_base(ni) + CA_NI_QM_CFG0_EQ(CA_NI_RX_EQ12_ID)),
+			   readl(ni_base(ni) + CA_NI_QM_CFG1_EQ(CA_NI_RX_EQ12_ID)),
+			   readl(ni_base(ni) + CA_NI_QM_CFG2_EQ(CA_NI_RX_EQ12_ID)),
+			   CA_NI_RX_DQ_PROFILE_SEL,
+			   readl(ni_base(ni) +
+				 CA_NI_QM_EQ_PROFILE(CA_NI_RX_DQ_PROFILE_SEL)),
+			   (unsigned long)FIELD_GET(CA_NI_QM_PA_REQ_READY, dq_req),
+			   (unsigned long)FIELD_GET(CA_NI_QM_PA_INACTIVE_CNT,
+						    dq_req));
+	}
 	seq_printf(m, "last_desc=%016llx last_hdra=%016llx\n",
 		   rx->last_desc, rx->last_hdra);
 	/* ★ TEMP DIAG (rx_crc_tap): machine-readable HW lookup-CRC witness */
@@ -5488,7 +6715,17 @@ int cortina_ni_rx_probe(struct cortina_ni *ni)
 	rx->ni = ni;
 	rx->netdev = ni->tx->netdev;
 	INIT_DELAYED_WORK(&rx->recovery_work, cortina_ni_rx_recovery_work);
+	/* where a chain continuation's payload starts.  Resolved once, at probe,
+	 * so the receive path reads a field instead of a module parameter. */
+	rx->chain_rest_off = CA_NI_RX_HDRA_OFF +
+			     (rx_chain_rest_hdra ? CA_NI_RX_HDR_CPU_LEN : 0);
 	ni->rx = rx;
+	if (rx_chain)
+		dev_info(ni->dev,
+			 "RX: multi-buffer receive ON (chain payload window %u B/buffer, continuation at +0x%02x, max %u segs, max %u B)\n",
+			 CA_NI_RX_BUF_USABLE_END(CA_NI_RX_CPU_POOL0_BUFSZ) -
+			 CA_NI_RX_BUF_HEADROOM, rx->chain_rest_off,
+			 CA_NI_RX_CHAIN_MAX_SEGS, CA_NI_RX_CHAIN_MAX_LEN);
 
 	/* snapshot the GPHY calibration while it is in the U-Boot-proven
 	 * state, and log the fault latch so a wedge already present at
@@ -5545,17 +6782,23 @@ int cortina_ni_rx_probe(struct cortina_ni *ni)
 	 * DMA-writes each frame's data here and the CPU reads it in NAPI; cached (WB) would
 	 * return stale data on the non-coherent NE DMA.  WC (Normal-NC) is memcpy/unaligned-
 	 * safe (unlike Device ioremap), so the NAPI skb build reads the real frame bytes. */
+	/* ★ The mapping spans BOTH CPU pools and the deep-queue pool that follows
+	 * them, so cortina_ni_rx_frame()'s PA->VA math and bounds check cover a
+	 * deep-queue buffer with no special case.  Still one fixed-phys region
+	 * inside the same proven DDR reserve. */
 	rx->cpu_dram_dma = CA_NI_RX_CPU_POOL_PHYS;
 	rx->cpu_dram = devm_memremap(ni->dev, CA_NI_RX_CPU_POOL_PHYS,
-				     CA_NI_RX_CPU_DRAM_SIZE, MEMREMAP_WC);
+				     CA_NI_RX_MAP_SIZE, MEMREMAP_WC);
 	if (IS_ERR_OR_NULL(rx->cpu_dram)) {
 		dev_err(ni->dev, "RX: CPU-pool memremap(%pa) failed\n",
 			&rx->cpu_dram_dma);
 		ni->rx = NULL;
 		return -ENOMEM;
 	}
-	dev_info(ni->dev, "RX: CPU-pool DRAM @%pad size %u (reserved-window)\n",
-		 &rx->cpu_dram_dma, CA_NI_RX_CPU_DRAM_SIZE);
+	dev_info(ni->dev,
+		 "RX: CPU-pool DRAM @%pad size %u (reserved-window; %u CPU pools + %u deep-queue @0x%08x)\n",
+		 &rx->cpu_dram_dma, CA_NI_RX_MAP_SIZE, CA_NI_RX_CPU_DRAM_SIZE,
+		 CA_NI_RX_DQ_DRAM_SIZE, (u32)CA_NI_RX_DQ_POOL_PHYS);
 
 	/* U-Boot TFTP'd through port 0 and may have left the MAC RX on;
 	 * force it off so nothing feeds the ring before ndo_open */
@@ -5598,6 +6841,20 @@ int cortina_ni_rx_probe(struct cortina_ni *ni)
 	 * the port-0 MAC RX stays off until open. */
 	ni_rmw(ni, CA_NI_QM_RMU0_CTRL, 0, CA_NI_QM_RMU0_RX_EN);
 	cortina_ni_rx_eqm_readback(ni, "after RMU0 enable, pre-populate");
+
+	/* ★ Software-owned pools: stage their buffers now - the push stage
+	 * only drains once the EQ config is committed and RMU0 runs, both of
+	 * which have just happened, and the port-0 MAC RX is still off so
+	 * nothing can consume a buffer before the pools are full.  A failure
+	 * here is fatal to RX, so it is reported and propagated, never
+	 * swallowed. */
+	if (cpu_pool_push) {
+		ret = cortina_ni_rx_push_seed(ni);
+		if (ret) {
+			ni->rx = NULL;
+			return ret;
+		}
+	}
 
 	/* ★★ RMU AXI reorder engine (stock runs this right after enable_rx) - the
 	 * separate g_ne_axi_reo MMIO block our driver never touched; without it the RMU

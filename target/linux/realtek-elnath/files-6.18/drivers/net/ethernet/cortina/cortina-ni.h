@@ -91,6 +91,82 @@ struct cortina_ni_rx_irqctx {
 #define CA_NI_RX_HASH_BITS	11	/* 2048 heads for 880 pool slots */
 #define CA_NI_RX_HASH_SIZE	BIT(CA_NI_RX_HASH_BITS)
 
+/*
+ * ★★★ A pool buffer's USABLE PAYLOAD WINDOW is not its size.
+ *
+ * These belong beside the other buffer-geometry defines in cortina-ni-regs.h and
+ * are kept here only to avoid colliding with concurrent edits to that header -
+ * please move them when convenient.
+ *
+ * QM_DEST_PORTn_PKT_BUF_CFG, which this driver programs with stock's golden
+ * 0x18041804, reserves head_room = CA_NI_QM_PKT_BUF_HEAD_UNITS (4 x 16B = 64B,
+ * which is what puts HEADER_A at +0x40) at the front of a buffer and tail_room =
+ * CA_NI_QM_PKT_BUF_TAIL_UNITS (0x18 x 16B = 384B) at the back.  A 2048-byte pool
+ * buffer therefore holds 1600 bytes of frame, in [0x40, 0x680) - which is exactly
+ * the window the shipped firmware invalidates and clamps every segment to.
+ *
+ * The bounds check in cortina_ni_rx_frame() used the BUFFER SIZE (2048) as its
+ * ceiling, which is 384 bytes too generous.  A frame whose HEADER_A.pkt_size
+ * landed in the gap passed the check and was copied out of memory the hardware
+ * never wrote - stale bytes from whatever frame used that buffer before,
+ * silently, with no counter moving.  Only the chain path can carry such a frame;
+ * until it is enabled the correct outcome is a counted drop.
+ */
+#define CA_NI_RX_BUF_TAILROOM		(CA_NI_QM_PKT_BUF_TAIL_UNITS * 16)
+#define CA_NI_RX_BUF_USABLE_END(bufsz)	((bufsz) - CA_NI_RX_BUF_TAILROOM)
+
+/*
+ * Chain bounds.  A malformed chain must cost a counter, never a buffer, a spin or
+ * an unbounded skb - this device runs unattended for months, and the shipped
+ * firmware is no model here: its chain loop has no segment cap, no timeout and no
+ * availability check, so a corrupt pkt_size walks it off the end of the
+ * descriptor ring.
+ *
+ * MAX_LEN is a policy cap, not a hardware limit: it bounds the ONE allocation a
+ * chain makes (the skb is sized from the SOP's pkt_size and never grown), and is
+ * set for a 1500-byte MTU plus every encapsulation this port carries - QinQ,
+ * PPPoE, the 16-byte PON header - with room to spare.  Raise it deliberately if
+ * jumbo frames are ever wanted; it is not a guess about the silicon.
+ */
+#define CA_NI_RX_CHAIN_MAX_LEN		2048u
+/* Segment cap.  8 is generous for the pools we configure (a 2048-byte buffer
+ * offers 1600 usable bytes, so MAX_LEN needs two), and the static_assert in
+ * cortina-ni-rx.c is what stops it silently under-covering if a pool is ever
+ * shrunk - giving the deep-queue pool stock's 512-byte geometry is exactly why
+ * this path exists. */
+#define CA_NI_RX_CHAIN_MAX_SEGS		8u
+
+/*
+ * Multi-buffer receive: the arithmetic of one in-flight SOP..EOP chain.
+ *
+ * Deliberately free of skb and of any hardware reference - it holds only the
+ * running length accounting - so ca_ni_chain_step() in cortina-ni-rx.c is a
+ * pure function the x86 adversarial suite can drive directly
+ * (rtl9607c-test/gen_rx_chain_impl.sh extracts both).  The skb lives beside it
+ * in struct cortina_ni_rx_chain, which the imperative shell owns.
+ */
+struct ca_ni_chain_state {
+	u32	total;		/* payload bytes the SOP HEADER_A promised */
+	u32	got;		/* payload bytes accounted so far */
+	u16	segs;		/* descriptors consumed by this chain */
+	bool	open;		/* a chain is in flight on this voq */
+};
+
+/* One in-flight chain, PER CPU-port VOQ.  Per-voq and not global: a frame's
+ * descriptors are appended to one voq's FIFO in order, while the NAPI budget
+ * can cut a chain in half - so the state must survive into the next poll
+ * without the frames of the next voq we drain appending into it. */
+struct cortina_ni_rx_chain {
+	struct sk_buff			*skb;	/* NULL = nothing held */
+	/* HEADER_A word 1 of the SOP buffer.  The delivery decision (lspid ->
+	 * WAN netdev or eth0) is made when the chain COMPLETES, on a descriptor
+	 * that carries no header of its own, and a chain can span NAPI polls -
+	 * so the deciding word is kept here rather than read from rx->last_hdra,
+	 * which any other frame overwrites. */
+	u32				hdra_lo;
+	struct ca_ni_chain_state	st;
+};
+
 struct cortina_ni_rx {
 	struct cortina_ni	*ni;
 	struct net_device	*netdev;
@@ -137,8 +213,49 @@ struct cortina_ni_rx {
 	u64			drop_nosop;	/* descriptor without SOP */
 	u64			drop_badpa;	/* PA not in our map */
 	u64			drop_len;	/* bad frame length */
+	/* drop_len's two causes, split so the buffer-window fix is measurable:
+	 * a runt is a real bad frame, an oversize one is a frame that does not
+	 * fit the buffer's usable window and needs the chain path (rx_chain). */
+	u64			drop_runt;	/* len < ETH_HLEN */
+	u64			drop_oversize;	/* off + len past the usable window */
 	u64			drop_nobuf;	/* refill alloc failed */
 	u64			slot_dead;	/* buffer lost (remap failed) */
+	/* ---- multi-buffer receive (rx_chain).  One in-flight chain per voq,
+	 * plus the malformation ledger: the hardware is not trusted to
+	 * terminate a chain, so every way one can go wrong is counted and
+	 * logged rather than assumed impossible. */
+	struct cortina_ni_rx_chain chain[CA_NI_RX_VOQ_COUNT];
+	u32			chain_rest_off;	/* payload offset in a non-first buffer */
+	u64			chain_frames;	/* chains assembled and delivered */
+	u64			chain_segs;	/* segments those frames consumed */
+	u64			chain_max_segs;	/* deepest chain seen */
+	u64			chain_abort;	/* partial frames freed (total) */
+	u64			chain_reopen;	/* SOP arrived with a chain still open */
+	u64			chain_orphan;	/* non-SOP segment, no chain open */
+	u64			chain_badtotal;	/* SOP pkt_size out of range */
+	u64			chain_toolong;	/* segment cap hit / segments overran total */
+	u64			chain_short;	/* EOP with fewer bytes than promised */
+	u64			chain_swid;	/* headerless format: geometry unknown */
+	/* Per-segment descriptor pkt_size as REPORTED by the hardware, beside the
+	 * byte count we DERIVED, for the last chain assembled.  Recorded rather
+	 * than judged: the shipped firmware discards this field on a continuation
+	 * descriptor, so there is no evidence of what it holds and a mismatch
+	 * counter alone would be a phantom.  The first chained frame settles it. */
+	u32			chain_dlen_seen[CA_NI_RX_CHAIN_MAX_SEGS];
+	u32			chain_dlen_calc[CA_NI_RX_CHAIN_MAX_SEGS];
+	u64			chain_dlen_diff;	/* how often the two disagreed */
+	/* ★ RX-buffer ownership witnesses (see cpu_pool_push in cortina-ni-rx.c).
+	 * stale_buf = the descriptor's pktlen and the buffer's HEADER_A.pkt_size
+	 * disagree, i.e. the buffer no longer holds the frame this descriptor was
+	 * written for.  It read non-zero on every fragmented datagram with the
+	 * hardware-managed pool and MUST stay 0 with the software-owned one.
+	 * push_fail = a recycle doorbell timed out; the pool shrinks by one. */
+	u64			stale_buf;
+	u64			push_fail;
+	/* frames delivered out of the hardware-managed DEEP-QUEUE pool (EQ12).
+	 * Non-zero is the witness that that pool is populated and the deep-queue
+	 * admission path is alive; the GPON downstream punt rides it. */
+	u64			dq_frames;
 	u64			last_desc;	/* last non-empty descriptor */
 	u64			last_hdra;	/* last HEADER_A (host order) */
 	/* ★ TEMPORARY DIAGNOSTIC (P3 crc_ntfy tap, rx_crc_tap gate - REVERT
