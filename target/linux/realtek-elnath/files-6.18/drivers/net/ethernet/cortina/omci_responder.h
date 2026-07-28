@@ -6,19 +6,31 @@
  * Kernel port of the host oracle's responder (dev/rtl9607c-oracle), with the
  * on-wire facts aligned to the responder PROVEN against the same HSGQ-G008
  * OLT on the RTL9602C (realtek-luna rtl9602c_eth.c, reached Online/normal +
- * WAN end-to-end):
- *   - GET request attribute mask   = msg[8..9]  (contents start at octet 8)
- *   - MIB-Upload  reply row count  = resp[8..9] (NO result byte)
+ * WAN end-to-end).  The ONE rule the whole layout follows: message contents
+ * start at octet 8, and only a response that carries a RESULT code spends that
+ * octet on the result.
+ *   - GET request attribute mask   = msg[8..9]  (a request has no result byte)
+ *   - GET response  = result[8] + attr-mask[9..10] + values[11..35]
+ *     (25 octets) + optional-attribute mask[36..37] + attribute-execution
+ *     mask[38..39].  The last four octets are RESERVED ALWAYS, success
+ *     included, so the value area is 25 octets and NOT 29.
+ *   - SET request = mask[8..9] + values from msg[10]; CREATE request = the
+ *     set-by-create values from msg[8] (no mask)
+ *   - MIB-Upload reply row count   = resp[8..9] (NO result byte)
+ *   - Get-All-Alarms reply count   = resp[8..9] (NO result byte)
  *   - MIB-Upload-Next request seq  = msg[8..9]; reply = class[8..9] +
  *     inst[10..11] + mask[12..13] + values[14..39] (26 value bytes, no result)
- *   - Create body = msg+8; MIB-Data-Sync +1 per Create/Set/Delete, wrap
- *     255 -> 1; on-wire MIB-Reset zeroes it
- *   - MIC (bytes 44..47) = zlib CRC-32 over bytes 0..43, stored big-endian,
- *     computed in SOFTWARE (a zero/wrong MIC = the OLT silently drops the
- *     response and loops its GET audit)
+ *   - MIB-Data-Sync +1 per APPLIED Create/Set/Delete, wrap 255 -> 1; an
+ *     on-wire MIB-Reset zeroes it
+ *   - MIC (bytes 44..47) = the NON-reflected AAL5/I.363.5 CRC-32 over bytes
+ *     0..43 (the kernel's crc32_be, init all-ones, final complement), stored
+ *     big-endian and computed in SOFTWARE.  It is NOT the reflected zlib
+ *     crc32_le — LIVE-PROVEN on this OLT (see the MIC comment in the .c).  A
+ *     zero/wrong MIC = the OLT silently drops the response and loops its GET
+ *     audit.
  *   - autonomous AVC: TID=0, MT=0x11, changed-attr mask at [8..9], value
  *     from [10]
- * (The host oracle's mask-at-9/seq-from-inst layout is a host-sim-only
+ * (The host oracle's old mask-at-9/seq-from-inst layout was a host-sim-only
  * convention — self-consistent with its OLT sim but wrong on the real wire.)
  *
  * Endianness-agnostic: all wire access is explicit byte math, never a
@@ -61,11 +73,55 @@ struct omci_onu {
 	u16	store_n;		/* provisioned-ME count */
 	struct omci_mib_row	rows[OMCI_MIB_ROWS_MAX];
 	struct omci_me_inst	store[OMCI_STORE_MAX];
+	/* G.988 11.2.2.1 retained last response: the OMCC is stop-and-wait, so
+	 * ONE entry covers every retransmission — the OLT never advances past
+	 * an unanswered transaction.  A byte-identical repeat is REPLAYED from
+	 * here instead of re-executed, so a lost US response cannot bump
+	 * MIB-Data-Sync twice for one OLT transaction. */
+	u8	last_req[40];		/* bytes 0..39 (trailer+MIC derived) */
+	u8	last_resp[OMCI_LEN];
+	bool	have_last;
 	/* spy counters (dump/probe capability is first-class, project rule) */
-	u32	unhandled;		/* DS message types answered NOT_SUPPORTED */
+	u32	unhandled;		/* DS message types with no ONU action */
+	u32	dup_replay;		/* retransmissions served from the cache */
+	u32	rx_extended;		/* devid 0x0b frames seen (not served) */
+	u32	no_ack;			/* requests with AR clear: applied, not
+					 * answered — a silent path must still be
+					 * countable */
 	u32	avc_count;		/* autonomous AVC frames emitted */
 	bool	avc_veip_up_sent;
+	/* ME 263 ANI-G #10 RX / #14 TX optical level, in the G.988 wire form
+	 * (2's complement, 0.002 dB increments referred to 1 mW).  Seeded by
+	 * omci_onu_init() to the conformant STATIC fallback below and overwritten
+	 * by the imperative shell from the live SFF-8472 A2h DDM read — the OLT's
+	 * optical view of this ONU then tracks the real fiber instead of a
+	 * plausible-looking constant.  The fallback is kept for a failed read
+	 * because the OLT must never get silence, and @anig_live says which of the
+	 * two a reader is looking at so a stub is never mistaken for a
+	 * measurement.  The host oracle never calls the setter, so its GET
+	 * responses stay byte-identical to the pre-DDM reference snapshot. */
+	u16	anig_rx_level;
+	u16	anig_tx_level;
+	bool	anig_live;
 };
+
+/* The static ANI-G optical levels served until (and after a failed) DDM read.
+ * 0xeedc = -8.77 dBm received, 0x04d7 = +2.47 dBm launched — both plausible for
+ * this class-B+ optic, which is exactly why they must be labelled: a fabricated
+ * value that looks right is the hardest kind to notice. */
+#define OMCI_ANIG_RX_FALLBACK	0xeedc
+#define OMCI_ANIG_TX_FALLBACK	0x04d7
+
+/* Publish a live optical measurement into ME 263 #10/#14.  The caller does the
+ * (sleeping) i2c read OUTSIDE whatever lock guards the responder and passes the
+ * two already-converted wire values in. */
+static inline void omci_onu_set_optical(struct omci_onu *o, u16 rx_level,
+					u16 tx_level)
+{
+	o->anig_rx_level = rx_level;
+	o->anig_tx_level = tx_level;
+	o->anig_live = true;
+}
 
 /* Init/reset the responder + rebuild the static MIB rows.  @mds_seed is the
  * MIB-Data-Sync boot value: a POISON that must NOT match the OLT's stored
@@ -74,7 +130,8 @@ struct omci_onu {
 void omci_onu_init(struct omci_onu *o, const u8 sn[8], u8 mds_seed);
 
 /* Process one DS baseline PDU -> fill @resp (48 bytes, trailer + MIC done).
- * Returns OMCI_LEN, or 0 when no response must be sent (runt / non-baseline). */
+ * Returns OMCI_LEN, or 0 when no response must be sent (runt / non-baseline /
+ * AR clear, i.e. the OLT asked for no acknowledgement). */
 int omci_onu_input(struct omci_onu *o, const u8 *req, unsigned int len, u8 *resp);
 
 /* Autonomous VEIP (ME 329) operational-state-up AVC: the OLT never polls the

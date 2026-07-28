@@ -31,6 +31,7 @@
 #include "cortina-gpon-bosa.h"
 #include "cortina-gpon-bosa-cal.h"
 #include "cortina-gpon-bosa-seq.h"
+#include "cortina-gpon-ddm.h"
 
 #define BOSA_I2C_ADDR		0x51	/* SFF-8472 A2h address */
 
@@ -217,6 +218,45 @@ int cg_bosa_dump(struct device *dev)
 	dev_info(dev, "BOSADUMP %s, rd_fail=%u (page restored to 0x%02x)\n",
 		 ret ? "FAILED" : "done", rd_fail, curpage);
 	return ret;
+}
+
+/*
+ * Read the SFF-8472 A2h real-time diagnostics (bytes 96..105 = regs 0x60-0x69):
+ * temperature, Vcc, TX bias, TX power, RX power.  The scaling and the
+ * "unavailable" policy live in cortina-gpon-ddm.h so they are host-testable;
+ * this is only the bus half.
+ *
+ * SLEEPS (the i2c master takes a mutex and polls with msleep) — PROCESS CONTEXT
+ * ONLY.  Never call this from the OMCI RX path, an IRQ, a softirq or under a
+ * spinlock.
+ *
+ * All ten registers are in the UN-PAGED 0x00-0x7F window, so unlike
+ * cg_bosa_dump() this must NOT touch the table-select register 0x7F: whatever
+ * page the init sequence left selected stays selected.  Ten byte-reads at
+ * 100 kHz cost about 1 ms, which is why the value is sampled on demand and
+ * there is no polling timer.
+ *
+ * Returns an enum cg_ddm_status (CG_DDM_OK == 0).  A dead bus is reported
+ * loudly, rate-limited, because it is the exact signature of the cold-boot
+ * "i2c0 pinmux unrouted" failure that also leaves the laser unprogrammed.
+ */
+int cg_bosa_ddm_read(struct device *dev, struct cg_bosa_ddm *d)
+{
+	u8 raw[CG_DDM_LEN] = { 0 };
+	unsigned int i;
+	int io_err = 0;
+
+	for (i = 0; i < CG_DDM_LEN; i++) {
+		if (cg_i2c_read_byte(BOSA_I2C_ADDR, CG_DDM_BASE + i, &raw[i])) {
+			io_err = 1;
+			break;
+		}
+	}
+
+	if (cg_ddm_decode(raw, io_err, d) != CG_DDM_OK)
+		dev_warn_ratelimited(dev, "BOSA DDM: %s\n",
+				     cg_ddm_status_str(d->status));
+	return d->status;
 }
 
 /*

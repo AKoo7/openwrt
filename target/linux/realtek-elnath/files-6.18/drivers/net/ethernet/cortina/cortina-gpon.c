@@ -36,6 +36,7 @@
 #include <linux/of_address.h>
 #include <linux/platform_device.h>
 #include <linux/proc_fs.h>
+#include <linux/ratelimit.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
@@ -44,6 +45,7 @@
 
 #include "cortina-gpon-serdes.h"
 #include "cortina-gpon-bosa.h"
+#include "cortina-gpon-ddm.h"	/* SFF-8472 A2h optical decode (functional core) */
 #include "cortina-ni.h"		/* cortina_ni_pon_rx_hook_set + cortina_ni_pon_tx */
 #include "omci_responder.h"	/* Stage C: the G.988 responder + ME model */
 
@@ -407,10 +409,159 @@
 #define CG_PUC_US_OMCI_HP_HDR_A	(CG_PUC_BASE + 0x164)	/* gemid[7:0],cos[10:8],tcont[21:16] */
 #define CG_PUC_GLOBAL_PLOAM_CFG	(CG_PUC_BASE + 0x168)	/* us_hdr_min_size[21:16], us_ext_omci_en[31] */
 
-/* XGPN_PUCIF_CTRL (PON window + 0x4fe0, dft 0x1040a100): the PUC<->US-scheduler
- * interface control; GPON sets cntr_inccfg=2 (clear-on-read) -> 0x5040a100. */
-#define CG_XGPN_PUCIF_CTRL	0x4fe0
-#define CG_XGPN_PUCIF_CTRL_VAL	0x5040a100
+/*
+ * The PUC's CONTROL-PACKET classifier and its two dedicated counters — the only
+ * upstream witness in this block that does NOT also count upstream user data.
+ *
+ * Every upstream control frame carries the 16-byte PON control header the NI TX
+ * path stamps on it (cortina_ni_pon_hdr): a fixed DA/SA pair, then a 16-bit
+ * type.  The PUC holds that same pair in GLOBAL_DA_SA2/1/0 and two types to
+ * classify against, and counts each group in its own counter:
+ *
+ *   GLOBAL_DA_SA2/1/0 = 00:13:25:00:00:00 / 00:13:25:00:00:01  (DA then SA,
+ *                       big-endian across the three words — byte-identical to
+ *                       the pair cortina_ni_pon_hdr puts on our OMCI PDUs)
+ *   GLOBAL_LNK_TYPE   = 0xfff1  = the OMCI type, i.e. the type the NI stamps
+ *                                 on every upstream OMCI PDU
+ *   GLOBAL_MAC_TYPE   = 0xfff0  = the companion MAC-layer control type
+ *   BMC_CONTROL_PKT_CNTR_lnk / _mac = the two matching frame counts
+ *   BMC_LENGTH_ERROR                = US frames rejected on length
+ *
+ * ⇒ _lnk is an OMCI-SPECIFIC upstream frame count, and the vendor treats it as
+ * exactly that (its "OMCI packet count" accessor reads this register and
+ * nothing else), whereas BMC_RX_PKT is the TOTAL — data and control together.
+ * It is the one instrument here that upstream user data cannot inflate.
+ *
+ * Widths differ inside the group and it matters: BMC_RX_PKT/_ENQ are 32-bit,
+ * but FORCE_DROP, LENGTH_ERROR and both CONTROL_PKT counters are cntr:16 with
+ * a reserved upper half, which stock masks off on every read.
+ *
+ * All of them are CLEAR-ON-READ (PUCCFG.inccfg=2) and the block drops them
+ * after a short idle window, so exactly one reader in this driver may touch the
+ * three control-packet registers — see cg_puc_ctrl_sample().
+ *
+ * ★ One thing is NOT established: whether the type match is the 16-bit type
+ * alone or a 32-bit compare that also covers the two header bytes after it.
+ * Our OMCI PDUs carry 0xff 0xf1 0x00 0x01 there (byte 15 = the cos>6 flag)
+ * while the register reads 0xfff10000, so under the 32-bit reading our own
+ * frames would NOT be classified and _lnk would stay 0 for a reason that has
+ * nothing to do with the upstream path.  A vendor OMCI counter that reads 0 on
+ * every unit of this generation is implausible, and the two type registers'
+ * low halves are 0 while the vendor's OMCI ethertype is a 16-bit 0xfff1 — but
+ * "implausible" is not "measured".  So the only thing that settles it is
+ * watching us_omci while the responder transmits, and until it has been seen
+ * to move on a WORKING board, a zero here must never be read as a defect.
+ */
+#define CG_PUC_GLOBAL_DA_SA2	(CG_PUC_BASE + 0x14c)	/* DA[0..3] */
+#define CG_PUC_GLOBAL_DA_SA1	(CG_PUC_BASE + 0x150)	/* DA[4..5], SA[0..1] */
+#define CG_PUC_GLOBAL_DA_SA0	(CG_PUC_BASE + 0x154)	/* SA[2..5] */
+#define CG_PUC_GLOBAL_MAC_TYPE	(CG_PUC_BASE + 0x158)	/* type:32, dft 0xfff00000 */
+#define CG_PUC_GLOBAL_LNK_TYPE	(CG_PUC_BASE + 0x15c)	/* type:32, dft 0xfff10000 (OMCI) */
+#define CG_PUC_BMC_CTRL_PKT_MAC	(CG_PUC_BASE + 0x174)	/* cntr:16, MAC-type control frames */
+#define CG_PUC_BMC_CTRL_PKT_LNK	(CG_PUC_BASE + 0x178)	/* cntr:16, OMCI-type control frames */
+#define CG_PUC_BMC_LENGTH_ERROR	(CG_PUC_BASE + 0x188)	/* cntr:16, US length-check rejects */
+#define CG_PUC_BMC_CNTR_MASK	0xffff	/* the cntr:16 fields' reserved upper half */
+#define CG_PUC_LNK_TYPE_OMCI	0xfff1
+
+/*
+ * The PUC<->US-scheduler interface control.  ★ On this silicon it is at
+ * PON+0x6e00, NOT at the PON+0x4fe0 that a vendor source path names: that
+ * window does not decode here (every word from 0x4fc0 to 0x500c reads one and
+ * the same constant, unchanged by a write to it) and this board's stock
+ * firmware has no register anywhere in PON+0x4xxx.  Read for /proc only — the
+ * driver configures nothing here.
+ *
+ * Field layout: cntr_tconid[4:0], cntr_tconid_en[5], cntr0/1/2_event_sel (3
+ * bits each), single_thread, sch_to_threshold[27:16], cntr_inccfg[31:29].  Two
+ * facts worth keeping: cntr_inccfg is 0 at reset, which is why the three
+ * counters at +0x04/08/0c are free-running rather than clear-on-read (one of
+ * them ticks at the 8 kHz GPON upstream frame rate — what each selects is not
+ * established); and stock's GPON path sets sch_to_threshold=1000 here, which
+ * this driver does NOT (its write went to the 0x4fe0 hole above, so the field
+ * has always sat at its reset 64).  That divergence is REPORTED, not silently
+ * "fixed": the upstream path works as it is, and re-tuning the US scheduler is
+ * not a change to make as a side effect of exposing a counter.
+ */
+#define CG_GPON_MAC_PUCIF_CTRL	0x6e00	/* dft 0x0040a100 */
+
+/*
+ * GPON-MAC statistics counters (MAC-block-relative, i.e. the SILICON offsets —
+ * this board's own register table etc/reg.txt is already the silicon view, as
+ * its alarm@0x9c / interrupt_top@0xa4 / onu@0xdc entries match the live-proven
+ * offsets used above, so no +0x20 header shift applies to these names).
+ *
+ * ★ SEMANTICS, and why they are read RAW with no accumulator (the opposite of
+ * the PUC control counters): these are ACCUMULATING counters that are cleared
+ * by SOFTWARE WRITING ZERO, not by being read.  Stock proves it two ways —
+ * its aal_gpon_port_stats_clear() writes 0 to exactly this set, and its
+ * aal_gpon_current_bip_error_get() reads the BIP pair and then explicitly
+ * zeroes it, which would be redundant if a read self-cleared.  So a plain read
+ * is idempotent and any number of concurrent readers is safe: DO NOT convert
+ * these into clear-on-read deltas, and DO NOT ever write them from here — a
+ * write would destroy the history every other reader (and the test suite)
+ * depends on.  Clearing is an explicit operator action, never a read side
+ * effect.
+ *
+ * ★ The DS MIB group at silicon 0x084..0x094 belongs to the SAME accumulating,
+ * software-cleared family, correcting the "clear-on-read" descriptor in the
+ * interrupt-block note above.  Two independent tiers say accumulating: stock's
+ * aal_gpon_port_stats_get() reads them plainly as a statistics API (which would
+ * be self-destroying if a read cleared) and aal_gpon_port_stats_clear() zeroes
+ * them explicitly; and a live stock capture shows large retained values
+ * (ds_omci_gem == ds_omci_pkt == 1127, bip_error_frame_count == 0xF9991).  What
+ * the note got right, and what actually caused the incident it records, is that
+ * WRITING here corrupts the US PLOAM engine — so these are read, never written.
+ */
+#define CG_REG_BIP_ERR		0x078	/* BIP-8 errors of the last superframe   */
+#define CG_REG_BIP_ERR_ACCUM	0x07c	/* accumulated BIP-8 errors              */
+#define CG_REG_BIP_ERR_FRAMES	0x080	/* frames over which BIP was accumulated */
+#define CG_REG_DS_OMCI_GEM	0x084	/* DS OMCI GEM frames (hardware count)   */
+#define CG_REG_DS_OMCI_PKT	0x088	/* DS OMCI packets (hardware count)      */
+#define CG_REG_DS_PKT_CRC	0x08c	/* DS packets failing CRC                */
+#define CG_REG_DS_UNDERSIZE	0x090	/* DS undersized packets                 */
+#define CG_REG_DS_OVERSIZE	0x094	/* DS oversized packets                  */
+#define CG_REG_SUPERFRAME	0x0fc	/* 125 us superframe counter             */
+#define CG_REG_US_OMCC_CNT	0x200	/* upstream OMCC frames, GPON-MAC side.
+					 * Present in this board's register map
+					 * but stock never reads it, so there is
+					 * NO stock oracle: treat as unvalidated
+					 * until seen to move.  Worth having —
+					 * it is a second, independent angle on
+					 * the upstream-OMCI question the PUC
+					 * _lnk counter leaves open. */
+#define CG_REG_PUCIF_PROTECT	0xe14	/* b0 = PUCIF hang LATCHED, b5:1 = the
+					 * T-CONT id that hung.  Stock's periodic
+					 * monitor logs "pucif_hang_tcon_id:%d"
+					 * and clears by writing 0.  We read it
+					 * WITHOUT clearing: a sticky "ever hung"
+					 * plus the offender's id costs nothing
+					 * and cannot perturb stock-matching
+					 * behaviour.  (Clearing would let us
+					 * count episodes, but it makes this
+					 * driver a mutator of upstream state,
+					 * which is not worth it for a witness.) */
+#define CG_REG_O5		0x1a8	/* O5-related count (semantics unproven) */
+#define CG_REG_GEM_FRAG_DROP	0x1ac	/* DS GEM fragments dropped              */
+#define CG_REG_GEM_1BITERR	0x1b0	/* GEM header 1-bit errors (corrected)   */
+#define CG_REG_GEM_2BITERR	0x1b4	/* GEM header 2-bit errors               */
+#define CG_REG_GEM_UNCORR	0x1b8	/* GEM header uncorrectable errors       */
+#define CG_REG_BWMAP_DROP	0x1bc	/* upstream BWmap entries dropped        */
+#define CG_REG_OMCI_CRC		0x1c0	/* DS OMCI CRC failures                  */
+#define CG_REG_PLEND_ERR	0x1c4	/* PLend field errors                    */
+#define CG_REG_PLEND_BITERR	0x1c8	/* PLend bit errors                      */
+#define CG_REG_DS_ASMBL_DROP	0x1cc	/* DS reassembly-FIFO drops              */
+#define CG_REG_BWMAP_UNCORR	0x1f8	/* BWmap uncorrectable bit errors        */
+#define CG_REG_BWMAP_CORR	0x1fc	/* BWmap corrected bit errors            */
+/* FEC block.  The five counters have no clear function in stock, so whether
+ * they self-clear is NOT established — they are published raw and labelled
+ * accordingly rather than presented as cumulative totals. */
+#define CG_REG_FEC_CTRL		0x800
+#define CG_REG_FEC_MISC_STATUS	0x804
+#define CG_REG_FEC_CORR_BLK	0x808	/* correctable FEC blocks   */
+#define CG_REG_FEC_UNCORR_BLK	0x80c	/* uncorrectable FEC blocks */
+#define CG_REG_FEC_CLEAN_BLK	0x810	/* error-free FEC blocks    */
+#define CG_REG_FEC_BLK_TOTAL	0x814	/* total FEC blocks         */
+#define CG_REG_FEC_CORR_BYTES	0x818	/* bytes corrected by FEC   */
 
 #define CG_PUC_TCONT_NUM	32	/* AAL_GPON_SYSTEM_MAX_TCONT_NUM */
 #define CG_PUC_QUEUE_PER_TCONT	8	/* 8Q mode */
@@ -501,6 +652,22 @@ struct cortina_gpon {
 	u32 omci_rx_short;		/* runt PDUs (< 8 bytes, not decodable) */
 	bool pdc_ready;			/* PDC map + CTRL programmed */
 	bool puc_ready;			/* PUC US-VoQ admission programmed */
+
+	/*
+	 * The PUC control-packet counters, made CUMULATIVE in software.  The
+	 * hardware counters are clear-on-read and hold only a short window, so
+	 * a snapshot of them says nothing on an idle device; summing the deltas
+	 * does.  Exactly one function reads those registers
+	 * (cg_puc_ctrl_sample), which is what lets any number of concurrent
+	 * readers of /proc/gpon ADD to these totals instead of stealing from
+	 * them.
+	 */
+	spinlock_t puc_cnt_lock;	/* serializes the read-and-add */
+	struct delayed_work puc_cnt_work;	/* samples shortly after a US OMCI TX */
+	u32 puc_omci_us;		/* upstream OMCI (link-type 0xfff1) frames */
+	u32 puc_ctrl_mac;		/* upstream MAC-type control frames */
+	u32 puc_len_err;		/* upstream frames failing the length check */
+	u32 puc_cnt_samples;		/* reads folded in (0 = never sampled) */
 
 	/* Stage C: the G.988 OMCI responder + US OMCI TX */
 	struct omci_onu *omci;		/* responder context (kzalloc'd at probe) */
@@ -1165,6 +1332,19 @@ static void cg_puc_init(struct cortina_gpon *cg)
 	v = (v & ~GENMASK(21, 16)) | (30u << 16) | BIT(31);
 	writel(v, pon + CG_PUC_GLOBAL_PLOAM_CFG);
 
+	/*
+	 * That same link type is what makes the control-packet counter an
+	 * OMCI-specific one (see cg_puc_ctrl_sample).  It is a hardware reset
+	 * default, so check it rather than write it: were it ever something
+	 * else, /proc's us_omci would quietly become a counter of nothing, and a
+	 * witness that reads 0 for a reason nobody can see is worse than none.
+	 */
+	v = readl(pon + CG_PUC_GLOBAL_LNK_TYPE) >> 16;
+	if (v != CG_PUC_LNK_TYPE_OMCI)
+		dev_warn(cg->dev,
+			 "PUC control-packet link type is 0x%04x, expected 0x%04x: the upstream OMCI frame count will not match\n",
+			 v, CG_PUC_LNK_TYPE_OMCI);
+
 	/* back-pressure: drop off, bp on, threshold 0x100 */
 	v = readl(pon + CG_PUC_BPCNTL);
 	v = (v & ~(BIT(4) | GENMASK(30, 16))) | BIT(0) | (0x100u << 16);
@@ -1183,9 +1363,6 @@ static void cg_puc_init(struct cortina_gpon *cg)
 	writel(0x00c80000, pon + CG_PUC_Q2PQSRCFG01);	/* lv0=0, lv1=0xc8 */
 	writel(0x05c201b8, pon + CG_PUC_Q2PQSRCFG23);	/* lv2=0x1b8, lv3=0x5c2 */
 
-	/* PUC<->US-scheduler interface: cntr clear-on-read */
-	writel(CG_XGPN_PUCIF_CTRL_VAL, pon + CG_XGPN_PUCIF_CTRL);
-
 	/* aggregate shaper + PIR (rate limiter off) */
 	v = readl(pon + CG_PUC_CTRL);
 	v = (v | BIT(30)) & ~BIT(26);	/* shp_en=1, rl_en=0 */
@@ -1197,8 +1374,79 @@ static void cg_puc_init(struct cortina_gpon *cg)
 
 	cg->puc_ready = true;
 	dev_info(cg->dev,
-		 "PUC: OMCC T-CONT0 VoQs + 9th-queue enabled, puccfg=0x%08x pucif=0x%08x\n",
-		 readl(pon + CG_PUC_PUCCFG), readl(pon + CG_XGPN_PUCIF_CTRL));
+		 "PUC: OMCC T-CONT0 VoQs + 9th-queue enabled, puccfg=0x%08x lnk_type=0x%04x\n",
+		 readl(pon + CG_PUC_PUCCFG),
+		 readl(pon + CG_PUC_GLOBAL_LNK_TYPE) >> 16);
+}
+
+/*
+ * Fold one read of the PUC control-packet counters into the cumulative totals.
+ *
+ * ★ These counters are CLEAR-ON-READ (PUCCFG.inccfg=2, which is what stock sets
+ * too) and the block also drops them after a short idle window, so a snapshot is
+ * only ever "did a control frame arrive in the last instant" — which on a
+ * working but idle ONU is always no.  Turning that into a usable witness needs
+ * two things:
+ *
+ *   1. clear-on-read makes every read a DELTA since the previous read, so the
+ *      sum of all reads is the exact total, with no double counting.  The mode
+ *      that looks like a bug is what makes the accumulation exact;
+ *   2. this must be the ONLY reader.  It is: nothing else in the driver touches
+ *      +0x174/+0x178/+0x188, and /proc/gpon calls THIS rather than reading them.
+ *      So a concurrent, unrelated /proc/gpon poller — a monitor sampling the
+ *      node every few seconds, say — CONTRIBUTES a delta instead of destroying
+ *      one.  With a plain readl in the show function it would instead silently
+ *      steal every count it happened to land on, which is precisely how a
+ *      snapshot of the neighbouring us_rx came to be structurally guaranteed to
+ *      read 0 on a healthy board.
+ *
+ * The window counters BMC_RX_PKT/_ENQ/FORCE_DROP are deliberately NOT sampled
+ * here: they are read raw by the show function as a burst-delta instrument, and
+ * a second reader would be exactly the theft described above.
+ *
+ * Why accumulate in software rather than ask the hardware to stop clearing:
+ * PUCCFG.inccfg is block-global (it governs every PUC counter, not just these
+ * three), stock writes 2 into it unconditionally before any PON-mode branch, and
+ * no source establishes an encoding that means "accumulate" — the reset default
+ * is a third value whose meaning is undocumented.  Diverging from stock inside
+ * the upstream admission block, on a guess, to save a few lines of adding is a
+ * bad trade.  The 16-bit fields cannot overflow between samples either: a sample
+ * follows every OMCI transmit within milliseconds, and 65535 control frames do
+ * not fit in one window.
+ */
+static void cg_puc_ctrl_sample(struct cortina_gpon *cg)
+{
+	void __iomem *pon = cg->pon;
+
+	if (!cg->puc_ready)
+		return;
+	spin_lock(&cg->puc_cnt_lock);
+	cg->puc_omci_us += readl(pon + CG_PUC_BMC_CTRL_PKT_LNK) &
+			   CG_PUC_BMC_CNTR_MASK;
+	cg->puc_ctrl_mac += readl(pon + CG_PUC_BMC_CTRL_PKT_MAC) &
+			    CG_PUC_BMC_CNTR_MASK;
+	cg->puc_len_err += readl(pon + CG_PUC_BMC_LENGTH_ERROR) &
+			   CG_PUC_BMC_CNTR_MASK;
+	cg->puc_cnt_samples++;
+	spin_unlock(&cg->puc_cnt_lock);
+}
+
+/*
+ * Sample shortly after an upstream OMCI frame was handed to the NI: the PDU
+ * reaches the PUC by DMA microseconds later, well inside the counter's window,
+ * and this is the one moment at which the OMCI counter is expected to move.  A
+ * burst of replies coalesces into one sample (the counter accumulates in
+ * hardware meanwhile, so nothing is lost) — that is why a re-arm while already
+ * queued is a no-op rather than a reschedule.
+ */
+#define CG_PUC_CNT_TX_DELAY_MS	20
+
+static void cg_puc_cnt_work(struct work_struct *work)
+{
+	struct cortina_gpon *cg = container_of(to_delayed_work(work),
+					       struct cortina_gpon, puc_cnt_work);
+
+	cg_puc_ctrl_sample(cg);
 }
 
 /*
@@ -2075,6 +2323,109 @@ static void cg_omci_tx(struct cortina_gpon *cg, const u8 *pdu48)
 		dev_warn_ratelimited(cg->dev, "US OMCI TX failed (%d)\n", ret);
 	} else {
 		cg->omci_tx++;
+		/* The frame is on its way to the PUC; read the OMCI-specific
+		 * control-packet counter once it has arrived, while its
+		 * clear-on-read window still holds it (cg_puc_ctrl_sample). */
+		schedule_delayed_work(&cg->puc_cnt_work,
+				      msecs_to_jiffies(CG_PUC_CNT_TX_DELAY_MS));
+	}
+}
+
+/*
+ * What ME 263 ANI-G #10/#14 currently serve the OLT, and whether that is a real
+ * DDM measurement or the static fallback.  Printed right under the optical
+ * block so a stub can never be mistaken for a live optical level: "FALLBACK"
+ * means the OLT is being told a plausible-looking constant.
+ */
+/*
+ * Print an optical power in centi-dBm, or "-inf" when the optic reports no
+ * light at all.  A numeric 0 there would read as a perfectly healthy +0 dBm —
+ * exactly the kind of fabricated value the whole DDM path exists to avoid — and
+ * "-inf" also makes the scrapers' "(-?\d+)" fail to match, so a consumer sees
+ * "no reading" instead of a wrong one.
+ */
+static void cg_seq_cdbm(struct seq_file *m, s32 cdbm)
+{
+	if (cdbm == CG_DDM_CDBM_NONE)
+		seq_puts(m, "-inf");
+	else
+		seq_printf(m, "%d", cdbm);
+}
+
+static void cg_optic_anig_show(struct cortina_gpon *cg, struct seq_file *m)
+{
+	if (!cg->omci) {
+		seq_puts(m, "optic_anig     = (responder not allocated)\n");
+		return;
+	}
+	seq_printf(m, "optic_anig     = %s  me263 #10 rx=0x%04x #14 tx=0x%04x  (G.988 0.002 dB units)\n",
+		   cg->omci->anig_live ? "live" : "FALLBACK (static, no DDM sample yet)",
+		   cg->omci->anig_rx_level, cg->omci->anig_tx_level);
+}
+
+/*
+ * Sample the optic's SFF-8472 A2h diagnostics, print them to @m when it is
+ * non-NULL, and publish the two optical levels into ME 263 ANI-G #10/#14 so the
+ * OLT's optical view of this ONU is a real measurement rather than a constant.
+ *
+ * PROCESS CONTEXT ONLY — cg_bosa_ddm_read() sleeps.  The read therefore happens
+ * OUTSIDE omci_lock and only the two converted u16 are copied in under it.
+ *
+ * Sampled on demand (here and at ~31s post-O5, which is when the OLT starts its
+ * ANI-G audit) rather than from a timer: ten byte-reads at 100 kHz cost ~1 ms,
+ * and the project has been bitten badly by self-invented periodic handlers, so
+ * a poll timer would have to earn its keep.  A failed read leaves the
+ * responder's conformant static fallback in place — the OLT must never get
+ * silence — and prints an explicit "unavailable", never a fabricated 0.
+ */
+static void cg_optic_sample(struct cortina_gpon *cg, struct seq_file *m)
+{
+	struct cg_bosa_ddm d;
+	s32 rx_cdbm, tx_cdbm;
+
+	if (cg_bosa_ddm_read(cg->dev, &d) != CG_DDM_OK) {
+		if (m) {
+			seq_printf(m, "optic_ddm      = %s\n",
+				   cg_ddm_status_str(d.status));
+			cg_optic_anig_show(cg, m);
+		}
+		return;
+	}
+
+	rx_cdbm = cg_ddm_uw10_to_cdbm(d.rx_pwr);
+	tx_cdbm = cg_ddm_uw10_to_cdbm(d.tx_pwr);
+
+	if (cg->omci) {
+		u16 rx = cg_ddm_cdbm_to_omci(rx_cdbm);
+		u16 tx = cg_ddm_cdbm_to_omci(tx_cdbm);
+
+		spin_lock_bh(&cg->omci_lock);
+		omci_onu_set_optical(cg->omci, rx, tx);
+		spin_unlock_bh(&cg->omci_lock);
+	}
+
+	if (m) {
+		unsigned int i;
+
+		seq_printf(m, "optic_ddm      = live (SFF-8472 A2h 0x%02x-0x%02x)\n",
+			   CG_DDM_BASE, CG_DDM_BASE + CG_DDM_LEN - 1);
+		/* The RAW word sits beside every scaled value on purpose: the
+		 * 0.1 uW LSB is the one thing about RX power this module has not
+		 * independently confirmed (see cortina-gpon-ddm.h), so a reader must
+		 * always be able to re-derive the level without a firmware change. */
+		seq_printf(m, "optic_rx_raw: 0x%04x optic_rx_cdbm: ", d.rx_pwr);
+		cg_seq_cdbm(m, rx_cdbm);
+		seq_printf(m, " optic_tx_raw: 0x%04x\n", d.tx_pwr);
+		seq_printf(m, "optic_env:   temp_dc=%d bias_ua=%u tx_cdbm=",
+			   cg_ddm_temp_dc(d.temp), cg_ddm_bias_ua(d.bias));
+		cg_seq_cdbm(m, tx_cdbm);
+		seq_printf(m, " vcc_mv=%u\n", cg_ddm_vcc_mv(d.vcc));
+		seq_printf(m, "optic_ddm_raw: %02x..%02x =",
+			   CG_DDM_BASE, CG_DDM_BASE + CG_DDM_LEN - 1);
+		for (i = 0; i < CG_DDM_LEN; i++)
+			seq_printf(m, " %02x", d.raw[i]);
+		seq_putc(m, '\n');
+		cg_optic_anig_show(cg, m);
 	}
 }
 
@@ -2089,6 +2440,11 @@ static void cg_veip_avc_work(struct work_struct *work)
 	u8 frame[OMCI_LEN];
 	bool emit = false;
 
+	/* Publish a live optical reading before the AVC: this fires ~31s after
+	 * O5, i.e. just as the OLT begins auditing ANI-G, so its first optical
+	 * GET already gets a measurement instead of the static fallback. */
+	cg_optic_sample(cg, NULL);
+
 	spin_lock_bh(&cg->omci_lock);
 	if (cg->omci_active && !cg->omci->avc_veip_up_sent) {
 		omci_onu_emit_veip_up_avc(cg->omci, frame);
@@ -2099,6 +2455,77 @@ static void cg_veip_avc_work(struct work_struct *work)
 		cg_omci_tx(cg, frame);
 		dev_info(cg->dev, "VEIP oper-up AVC emitted (~31s post-O5)\n");
 	}
+}
+
+/*
+ * Per-message OMCI trace.  DEFAULT OFF.
+ *
+ * The always-on instruments answer the AGGREGATE questions: /proc/gpon
+ * "ds_omci_rx = N (short=M)" and "omci_resp = armed tx= fail= ds_crc ok= bad=
+ * mds= store= avc= unhandled= dup_replay= ext= no_ack=", plus the
+ * unconditional event lines ("FSM x -> y", "Deactivate_ONU-ID received",
+ * "OMCI cfg mt=.. me=..", "OMCI: data T-CONT/GEM ..").
+ *
+ * What no counter can answer is the PER-MESSAGE one: which attributes did the
+ * OLT request in THIS Get, and which of them did we actually answer?  That
+ * comparison is the only way to see the ME-model defect class that strands an
+ * OLT in a Get audit loop — an attribute the OLT audits that our ME table does
+ * not model at all.  So this trace reports, per downstream PDU: message type,
+ * ME class/instance, length and, for a Get:
+ *   mask   = attributes the OLT requested       (request octets 8..9)
+ *   rmask  = attributes we actually emitted     (response octets 9..10)
+ *   unsup  = requested but NOT MODELLED by us   (response octets 36..37)
+ *   failed = modelled but did not fit the 25-octet value area (octets 38..39)
+ *   rc     = the response result code           (response octet 8)
+ *
+ * unsup != 0 is the real defect signal.  failed != 0 is legitimate G.988
+ * behaviour (a Get whose selected attributes overflow the value area; the OLT
+ * must then split it), which is exactly why the two are reported separately
+ * instead of just "rmask != mask" — the latter cannot tell a missing attribute
+ * from a correctly-reported overflow.
+ *
+ * Off by default because a MIB-upload walk is ~100 PDUs and this is a shipping
+ * image; cost when off is one unlikely() test per downstream OMCI PDU, on the
+ * control path, not the packet fast path.  Rate-limited when on so a broken or
+ * hostile OLT cannot wedge the console, with a burst generous enough that a
+ * whole MIB-upload walk still gets through intact.
+ *
+ * Enable at runtime:  echo 1 > /sys/module/cortina_gpon/parameters/omci_trace
+ * or on the kernel command line:  cortina_gpon.omci_trace=1
+ */
+static bool cg_omci_trace;
+module_param_named(omci_trace, cg_omci_trace, bool, 0644);
+MODULE_PARM_DESC(omci_trace, "log one line per downstream OMCI PDU: message type, ME class/instance and, for a Get, the requested vs answered vs unmodelled attribute masks (default OFF)");
+
+/*
+ * Emit one trace line for the PDU just processed.  @resp/@n are the responder's
+ * output (@n == OMCI_LEN when a response was built, 0 when none was) and are
+ * only decoded when a response exists — resp[] is otherwise uninitialised.
+ */
+static void cg_omci_trace_one(struct cortina_gpon *cg, const u8 *pdu,
+			      unsigned int len, const u8 *resp, int n,
+			      const char *name)
+{
+	static DEFINE_RATELIMIT_STATE(rs, 5 * HZ, 512);
+	bool is_get = (pdu[2] & 0x1f) == 9;	/* G.988 Table 11.2.2-1: Get */
+	char det[80];
+
+	if (!__ratelimit(&rs))
+		return;
+	det[0] = '\0';
+	if (is_get && len >= 10 && n == OMCI_LEN)
+		scnprintf(det, sizeof(det),
+			  " mask=0x%04x rmask=0x%04x unsup=0x%04x failed=0x%04x rc=%u",
+			  ((u16)pdu[8] << 8) | pdu[9],
+			  ((u16)resp[9] << 8) | resp[10],
+			  ((u16)resp[36] << 8) | resp[37],
+			  ((u16)resp[38] << 8) | resp[39], resp[8]);
+	else if (n != OMCI_LEN)
+		scnprintf(det, sizeof(det), " noresp");
+	dev_info(cg->dev, "OMCI DS: MT=0x%02x %s class=%u inst=%u len=%u%s\n",
+		 pdu[2], is_get ? "GET" : name,
+		 ((u16)pdu[4] << 8) | pdu[5], ((u16)pdu[6] << 8) | pdu[7],
+		 len, det);
 }
 
 /*
@@ -2271,6 +2698,8 @@ static void cg_rx_omci(const u8 *pdu, unsigned int len)
 		spin_unlock(&cg->omci_lock);
 		if (n == OMCI_LEN)
 			cg_omci_tx(cg, resp);
+		if (unlikely(cg_omci_trace))
+			cg_omci_trace_one(cg, pdu, len, resp, n, name);
 	}
 }
 
@@ -2583,6 +3012,79 @@ static void cg_read_vendor(struct cortina_gpon *cg, char out[5])
 	out[4] = '\0';
 }
 
+/*
+ * The GPON-MAC hardware error/statistics counters.
+ *
+ * These are the instruments that let this ONU characterise an *unknown* OLT:
+ * BIP-8 and FEC tell you the downstream link quality the far end is actually
+ * delivering, the GEM/PLend/BWmap error counters say whether a frame was
+ * mangled in the GTC layer rather than never sent, and ds_asmbl_drop /
+ * gem_frag_drop distinguish "the OLT never sent it" from "it arrived and this
+ * ONU dropped it inside the GEM stage" — which is exactly the attribution a
+ * downstream-delivery fault needs, and which no software counter can provide.
+ *
+ * Read-only and idempotent by design; see the register block comment for why
+ * there is deliberately no accumulator here.  `state=` is the runtime support
+ * probe: an undecoded or powered-down block reads all-ones, and a caller must
+ * treat that as "not available on this hardware", not as a zero measurement.
+ */
+static void cg_show_gpon_mib(struct seq_file *m, struct cortina_gpon *cg)
+{
+	u32 bip = cg_mac_rd(cg, CG_REG_BIP_ERR);
+	u32 accum = cg_mac_rd(cg, CG_REG_BIP_ERR_ACCUM);
+	u32 frames = cg_mac_rd(cg, CG_REG_BIP_ERR_FRAMES);
+	u32 fec_total = cg_mac_rd(cg, CG_REG_FEC_BLK_TOTAL);
+	u32 v;
+	bool live = !(bip == U32_MAX && accum == U32_MAX &&
+		      frames == U32_MAX && fec_total == U32_MAX);
+
+	seq_printf(m,
+		   "gpon_ds_err    = %s bip=%u bip_accum=%u bip_frames=%u gem_frag_drop=%u gem_1bit=%u gem_2bit=%u gem_uncorr=%u omci_crc=%u ds_asmbl_drop=%u (accumulating, sw-cleared)\n",
+		   live ? "live" : "UNAVAILABLE (block reads all-ones)",
+		   bip, accum, frames,
+		   cg_mac_rd(cg, CG_REG_GEM_FRAG_DROP),
+		   cg_mac_rd(cg, CG_REG_GEM_1BITERR),
+		   cg_mac_rd(cg, CG_REG_GEM_2BITERR),
+		   cg_mac_rd(cg, CG_REG_GEM_UNCORR),
+		   cg_mac_rd(cg, CG_REG_OMCI_CRC),
+		   cg_mac_rd(cg, CG_REG_DS_ASMBL_DROP));
+	seq_printf(m,
+		   "gpon_ds_mib    = omci_gem=%u omci_pkt=%u ds_crc=%u undersize=%u oversize=%u superframe=%u (hardware DS counts)\n",
+		   cg_mac_rd(cg, CG_REG_DS_OMCI_GEM),
+		   cg_mac_rd(cg, CG_REG_DS_OMCI_PKT),
+		   cg_mac_rd(cg, CG_REG_DS_PKT_CRC),
+		   cg_mac_rd(cg, CG_REG_DS_UNDERSIZE),
+		   cg_mac_rd(cg, CG_REG_DS_OVERSIZE),
+		   cg_mac_rd(cg, CG_REG_SUPERFRAME));
+	seq_printf(m,
+		   "gpon_us_grant  = bwmap_drop=%u bwmap_corr=%u bwmap_uncorr=%u plend_err=%u plend_biterr=%u o5=%u us_omcc=%u (us_omcc UNVALIDATED)\n",
+		   cg_mac_rd(cg, CG_REG_BWMAP_DROP),
+		   cg_mac_rd(cg, CG_REG_BWMAP_CORR),
+		   cg_mac_rd(cg, CG_REG_BWMAP_UNCORR),
+		   cg_mac_rd(cg, CG_REG_PLEND_ERR),
+		   cg_mac_rd(cg, CG_REG_PLEND_BITERR),
+		   cg_mac_rd(cg, CG_REG_O5),
+		   cg_mac_rd(cg, CG_REG_US_OMCC_CNT));
+	/*
+	 * The hardware's own upstream-wedge witness.  There is currently NO
+	 * witness at all for "the GPON-MAC to PUC interface hung", which is the
+	 * failure this latch reports — and it names the offending T-CONT.
+	 */
+	v = cg_mac_rd(cg, CG_REG_PUCIF_PROTECT);
+	seq_printf(m,
+		   "gpon_pucif_hang= %s (raw=0x%08x, tcont=%u) (latched, not cleared by this read)\n",
+		   (v & BIT(0)) ? "★ HUNG" : "no", v, (v >> 1) & 0x1f);
+	seq_printf(m,
+		   "gpon_fec       = ctrl=0x%08x status=0x%08x total=%u clean=%u corr=%u uncorr=%u corr_bytes=%u (clear semantics UNPROVEN)\n",
+		   cg_mac_rd(cg, CG_REG_FEC_CTRL),
+		   cg_mac_rd(cg, CG_REG_FEC_MISC_STATUS),
+		   fec_total,
+		   cg_mac_rd(cg, CG_REG_FEC_CLEAN_BLK),
+		   cg_mac_rd(cg, CG_REG_FEC_CORR_BLK),
+		   cg_mac_rd(cg, CG_REG_FEC_UNCORR_BLK),
+		   cg_mac_rd(cg, CG_REG_FEC_CORR_BYTES));
+}
+
 static int cg_proc_show(struct seq_file *m, void *v)
 {
 	struct cortina_gpon *cg = m->private;
@@ -2627,20 +3129,48 @@ static int cg_proc_show(struct seq_file *m, void *v)
 	seq_printf(m, "ds_omci_rx     = %u (short=%u)  pdc_ctrl = 0x%08x (%s, expect 0x02870002)\n",
 		   cg->omci_rx, cg->omci_rx_short, readl(cg->pon + CG_PDC_CTRL),
 		   cg->pdc_ready ? "programmed" : "NOT programmed");
+	/*
+	 * us_rx/enq/drop are the SHORT-WINDOW upstream-admission counters, read
+	 * raw on purpose: they are only meaningful as a delta across a burst of
+	 * upstream frames the reader generates itself (an idle but perfectly
+	 * healthy ONU reads 0 0 0).  FORCE_DROP is a 16-bit field, so the
+	 * reserved upper half must not be printed as part of the count.
+	 */
 	seq_printf(m, "puc            = %s  us_rx=%u enq=%u drop=%u  pucif=0x%08x\n",
 		   cg->puc_ready ? "programmed" : "NOT programmed",
 		   readl(cg->pon + CG_PUC_BMC_RX_PKT),
 		   readl(cg->pon + CG_PUC_BMC_RX_PKT_ENQ),
-		   readl(cg->pon + CG_PUC_BMC_FORCE_DROP),
-		   readl(cg->pon + CG_XGPN_PUCIF_CTRL));
+		   readl(cg->pon + CG_PUC_BMC_FORCE_DROP) & CG_PUC_BMC_CNTR_MASK,
+		   readl(cg->pon + CG_GPON_MAC_PUCIF_CTRL));
+	/*
+	 * ...and the OMCI-SPECIFIC upstream witness, CUMULATIVE: the count of
+	 * upstream frames the PUC matched against the OMCI link type, summed
+	 * from the clear-on-read deltas (see cg_puc_ctrl_sample).  Reading this
+	 * line takes a sample itself, so a poller feeds the totals instead of
+	 * stealing from them.  us_omci is the one number here that upstream
+	 * user data can never inflate; pair it with omci_resp's tx= below (what
+	 * the responder handed to the transmit ring) to tell "the OLT got no
+	 * reply because we built none" from "...because it never left the CPU".
+	 */
+	cg_puc_ctrl_sample(cg);
+	spin_lock(&cg->puc_cnt_lock);
+	seq_printf(m,
+		   "puc_ctrl       = us_omci=%u ctrl_mac=%u len_err=%u samples=%u lnk_type=0x%04x (cumulative)\n",
+		   cg->puc_omci_us, cg->puc_ctrl_mac, cg->puc_len_err,
+		   cg->puc_cnt_samples,
+		   readl(cg->pon + CG_PUC_GLOBAL_LNK_TYPE) >> 16);
+	spin_unlock(&cg->puc_cnt_lock);
+	cg_show_gpon_mib(m, cg);
 	seq_printf(m, "omci_resp      = %s tx=%u fail=%u ds_crc ok=%u bad=%u",
 		   cg->omci_active ? "armed" : "off",
 		   cg->omci_tx, cg->omci_tx_fail,
 		   cg->omci_ds_crc_ok, cg->omci_ds_crc_bad);
 	if (cg->omci)
-		seq_printf(m, "  mds=%u store=%u avc=%u unhandled=%u",
+		seq_printf(m, "  mds=%u store=%u avc=%u unhandled=%u dup_replay=%u ext=%u no_ack=%u",
 			   cg->omci->mds, cg->omci->store_n,
-			   cg->omci->avc_count, cg->omci->unhandled);
+			   cg->omci->avc_count, cg->omci->unhandled,
+			   cg->omci->dup_replay, cg->omci->rx_extended,
+			   cg->omci->no_ack);
 	seq_putc(m, '\n');
 	seq_printf(m, "data           = %s alloc=%u (me 0x%04x) gem=%u (tcont-ptr 0x%04x dir %u) bcast=%u carrier=%d\n",
 		   cg->data_installed ? "INSTALLED" : "down",
@@ -2687,6 +3217,8 @@ static int cg_proc_show(struct seq_file *m, void *v)
 		   readl(cg->gpio + CG_PERGPIO_CFG3), readl(cg->gpio + CG_PERGPIO_OUT3),
 		   readl(cg->gpio + CG_PERGPIO_CFG4), readl(cg->gpio + CG_PERGPIO_OUT4));
 	cg_bosa_proc_show(cg->dev, m);
+	/* live optical diagnostics; also refreshes the ANI-G levels the OLT reads */
+	cg_optic_sample(cg, m);
 
 	/* full GPON MAC block dump (nonzero) for diffing against the stock golden.
 	 * SKIP int_top (0xa4, READ-CLEARS: a cat of /proc must never eat a pending
@@ -2803,9 +3335,11 @@ static int cortina_gpon_probe(struct platform_device *pdev)
 	 * ever initializes it, never allocates.  ~7 KB. */
 	spin_lock_init(&cg->omci_lock);
 	mutex_init(&cg->sn_lock);
+	spin_lock_init(&cg->puc_cnt_lock);
 	INIT_DELAYED_WORK(&cg->veip_avc_work, cg_veip_avc_work);
 	INIT_DELAYED_WORK(&cg->coldstart_work, cg_coldstart_work);
 	INIT_DELAYED_WORK(&cg->sn_wait_work, cg_sn_wait_work);
+	INIT_DELAYED_WORK(&cg->puc_cnt_work, cg_puc_cnt_work);
 	cg->omci = devm_kzalloc(dev, sizeof(*cg->omci), GFP_KERNEL);
 	if (!cg->omci)
 		dev_warn(dev, "no OMCI responder ctx - DS OMCI will not be answered\n");
@@ -2938,6 +3472,7 @@ static void cortina_gpon_remove(struct platform_device *pdev)
 	cancel_delayed_work_sync(&cg->veip_avc_work);
 	cancel_delayed_work_sync(&cg->coldstart_work);
 	cancel_delayed_work_sync(&cg->sn_wait_work);
+	cancel_delayed_work_sync(&cg->puc_cnt_work);
 	cg_intr_teardown(cg);
 	if (cg->wan_ndev) {
 		unregister_netdev(cg->wan_ndev);
