@@ -4520,7 +4520,7 @@ static int cortina_ni_rx_eq_init(struct cortina_ni *ni)
 	 * cpu_eq=1 pool, so under software ownership this range must point at the
 	 * hardware-managed pool instead.  Stock likewise gives 16..47 a different
 	 * pool pair from its CPU ports. */
-	for (i = CA_NI_RX_DEEPQ_DEST_PORT_HI + 1; i <= CA_NI_QM_DEST_PORT_MAX; i++)
+	for (i = CA_NI_RX_DEEPQ_DEST_PORT_HI + 1; i <= CA_NI_QM_DEST_PORT_LAST; i++)
 		writel(cpu_pool_push ?
 		       FIELD_PREP(CA_NI_QM_DEST_PORT_PROF_SEL,
 				  CA_NI_RX_DQ_PROFILE_SEL) :

@@ -1370,7 +1370,18 @@ enum cortina_ni_win {
 #define CA_NI_RX_DEEPQ_DEST_PORT_HI	15
 /* highest DEST_PORT_EQ_CFG index (0x6168 + 0x2f*4 = 0x6224); stock configures the
  * whole CPU/PON range up to here, ours left 16..0x2f at profile 0 -> empty EQ0 */
+/* ★★ THE TABLE HAS 32 ENTRIES, so the LAST VALID INDEX IS 31 -- not 0x2f.
+ * DEST_PORT_MAX is the dest-port NUMBER SPACE (0..0x2f), which is NOT the same
+ * thing as the table length, and looping to it walks 16 entries off the end:
+ * index 38/39/40 resolve to 0x6200/04/08, which is EQ_PROFILE_GLOBAL(0..2).
+ * That silently overwrote the three global profiles written a few lines
+ * earlier.  It was invisible while both writes happened to store the same
+ * value, and became live the moment the dest-port loop started writing a
+ * different profile for the tagged-WAN fix (2026-07-28).
+ * Use CA_NI_QM_DEST_PORT_LAST to bound any loop over the table. */
 #define CA_NI_QM_DEST_PORT_MAX		0x2f
+#define CA_NI_QM_DEST_PORT_ENTRIES	32
+#define CA_NI_QM_DEST_PORT_LAST		(CA_NI_QM_DEST_PORT_ENTRIES - 1)
 /* dest-port (index = ldpid - 0x10; CPU port 0 = 0) -> EQ-profile select */
 /* per-dest-port EQ-profile select: authoritative base QM_QM_DEST_PORT0_EQ_CFG
  * = ELNATH 0x6168 (rtl8277c 0x6148), stride 4, 32 entries.  CPU dest port = 8,
