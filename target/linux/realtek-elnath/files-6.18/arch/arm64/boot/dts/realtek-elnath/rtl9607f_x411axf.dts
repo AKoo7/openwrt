@@ -392,4 +392,214 @@
 			#interrupt-cells = <0x01>;
 		};
 	};
+
+	/*
+	 * ======================= FRONT PANEL: GPIO, LEDs, BUTTONS ==============
+	 *
+	 * The SoC's peripheral GPIO block is five 32-pin groups, three words each
+	 * (CFG/OUT/IN) at PERI + 0x300 + 0x24 * group, plus one pin-mux word per
+	 * group at GLB + 0x130 + 4 * group where setting bit N routes pin N to the
+	 * GPIO block.  One node per group, so only the three groups this board
+	 * actually uses are mapped; the second reg entry is that group's mux word,
+	 * which the driver OR-s the requested pin into (we build without PINCTRL,
+	 * so nothing else would route the pad).
+	 *
+	 * Only CFG/OUT/IN are mapped (length 0xc).  The rest of each 0x24 bank
+	 * block is interrupt logic, which the driver does not implement — hence the
+	 * buttons below are gpio-keys-POLLED.
+	 *
+	 * ★ Shared with the GPON driver: cortina-gpon's cg_laser_on() also writes
+	 * these same CFG/OUT words for the BOSA/laser nets it owns, including
+	 * whole-register stores to groups 3 and 4.  That is why this driver only
+	 * ever read-modify-writes single bits and maps the window non-exclusively.
+	 * A consequence to be aware of: the GPON driver re-applies stock's group-3
+	 * snapshot on every (re-)activation, which momentarily forces the LED levels
+	 * on this list; the panel daemon re-asserts them on its next poll.
+	 */
+	gpio0: gpio@f4329300 {
+		compatible = "cortina,ca77xx-gpio";
+		reg = <0x04 0xf4329300 0x00 0x0c>,	/* group 0 CFG/OUT/IN   */
+		      <0x04 0xf4320130 0x00 0x04>;	/* group 0 pin-mux word */
+		gpio-controller;
+		#gpio-cells = <0x02>;
+		ngpios = <0x10>;
+	};
+
+	gpio3: gpio@f432936c {
+		compatible = "cortina,ca77xx-gpio";
+		reg = <0x04 0xf432936c 0x00 0x0c>,	/* group 3 CFG/OUT/IN   */
+		      <0x04 0xf432013c 0x00 0x04>;	/* group 3 pin-mux word */
+		gpio-controller;
+		#gpio-cells = <0x02>;
+		ngpios = <0x19>;
+	};
+
+	gpio4: gpio@f4329390 {
+		compatible = "cortina,ca77xx-gpio";
+		reg = <0x04 0xf4329390 0x00 0x0c>,	/* group 4 CFG/OUT/IN   */
+		      <0x04 0xf4320140 0x00 0x04>;	/* group 4 pin-mux word */
+		gpio-controller;
+		#gpio-cells = <0x02>;
+		ngpios = <0x11>;
+	};
+
+	/*
+	 * Front-panel LEDs.  The panel carries twelve: PWR, PON, LOS, NET, LAN1-4,
+	 * 2.4G, 5G, WPS, FXS1 (operator-confirmed).  The ten below are the ones on
+	 * SoC GPIO; 2.4G and 5G are NOT — they hang off each WiFi chip's own LED pad
+	 * and so cannot be declared here, because no SoC GPIO reaches them (a guessed
+	 * GPIO would drive some other net).  They are not a gap any more: each pad is
+	 * the WiFi MAC's GPIO 8, and our rtw89 registers a led_classdev per radio for
+	 * it (drivers/net/wireless/realtek/rtw89/led.c, CONFIG_RTW89_LEDS), naming
+	 * them x411axf:green:2.4g and x411axf:green:5g to match the ten below.
+	 * mac80211's throughput trigger then holds each one on while its radio is up.
+	 * Do NOT add them to this node.
+	 *
+	 * Pin numbers come from the stock firmware's own device tree, whose vendor
+	 * LED node spells each LED as <gpio-bank-phandle, pin-in-bank, flags> —
+	 * the ordinary OF GPIO specifier, as its sibling standard gpio-keys node
+	 * proves.  Flags are 0 on every LED there, i.e. ACTIVE HIGH, and that is
+	 * independently confirmed by live stock register values: at Online the
+	 * group-0 OUT word drives pin 6 (PWR) HIGH with pins 11 (LOS) and 12 (FXS)
+	 * LOW, and the group-3 OUT word drives pin 4 (PON) HIGH — exactly a running
+	 * ONU with a good fibre.  The set of pins stock configures as group-3
+	 * OUTPUTS is precisely this LED list plus the xgphy reset, which is what
+	 * makes the decode certain rather than plausible.
+	 *
+	 * The stock tree ALSO declares LED_USB0/LED_USB1; this board has no USB
+	 * port, so they are deliberately absent here.  That stock tree is a FAMILY
+	 * device tree — it covers models with USB, and conversely has no WiFi LED
+	 * although this board does.  Do not "restore" the USB entries from it.
+	 *
+	 * Names are OpenWrt-idiomatic <board>:<colour>:<function>; the vendor label
+	 * is kept in a comment so the mapping stays traceable.  Colours: the vendor
+	 * _G suffix means green (PWR/NET/WPS); PON green and LOS red are the
+	 * project's stated stock behaviour.  LAN and FXS1 colours are assumed green
+	 * and are cosmetic — they affect only the sysfs name, never a pin.
+	 */
+	leds {
+		compatible = "gpio-leds";
+
+		/* LED_PWR_G — group 0 pin 6.  On for the whole time we are up. */
+		led-power {
+			label = "x411axf:green:power";
+			gpios = <&gpio0 0x06 0x00>;
+			default-state = "on";
+		};
+
+		/* LED_PON — group 3 pin 4.  Driven by the panel daemon from the
+		 * GPON activation state (solid at O5, blinking while ranging). */
+		led-pon {
+			label = "x411axf:green:pon";
+			gpios = <&gpio3 0x04 0x00>;
+			default-state = "off";
+		};
+
+		/* LED_LOS — group 0 pin 11.  Daemon-driven: on ONLY while the
+		 * downstream optical signal is lost. */
+		led-los {
+			label = "x411axf:red:los";
+			gpios = <&gpio0 0x0b 0x00>;
+			default-state = "off";
+		};
+
+		/* LED_PPP_G — group 3 pin 12.  The panel silkscreen calls this
+		 * NET: internet/WAN reachability, daemon-driven from the WAN
+		 * interface state (PPPoE session up, or a WAN default route). */
+		led-net {
+			label = "x411axf:green:net";
+			gpios = <&gpio3 0x0c 0x00>;
+			default-state = "off";
+		};
+
+		/*
+		 * LED_EPHY0..3 — the four RJ45 link LEDs, group 3 pins 6/3/1/7.
+		 * Stock binds them to its per-port netdevs eth0.2/.3/.4/.5, i.e.
+		 * NI switch ports 0/1/2/3 in order (three independent sources in
+		 * the stock firmware agree: its switch node's per-port
+		 * netdev-name, its board_init.sh netdev-trigger wiring, and its
+		 * disabled hardware port-LED node).
+		 *
+		 * ★ We cannot use the netdev trigger for these: our clean-room NI
+		 * driver registers ONE netdev (eth0) for the whole switch, not a
+		 * per-port subdevice, so there is no netdev to bind per RJ45.  The
+		 * panel daemon drives them from the per-port PHY link state the
+		 * driver already exports instead.  LEDn <-> port n is proven; only
+		 * which silkscreened RJ45 is port 0 is not (the sibling MIPS board
+		 * numbers its sockets the other way round), so the lanN NAME may
+		 * be reversed even though each LED does track its own port.
+		 */
+		led-lan1 {
+			label = "x411axf:green:lan1";	/* LED_EPHY0, port 0 */
+			gpios = <&gpio3 0x06 0x00>;
+			default-state = "off";
+		};
+
+		led-lan2 {
+			label = "x411axf:green:lan2";	/* LED_EPHY1, port 1 */
+			gpios = <&gpio3 0x03 0x00>;
+			default-state = "off";
+		};
+
+		led-lan3 {
+			label = "x411axf:green:lan3";	/* LED_EPHY2, port 2 */
+			gpios = <&gpio3 0x01 0x00>;
+			default-state = "off";
+		};
+
+		led-lan4 {
+			label = "x411axf:green:lan4";	/* LED_EPHY3, port 3 */
+			gpios = <&gpio3 0x07 0x00>;
+			default-state = "off";
+		};
+
+		/* LED_WPS_G — group 3 pin 0.  Declared so the pad is owned and
+		 * scriptable; we ship no WPS registrar, so nothing drives it. */
+		led-wps {
+			label = "x411axf:green:wps";
+			gpios = <&gpio3 0x00 0x00>;
+			default-state = "off";
+		};
+
+		/* LED_FXS — group 0 pin 12.  The panel has an FXS1 indicator, but
+		 * we drive no voice stack, so this is declared only. */
+		led-fxs1 {
+			label = "x411axf:green:fxs1";
+			gpios = <&gpio0 0x0c 0x00>;
+			default-state = "off";
+		};
+	};
+
+	/*
+	 * Reset and WPS buttons (both on the side of the case, operator-confirmed).
+	 * Pins and key codes are the stock device tree's own gpio-keys node, which
+	 * uses the identical <bank pin flags> form as the LEDs above: reset =
+	 * group 4 pin 8, WPS = group 3 pin 16, both ACTIVE LOW.  Stock's live
+	 * register state corroborates it — group 4 pin 8 is the one pin in that
+	 * group left as an INPUT while its neighbours are driven outputs.
+	 *
+	 * POLLED, not interrupt-driven: our GPIO driver implements no irqchip, and
+	 * OpenWrt's gpio-button-hotplug refuses a plain "gpio-keys" node whose
+	 * lines cannot be mapped to an IRQ.  A button is a human-timescale input,
+	 * so a 100 ms poll is indistinguishable in use.
+	 *
+	 * The stock tree also has a third button (WiFi on/off, group 3 pin 15).
+	 * This panel has only reset and WPS, so it is left out.
+	 */
+	keys {
+		compatible = "gpio-keys-polled";
+		poll-interval = <0x64>;		/* 100 ms */
+
+		button-reset {
+			label = "reset";
+			linux,code = <0x198>;	/* KEY_RESTART */
+			gpios = <&gpio4 0x08 0x01>;
+		};
+
+		button-wps {
+			label = "wps";
+			linux,code = <0x211>;	/* KEY_WPS_BUTTON */
+			gpios = <&gpio3 0x10 0x01>;
+		};
+	};
 };

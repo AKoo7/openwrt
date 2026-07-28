@@ -1,0 +1,156 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# X411AXF / RTL9607F "Elnath": drive the front-panel state LEDs.
+#
+# WHY A SCRIPT AND NOT DRIVER CODE / A KERNEL TRIGGER
+# ---------------------------------------------------
+# Four of the ten panel LEDs track state that has no in-kernel LED trigger:
+#
+#   PON / LOS  GPON activation state and the downstream optical alarm.  There is
+#              no "gpon" LED trigger in Linux.  Stock does not use one either:
+#              its vendor GPON driver registers private triggers (GP_LED3 /
+#              GP_LED1) and its own /etc/scripts poke /sys/class/leds directly,
+#              so a script here is the same architecture with none of the
+#              driver-side code or footprint.
+#
+#   LAN1-4     stock binds these to the netdev trigger on its per-port netdevs
+#              eth0.2/.3/.4/.5.  ★ Our clean-room NI driver registers ONE netdev
+#              (eth0) for the whole switch - there is no per-port netdev to bind
+#              - so the netdev trigger physically cannot express "port 3 link".
+#              The driver does export per-port PHY link state, so we read that.
+#              Difference from stock, stated plainly: these show LINK only, they
+#              do not blink on traffic (stock's trigger did link+tx+rx).  If
+#              per-port netdevs ever land, delete this half and use the netdev
+#              trigger with mode "link tx rx".
+#
+#   NET        internet/WAN reachability.  Cheap and honest: a default route.
+#
+# PWR is handled entirely in the device tree (default-state = "on").  WPS and
+# FXS1 are declared in the DT but deliberately unmanaged: we ship no WPS
+# registrar and no voice stack, so nothing here may claim they work.
+#
+# The remaining two panel LEDs, 2.4G and 5G, are deliberately NOT driven here.
+# They are not on SoC GPIO at all: each hangs off its WiFi chip's own LED pad, so
+# rtw89 registers them (x411axf:green:2.4g / x411axf:green:5g) and mac80211's
+# throughput trigger holds each one on while its radio is up and blinks it on
+# traffic.  That is a standard in-kernel trigger doing the whole job, so adding a
+# poll_wifi() here would only fight it - do not add one.
+#
+# A note on sharing these pins: the GPON driver re-applies stock's whole-group
+# GPIO snapshot each time it (re-)activates the MAC, which briefly forces some
+# of these LED levels.  The next poll below re-asserts the truth, so a fibre
+# re-range shows at most one poll interval of a stale LED.
+
+LEDS=/sys/class/leds
+GPON=/proc/gpon
+NIRX=/proc/net/cortina_ni_rx
+
+# The one place the panel mapping lives.  LAN_LEDS is ordered by NI switch port
+# (port 0 first).
+#
+# *** THE SILKSCREEN IS MIRRORED RELATIVE TO THE SWITCH PORTS ***
+# Operator cable-check, 2026-07-26, all four sockets tried one at a time:
+#     socket LAN1 -> switch port3      socket LAN3 -> switch port1
+#     socket LAN2 -> switch port2      socket LAN4 -> switch port0
+# So the LED for the socket labelled LANn is driven by switch port (4-n).  The
+# first version of this list assumed port0=LAN1 and lit the LED at the OPPOSITE
+# end of the panel from the cable -- correct hardware, wrong label.  Do NOT
+# "simplify" this back to ascending order without redoing the cable check; the
+# sibling MIPS board numbers its sockets the other way round, which is exactly
+# how the wrong assumption got here.
+LED_PON="x411axf:green:pon"
+LED_LOS="x411axf:red:los"
+LED_NET="x411axf:green:net"
+# ordered by SWITCH PORT: port0 lights socket LAN4, port3 lights socket LAN1
+LAN_LEDS="x411axf:green:lan4 x411axf:green:lan3 x411axf:green:lan2 x411axf:green:lan1"
+
+POLL="${LED_PANEL_POLL:-2}"
+
+# on / off / blink.  gpio-leds has max_brightness 1, so 1 is fully on.  Writing
+# the trigger every pass would reset the timer's phase, so only change it when
+# it is not already what we want.
+set_led() {
+	local led="$1" want="$2" cur
+
+	[ -e "$LEDS/$led/brightness" ] || return 0
+
+	cur=$(sed -n 's/.*\[\([^]]*\)\].*/\1/p' "$LEDS/$led/trigger" 2>/dev/null)
+
+	if [ "$want" = "blink" ]; then
+		[ "$cur" = "timer" ] || {
+			echo timer > "$LEDS/$led/trigger" 2>/dev/null
+			echo 500 > "$LEDS/$led/delay_on" 2>/dev/null
+			echo 500 > "$LEDS/$led/delay_off" 2>/dev/null
+		}
+		return 0
+	fi
+
+	[ "$cur" = "none" ] || echo none > "$LEDS/$led/trigger" 2>/dev/null
+	if [ "$want" = "on" ]; then
+		echo 1 > "$LEDS/$led/brightness" 2>/dev/null
+	else
+		echo 0 > "$LEDS/$led/brightness" 2>/dev/null
+	fi
+}
+
+# GPON: "fsm            = O5-Operation (live id 0x01), tracked ..." -> the digit,
+# and "alarm          = 0x00000000 (no alarm, DS locked)" -> LOS when non-zero.
+# A missing/unparsable field leaves the LED alone rather than inventing a state.
+poll_gpon() {
+	local g state alarm
+
+	[ -r "$GPON" ] || return 0
+	g=$(cat "$GPON" 2>/dev/null) || return 0
+
+	state=$(echo "$g" | sed -n 's/^fsm[[:space:]]*=[[:space:]]*O\([0-9]\).*/\1/p' | head -n1)
+	case "$state" in
+	5|6)	set_led "$LED_PON" on ;;
+	2|3|4)	set_led "$LED_PON" blink ;;
+	1|7)	set_led "$LED_PON" off ;;
+	esac
+
+	alarm=$(echo "$g" | sed -n 's/^alarm[[:space:]]*=[[:space:]]*0x\([0-9a-fA-F]*\).*/\1/p' | head -n1)
+	case "$alarm" in
+	"")		;;			# no such field: say nothing
+	*[1-9a-fA-F]*)	set_led "$LED_LOS" on ;;	# any bit set = LOS/LOF
+	*)		set_led "$LED_LOS" off ;;
+	esac
+}
+
+# Per-port link, from the NI driver's own dump:
+#   "link port0 (phy1): bmsr=0x796d link=1"
+poll_lan() {
+	local i=0 led up
+
+	[ -r "$NIRX" ] || return 0
+	for led in $LAN_LEDS; do
+		up=$(sed -n "s/^link port$i .*link=\([0-9-]*\).*/\1/p" "$NIRX" 2>/dev/null | head -n1)
+		case "$up" in
+		1)	set_led "$led" on ;;
+		0)	set_led "$led" off ;;
+		esac
+		i=$((i + 1))
+	done
+}
+
+# NET: lit once the WAN actually gives us a default route (a DHCP lease or a
+# PPPoE session up, either way).  Deliberately not "the interface exists".
+# Read straight out of /proc/net/route (destination and mask both 0.0.0.0) so
+# this needs no `ip`/`route` binary at all - one less thing that can be absent
+# from a trimmed image and silently leave the LED dark.
+poll_net() {
+	if awk 'NR>1 && $2=="00000000" && $8=="00000000" { found=1 }
+		END { exit !found }' /proc/net/route 2>/dev/null; then
+		set_led "$LED_NET" on
+	else
+		set_led "$LED_NET" off
+	fi
+}
+
+while :; do
+	poll_gpon
+	poll_lan
+	poll_net
+	sleep "$POLL"
+done
