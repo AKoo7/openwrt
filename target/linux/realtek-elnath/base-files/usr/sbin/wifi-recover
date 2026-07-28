@@ -1,0 +1,244 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# X411AXF / RTL9607F "Elnath": get a WiFi radio back on the air, unattended.
+#
+# This unit ships with nobody watching it, so anything that can leave a radio
+# dark until a human types `wifi up` is a production defect.  There are two such
+# states, they are NOT the same fault, and netifd needs a different nudge for
+# each.  Both were measured on this board.
+#
+#
+# FAULT 1 - netifd has LATCHED the radio off
+# ------------------------------------------
+# In /lib/netifd/wireless-device.uc every failed setup spends one of
+# DEFAULT_RETRY (3) attempts, and when they are gone the device is latched:
+#
+#	if (wdev.retry > 0)  wdev.retry--;  else  wdev.retry_setup_failed = true;
+#
+# after which setup() refuses to run while the flag is set:
+#
+#	if (!this.autostart || this.retry_setup_failed)  return;
+#
+# Nothing clears it by itself.  Status shows up=0, retry_setup_failed=1.
+# Nudge: ubus `retry` -> retry_setup(), which re-arms and re-runs setup.
+#
+#
+# FAULT 2 - netifd says "up" but the AP is NOT on the air
+# -------------------------------------------------------
+# ★ Measured on this board (operator, 2026-07-26): given a channel hostapd could
+# not honour, the log showed
+#
+#	hostapd: hostapd.add_iface failed for phy phy1 ifname=phy1-ap0
+#	br-lan: port 3(phy1-ap0) entered disabled state
+#
+# `iw dev` listed phy1-ap0 with NO channel line - the netdev existed, the AP was
+# off the air - and yet netifd reported up=1, autostart=1, pending=0,
+# retry_setup_failed=0.  2.4 GHz was dark and nothing in the system noticed.
+#
+# Why netifd cannot see it, read out of the code it runs:
+#   * /lib/netifd/wireless/mac80211.sh:310 calls netifd.set_up() UNCONDITIONALLY,
+#     straight after hostapd.setup(data); that result is never checked (and
+#     hostapd.setup() does not even return one).
+#   * wifi/hostapd.uc raises setup_failed('HOSTAPD_START_FAILED') only when the
+#     `ubus call hostapd config_set` itself fails.  Here it SUCCEEDED - it
+#     returned hostapd's pid.  The per-BSS failure happens inside the hostapd
+#     process afterwards (/usr/share/hostap/hostapd.uc prints the add_iface
+#     line) and is never reported back through config_set.
+#   * so netifd.set_up() -> wdev_mark_up() -> state = "up": the success path.
+#     The retry counter is never touched, so FAULT 1's flag never appears.
+#   * netifd's own process watchdog was handed the SHARED wpad pid, which is
+#     alive and well serving the other radio, so that cannot notice one radio's
+#     missing BSS either.
+#
+# ⇒ "up" in netifd's model means "the setup script ran to completion and sent
+#   NOTIFY_CMD_UP".  It is a claim by the script, NOT a witness that the radio is
+#   serving.  So we need our own witness, and the one that tracked reality is an
+#   OPERATING CHANNEL on one of the radio's interfaces (`iw dev`).
+# Nudge: ubus `reconf` -> update() -> check() -> setup(), which re-runs the setup
+# handler so hostapd retries the BSS.  (`retry` is useless here: its handler
+# bails out unless state == "down", and this radio is "up".)
+#
+#
+# WHY NEITHER NUDGE CAN FIGHT A DELIBERATE `wifi down`
+# ----------------------------------------------------
+# netifd distinguishes intent from failure itself, and we key off exactly that -
+# no marker file to leak, go stale, or need cleaning up:
+#
+#	deliberate down (`wifi down`, ubus network.wireless down) -> stop(),
+#	  which sets autostart = false.  Status reports "autostart": false.
+#	either fault above -> autostart is left alone (true).
+#
+# autostart=false is therefore skipped here before anything else is looked at -
+# which matters doubly for FAULT 2, because a downed radio has no operating
+# channel and would otherwise look exactly like a dead AP.  Belt and braces, the
+# two nudges we use are the two netifd itself gates on autostart:
+#   retry  -> retry_setup(): `if (this.state != "down" || !this.autostart) return;`
+#   reconf -> update() -> check() -> setup(): `if (!this.autostart || ...) return;`
+# i.e. netifd REFUSES both for a radio somebody asked to stay down, which also
+# closes the race where a radio is downed between our status read and our call.
+# `up` would instead have FORCED autostart=true and overridden the operator - do
+# not "simplify" either call to `up`.
+#
+#
+# NOT FIGHTING A RADIO THAT IS SIMPLY STILL COMING UP
+# ---------------------------------------------------
+# An AP is legitimately off the air for a few seconds while it starts, so one
+# off-air sample means nothing.  Two guards: netifd's own `pending` (state setup
+# or teardown) is skipped without advancing anything, and the radio must be seen
+# off-air on OFFAIR_PASSES CONSECUTIVE passes (~3 min) before we touch it.
+# KNOWN LIMIT: a radio doing a DFS channel-availability check is off-air for 60 s
+# (600 s on weather-radar channels) and could be nudged.  It does not arise on
+# this product - Bolivia permits 5735-5835 to us and we ship ch149, not a DFS
+# channel - but if a DFS channel is ever configured, gate this on hostapd's own
+# `state: DFS` rather than by raising the pass count.
+#
+#
+# RATE BOUND
+# ----------
+# A radio that genuinely cannot come up (dead silicon, a config the hardware
+# rejects, a missing firmware blob) must not become a nudge every minute for the
+# rest of the uptime.  The gap per radio doubles - 1, 2, 4 ... BACKOFF_MAX polls
+# - then stays at the ceiling, so it keeps trying about twice an hour,
+# indefinitely.  Deliberately NOT capped by attempt count: an unattended device
+# still has to come back on the day the cause goes away, which "give up after N"
+# would prevent.  The gap is dropped the moment the radio is serving again, so
+# the next unrelated fault is handled at once.
+#
+# Scope: netifd's wireless devices only.  Never looks at the GPON/WAN side.
+
+POLL="${WIFI_RECOVER_POLL:-60}"		# seconds between passes
+BACKOFF_MAX=32				# polls; ~32 min ceiling between nudges
+OFFAIR_PASSES=3				# consecutive off-air passes before acting
+
+log() {
+	logger -t wifi-recover "$1"
+}
+
+# The radios this board is SUPPOSED to have.  /etc/config/wireless is the intent;
+# ubus below is the live state.  A radio in the config that netifd does not know
+# about at all (no phy, path mismatch) reports no fields and is skipped - a
+# different fault, and not ours to paper over.
+radios() {
+	uci -q show wireless | sed -n 's/^wireless\.\([^.]*\)=wifi-device$/\1/p'
+}
+
+# Every interface that currently HAS an operating channel, i.e. is on the air.
+# One `iw dev` per pass, built on first use and cached for the rest of it.
+scan_onair() {
+	[ -n "$onair_done" ] && return 0
+	onair_list=" $(iw dev 2>/dev/null |
+		awk '$1 == "Interface" { i = $2 }
+		     $1 == "channel" && i != "" { print i; i = "" }' |
+		tr '\n' ' ')"
+	onair_done=1
+}
+
+# Is this radio on the air?  True if ANY of its interfaces has a channel, so a
+# radio serving an AP alongside an unassociated station vif is not flagged.
+# UNJUDGEABLE COUNTS AS ON AIR: a radio whose vifs netifd never created has no
+# ifname to test (every vif disabled, say), and calling that "off air" would
+# nudge it forever.
+onair() {
+	local ifn n=0
+
+	scan_onair
+	for ifn in $(printf '%s' "$st" | jsonfilter -e "@.$1.interfaces[*].ifname" 2>/dev/null); do
+		n=$((n + 1))
+		case "$onair_list" in *" $ifn "*) return 0 ;; esac
+	done
+	[ "$n" = 0 ]
+}
+
+# Drop a radio's backoff and off-air run so the next fault is handled at once.
+# $2, if given, is logged - but only if we had actually been nudging it.
+forget() {
+	local iv
+	eval "iv=\${iv_$1:-0}"
+	[ "$iv" = 0 ] || [ -z "$2" ] || log "$2"
+	eval "iv_$1=0 skip_$1=0 off_$1=0"
+}
+
+pass() {
+	local st r up autostart pending disabled failed iv skip off act why
+	local onair_done onair_list
+
+	st=$(ubus call network.wireless status 2>/dev/null) || return 0
+
+	for r in $(radios); do
+		# The eval below only ever assigns the five names we ask for, but
+		# the radio name is interpolated into the filter: keep it to what a
+		# uci section name may hold.
+		case "$r" in *[!A-Za-z0-9_]*) continue ;; esac
+
+		unset up autostart pending disabled failed
+		eval "$(printf '%s' "$st" | jsonfilter \
+			-e "up=@.$r.up" \
+			-e "autostart=@.$r.autostart" \
+			-e "pending=@.$r.pending" \
+			-e "disabled=@.$r.disabled" \
+			-e "failed=@.$r.retry_setup_failed" 2>/dev/null)"
+
+		eval "iv=\${iv_$r:-0} skip=\${skip_$r:-0} off=\${off_$r:-0}"
+
+		# Hands off entirely: somebody asked this radio to stay down (THE
+		# escape hatch), it is disabled in the config, or netifd reported no
+		# fields at all (unset, so this test fails safe).
+		if [ "$autostart" != 1 ] || [ "$disabled" = 1 ]; then
+			forget "$r"
+			continue
+		fi
+
+		# Mid-transition: netifd is already working on it.  Keep the
+		# counters, just do not interfere.
+		[ "$pending" = 1 ] && continue
+
+		act=""
+		if [ "$up" = 1 ]; then
+			# FAULT 2 - it claims up.  Believe the radio, not the claim.
+			if onair "$r"; then
+				forget "$r" "$r is serving again"
+				continue
+			fi
+			off=$((off + 1))
+			eval "off_$r=$off"
+			[ "$off" -lt "$OFFAIR_PASSES" ] && continue
+			act="reconf"
+			why="up but off the air for $((off * POLL))s (no operating channel)"
+		elif [ "$up" = 0 ] && [ "$failed" = 1 ]; then
+			# FAULT 1 - latched off, and nobody asked for that.
+			act="retry"
+			why="latched off after a failed setup"
+		else
+			# Down but not latched: netifd is still driving it.
+			continue
+		fi
+
+		# Rate bound, shared by both faults.
+		if [ "$skip" -gt 0 ]; then
+			eval "skip_$r=$((skip - 1))"
+			continue
+		fi
+
+		iv=$((iv * 2))
+		[ "$iv" -lt 1 ] && iv=1
+		[ "$iv" -gt "$BACKOFF_MAX" ] && iv="$BACKOFF_MAX"
+		eval "iv_$r=$iv skip_$r=$iv"
+
+		log "$r $why - asking netifd to $act; next attempt in $((iv * POLL))s if it stays down"
+		ubus call network.wireless "$act" "{\"device\":\"$r\"}" >/dev/null 2>&1 ||
+			log "$r: ubus network.wireless $act failed"
+	done
+}
+
+# Sourcing this file with WIFI_RECOVER_LIB=1 defines the logic above without
+# starting the poll loop, so pass() can be driven with a stubbed ubus/iw by
+# dev/test_wifi_recover.sh.  Nothing in the image sets it.
+[ -n "$WIFI_RECOVER_LIB" ] && return 0
+
+# Sleep FIRST: at boot the radios are legitimately still coming up, and we must
+# not race the normal bring-up.
+while :; do
+	sleep "$POLL"
+	pass
+done

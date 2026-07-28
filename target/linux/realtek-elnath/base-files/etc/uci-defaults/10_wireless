@@ -86,8 +86,53 @@ suffix="${mac#??????}"
 # key -- per-band PSKs would break band-steering (both stock keys match here).
 ssid="ONU-$(echo "$suffix" | tr 'a-f' 'A-F')"
 key="$key_2g"
-country=$(echo "$country" | tr 'a-z' 'A-Z')
-[ "${#country}" = "2" ] || country="US"
+# ---------------------------------------------------------------------------
+# ★ REGULATORY DOMAIN = BO (Bolivia) -- operator directive 2026-07-26.
+# The units are deployed in Bolivia, so the regulatory domain is BOLIVIA, and
+# it deliberately OVERRIDES the value the board's own stock provisioning
+# carries (this board's config_hs.xml HW_WLAN0_COUNTRYSTR reads "US"): the
+# stock string reflects the vendor's build, not where the unit operates, and
+# transmitting on a channel/power the local regulator does not permit is not
+# something to inherit from a factory default.
+# Overridable per deployment: `uci set wireless.<radio>.country=XX`.
+# Still read the board value first, purely so it is logged and any future
+# deployment can flip WIFI_COUNTRY without editing this logic.
+board_country=$(echo "$country" | tr 'a-z' 'A-Z')
+country="BO"
+[ "${#country}" = "2" ] || country="BO"
+
+# ---------------------------------------------------------------------------
+# ★ CHANNELS ARE DERIVED FROM THE BOARD'S OWN MAC -- never a compiled-in
+# constant (operator directive 2026-07-26; same principle as the SSID and the
+# vif MACs above). Two units side by side must not land on the same channel:
+# a fleet that all boots channel 1 / channel 36 self-jams, and the ONU has no
+# ACS/DFS-driven auto-selection we trust yet.
+#
+# The derivation is deterministic (same board -> same channel across reboots,
+# so a client's saved network keeps working) and uses ONLY channels legal in
+# BO, which follows the FCC-style plan:
+#   2.4 GHz -> the three NON-OVERLAPPING channels {1, 6, 11}  (2402-2482 @ 40)
+#   5 GHz   -> 149 ONLY. NOT derived, and that is a REGULATORY fact, not laziness.
+#
+# ★★ BO's actual kernel regulatory rules, read live off the board (2026-07-26):
+#       country BO: DFS-JP
+#         (2402 - 2482 @ 40), (N/A, 20)
+#         (5250 - 5330 @ 80), (N/A, 30), DFS      <- ch 52-64, DFS-only
+#         (5735 - 5835 @ 80), (N/A, 30)           <- ch 149-165, non-DFS
+#    UNII-1 (5150-5250, ch 36-48) is NOT PERMITTED IN BOLIVIA AT ALL. An earlier
+#    revision of this file derived 5 GHz from {36, 149} on the FCC-style
+#    assumption -- that would have put half the fleet on an ILLEGAL channel.
+#    Verified against the live regdomain, not assumed.
+#    => BO leaves exactly ONE non-DFS 80 MHz block (5735-5835 = 149-161), so the
+#    5 GHz channel CANNOT be spread across a fleet without either using DFS
+#    (the AP would have to vacate mid-service) or dropping to HT40/HT20 and
+#    giving up half the width. HE80 @ 149 is the right trade for a 1 Gbps
+#    device, so 5 GHz is fixed and only 2.4 GHz is MAC-derived.
+mac_last=$(echo "$mac" | sed 's/.*\(..\)$/\1/')
+mac_n=$(printf '%d' "0x${mac_last:-0}" 2>/dev/null || echo 0)
+set -- 1 6 11
+eval "chan_2g=\${$(( mac_n % 3 + 1 ))}"
+chan_5g=149
 
 # per-board vif MACs (see header); base comes from the same factory source
 base=$(echo "$mac" | sed 's/../&:/g;s/:$//')
@@ -95,7 +140,7 @@ mac_2g=$(macaddr_add "$base" 2)
 mac_5g=$(macaddr_add "$base" 3)
 
 logger -t wireless-defaults \
-	"ssid='$ssid' 2g=$mac_2g 5g=$mac_5g country=$country"
+	"ssid='$ssid' 2g=$mac_2g 5g=$mac_5g country=$country (board said '$board_country') chan_2g=$chan_2g chan_5g=$chan_5g mac_n=$mac_n"
 
 found_2g="" found_5g=""
 setup_iface() {
@@ -107,7 +152,7 @@ setup_iface() {
 		[ -n "$found_2g" ] && return 0
 		found_2g=1
 		uci -q batch <<EOF2
-set wireless.$dev.channel='1'
+set wireless.$dev.channel='$chan_2g'
 set wireless.$dev.htmode='HT20'
 set wireless.$dev.country='$country'
 set wireless.$dev.legacy_rates='1'
@@ -133,7 +178,7 @@ EOF2
 		found_5g=1
 		uci -q batch <<EOF5
 set wireless.$dev.band='5g'
-set wireless.$dev.channel='36'
+set wireless.$dev.channel='$chan_5g'
 set wireless.$dev.htmode='HE80'
 set wireless.$dev.country='$country'
 set wireless.$dev.disabled='0'
