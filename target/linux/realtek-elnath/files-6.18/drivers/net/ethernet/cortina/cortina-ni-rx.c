@@ -2940,7 +2940,8 @@ static void cortina_ni_rx_flow_ctrl_init(struct cortina_ni *ni)
 		writel(i < CA_NI_NI_RXMUX_FC_THR_LO_CNT ?
 			       CA_NI_NI_RXMUX_FC_THR_LO_VAL :
 			       CA_NI_NI_RXMUX_FC_THR_HI_VAL,
-		       ni_base(ni) + CA_NI_NI_RXMUX_FC_THR(i));
+		       ni_base(ni) + CA_NI_IDX(CA_NI_NI_RXMUX_FC_THR, i,
+						CA_NI_NI_RXMUX_FC_THR_COUNT));
 	writel(CA_NI_NI_RXFIFO_THR_B0_VAL, ni_base(ni) + CA_NI_NI_RXFIFO_THR_B0);
 	writel(CA_NI_NI_RXFIFO_THR_B4_VAL, ni_base(ni) + CA_NI_NI_RXFIFO_THR_B4);
 	writel(CA_NI_NI_RXFIFO_THR_B8_VAL, ni_base(ni) + CA_NI_NI_RXFIFO_THR_B8);
@@ -4470,10 +4471,12 @@ static int cortina_ni_rx_eq_init(struct cortina_ni *ni)
 	 * field width from it. */
 	for (i = 0; i < 8; i++)
 		writel(CA_NI_RX_EQ_PROFILE_VAL,
-		       ni_base(ni) + CA_NI_QM_EQ_PROFILE(i));
+		       ni_base(ni) + CA_NI_IDX(CA_NI_QM_EQ_PROFILE, i,
+						CA_NI_QM_EQ_PROFILE_COUNT));
 	for (i = 0; i < CA_NI_QM_EQ_PROFILE_GLOBAL_COUNT; i++)
 		writel(CA_NI_RX_CPU_PROFILE_VAL,
-		       ni_base(ni) + CA_NI_QM_EQ_PROFILE_GLOBAL(i));
+		       ni_base(ni) + CA_NI_IDX(CA_NI_QM_EQ_PROFILE_GLOBAL, i,
+						CA_NI_QM_EQ_PROFILE_GLOBAL_COUNT));
 	/* build77: cpu_port 0 (CPU_0) -> profile_sel=2 -> EQ_PROFILE[2]={EQ5,EQ6} (the
 	 * stock CPU pools, now configured+seeded).  Our 0..7 loop above set EQ_PROFILE[2]
 	 * to {EQ5,EQ6}; point destport0 at profile 2 (stock value; was 0xf8=profile 8). */
@@ -4502,7 +4505,8 @@ static int cortina_ni_rx_eq_init(struct cortina_ni *ni)
 		       FIELD_PREP(CA_NI_QM_DEST_PORT_PROF_SEL,
 				  CA_NI_RX_DQ_PROFILE_SEL) :
 		       CA_NI_RX_CPU_PROFILE_VAL,
-		       ni_base(ni) + CA_NI_QM_DEST_PORT_EQ_CFG(i));
+		       ni_base(ni) + CA_NI_IDX(CA_NI_QM_DEST_PORT_EQ_CFG, i,
+						CA_NI_QM_DEST_PORT_ENTRIES));
 	/* ★ 2026-07-23 (Fable RE): stock configures DEST_PORT_EQ_CFG for the whole
 	 * CPU/PON dest-port range up to 0x2f; ours left 16..0x2f at profile 0 -> EQ0
 	 * (empty).  A DS-into-L3FE frame (hw_l3_fwd + cg_hw_l3_ds) that resolves to a
@@ -4525,7 +4529,8 @@ static int cortina_ni_rx_eq_init(struct cortina_ni *ni)
 		       FIELD_PREP(CA_NI_QM_DEST_PORT_PROF_SEL,
 				  CA_NI_RX_DQ_PROFILE_SEL) :
 		       CA_NI_RX_CPU_PROFILE_VAL,
-		       ni_base(ni) + CA_NI_QM_DEST_PORT_EQ_CFG(i));
+		       ni_base(ni) + CA_NI_IDX(CA_NI_QM_DEST_PORT_EQ_CFG, i,
+						CA_NI_QM_DEST_PORT_ENTRIES));
 
 	/* 0x6ab0 = 0x300 (stock-matching; this is NOT the real ES_CTRL2 - kept as a
 	 * harmless match). */

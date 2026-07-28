@@ -1379,6 +1379,50 @@ enum cortina_ni_win {
  * value, and became live the moment the dest-port loop started writing a
  * different profile for the tagged-WAN fix (2026-07-28).
  * Use CA_NI_QM_DEST_PORT_LAST to bound any loop over the table. */
+/* ---------------------------------------------------------------------------
+ * ★ DEBUG-ONLY BOUND CHECK FOR AN INDEXED REGISTER WRITE
+ *
+ * The register map is a declared address space, but nothing in C enforces it:
+ * `writel(v, base + REG(i))` is pointer arithmetic the compiler knows nothing
+ * about, and the hardware accepts a write to the wrong address without
+ * complaint.  Sanitizers do not help either -- these are MMIO writes through an
+ * ioremapped window, so there is no allocation for ASan to bound-check and
+ * valgrind does not run kernel code.
+ *
+ * So the map guards itself.  CA_NI_IDX() is the bound check for the one pattern
+ * that actually goes wrong: an indexed write inside a loop.  Under
+ * CONFIG_CORTINA_NI_REG_GUARD it warns once, naming the array and the index, if
+ * the index is past the array's declared entry count; with the option off it
+ * compiles to the plain macro expansion and costs nothing.
+ *
+ * It exists because CA_NI_QM_DEST_PORT_EQ_CFG was written sixteen entries past
+ * its 32-entry table -- the loop was bounded by CA_NI_QM_DEST_PORT_MAX (0x2f),
+ * which is the dest-port NUMBER SPACE and not the table length -- and the
+ * overshoot landed on EQ_PROFILE_GLOBAL(0..2).  It was invisible while both
+ * writes happened to store the same value.  A static guard in the host suite
+ * catches the declared case; this catches the one a static check cannot: an
+ * index that only goes out of range at runtime.
+ */
+#ifdef CONFIG_CORTINA_NI_REG_GUARD
+#define CA_NI_IDX(_arr, _i, _cnt)					\
+	({								\
+		unsigned int __ni_i = (unsigned int)(_i);		\
+		unsigned int __ni_c = (unsigned int)(_cnt);		\
+		WARN_ONCE(__ni_i >= __ni_c,				\
+			  "cortina-ni: " #_arr "[%u] is past its %u "	\
+			  "declared entries -- this write lands on "	\
+			  "another register\n", __ni_i, __ni_c);	\
+		_arr(__ni_i);						\
+	})
+#else
+#define CA_NI_IDX(_arr, _i, _cnt)	_arr(_i)
+#endif
+
+/* Declared entry counts, so a loop can be bound-checked against the TABLE and
+ * never against a port-number maximum or any other nearby constant. */
+#define CA_NI_QM_EQ_PROFILE_COUNT	16
+#define CA_NI_NI_RXMUX_FC_THR_COUNT	8
+
 #define CA_NI_QM_DEST_PORT_MAX		0x2f
 #define CA_NI_QM_DEST_PORT_ENTRIES	32
 #define CA_NI_QM_DEST_PORT_LAST		(CA_NI_QM_DEST_PORT_ENTRIES - 1)

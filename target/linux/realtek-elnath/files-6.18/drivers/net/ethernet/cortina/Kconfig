@@ -42,6 +42,21 @@ config CORTINA_NI_FLOWOFFLOAD
 	  disabled (or when the engine fails bring-up) every offload request
 	  is refused and traffic stays on the normal software path.
 
+config CORTINA_NI_REG_GUARD
+	bool "Bound-check indexed register writes (debug)"
+	depends on CORTINA_NI
+	help
+	  Warn once, naming the array and the index, when an indexed register
+	  write goes past the array's declared entry count.
+
+	  The hardware accepts a write to the wrong address silently, and no
+	  compiler or sanitizer can see it: these are MMIO writes through an
+	  ioremapped window, so there is no allocation to bound-check.  This is
+	  the runtime half of the register-map guard -- it catches an index that
+	  only goes out of range while running, which a build-time check cannot.
+
+	  Costs nothing when off.  Say N for a shipping image.
+
 config CORTINA_GPON
 	tristate "Cortina-Access RTL9607F GPON MAC"
 	depends on OF
