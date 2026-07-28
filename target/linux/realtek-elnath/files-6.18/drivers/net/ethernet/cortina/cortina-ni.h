@@ -208,6 +208,15 @@ int cortina_ni_pon_tx(const u8 *pdu, unsigned int len);
 void cortina_ni_pon_wan_ndev_set(struct net_device *ndev);
 
 /*
+ * Print BOTH directions' CPU-forward counters (US pon_data_enq + DS wan_l3 /
+ * wan_pon) as one unambiguous line.  Emitted into /proc/net/cortina_ni_rx AND
+ * /proc/net/cortina_ni_tx so a single read can never be mistaken for a
+ * whole-device statement when it only covers one direction.
+ */
+struct seq_file;
+void cortina_ni_cpu_fwd_show(struct seq_file *m, struct cortina_ni *ni);
+
+/*
  * US PON DATA (WAN) TX (the GPON WAN netdev's ndo_start_xmit calls this):
  * enqueue one Ethernet frame toward the PON with the data HEADER_A (ldpid =
  * PON, data CoS, fe_bypass) on the DMA-LSO ring; the HW GEM-encapsulates it

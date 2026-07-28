@@ -1188,12 +1188,18 @@ enum cortina_ni_win {
  * @0x519e0).  Both write this same register; our M2c RX init previously did
  * neither, which is why the CPU-EPP ring never advanced in either steer mode. */
 #define CA_NI_QM_ES_CTRL		0x6108
-/* ★★ build67 (vendor source RE): the REAL L3QM egress-scheduler ctrl = QM_QM_ES_CTRL @
- * 0x7108 (aal_l3qm enable_tx / enable_tx_cpu) - NOT 0x6108 which we mislabeled es_ctrl.
- * enable_tx sets tx_en(b31)+ni_en(0xff)+cpu_en=0; enable_tx_cpu(port) ORs cpu_en|=(1<<port).
- * We never set cpu_en HERE -> the CPU-port ES drain never ran -> epp_wptr frozen.  Same
- * field layout as 0x6108. */
-#define CA_NI_QM_ES_CTRL_REAL		0x7108
+/* ★★ 0x6108 above IS the real QM_QM_ES_CTRL.  A previous revision added a second
+ * "CA_NI_QM_ES_CTRL_REAL 0x7108" here, claiming 0x6108 was the mislabel; that was
+ * backwards, and 0x7108 is really EPP64_RDPTR(cpu_port 0, voq 2) - a hardware ring
+ * READ POINTER (see CA_NI_QM_EPP64_RDPTR below, whose formula it collided with).
+ * Four independent sources agree: live reads show 0x6108 holding a static control
+ * word while 0x7000/0x7100 advance together in descriptor-sized steps wrapping at
+ * the ring size; stock's register list names 0x6108 ES_CTRL and 0x7100 the RDPTR
+ * array base; stock's aal_l3qm_enable_tx / _tx_cpu write 0x6108 and only 0x6108,
+ * while aal_l3qm_set_rx_read_ptr writes 0x7100 + 4*(8*port + voq); and the vendor
+ * headers place a STRIDE-4 COUNT-64 array across 0x7100-0x71fc.
+ * Lesson worth keeping: two #defines resolving to the same offset is the invariant
+ * that was violated, and it hid the error because write and readback agreed. */
 #define  CA_NI_QM_ES_CPU_EN		GENMASK(7, 0)	/* per-CPU-port egress   */
 #define  CA_NI_QM_ES_NI_EN		GENMASK(15, 8)	/* per-NI-port egress    */
 #define  CA_NI_QM_ES_INCCFG_PKT		GENMASK(18, 16)	/* stock value 2         */

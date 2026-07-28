@@ -1227,6 +1227,9 @@ static int cortina_ni_tx_proc_show(struct seq_file *m, void *v)
 		   tx->drop_linearize, tx->drop_oversize);
 	seq_printf(m, "pon_tx enq=%llu data_enq=%llu fail=%llu busy_slots=0x%02x\n",
 		   tx->pon_enq, tx->pon_data_enq, tx->pon_fail, tx->pon_busy);
+	/* data_enq above is UPSTREAM-ONLY; print the downstream complement right
+	 * next to it so it can never be read as a whole-device CPU-forward rate. */
+	cortina_ni_cpu_fwd_show(m, ni);
 	for (i = 0; i < CA_NI_TX_NUM_VPS; i++) {
 		struct cortina_ni_txq *q = &tx->txq[i];
 

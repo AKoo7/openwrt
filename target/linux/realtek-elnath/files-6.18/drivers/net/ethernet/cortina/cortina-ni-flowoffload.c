@@ -908,6 +908,31 @@ static int cn_l3e_flow_add_rawcrc(struct cn_l3e *l3e, u32 crc32, u16 crc16,
 		return ret;
 	}
 
+	/*
+	 * ★ HIT-WITNESS INTEGRITY (all install paths, manual AND automatic).
+	 *
+	 * The entry goes live at START(2), but the aging sweep counts any slot it
+	 * finds above IDLE(1) as "the ASIC re-armed this entry, so traffic hit it".
+	 * Leaving a freshly installed entry AT START therefore makes the very next
+	 * sweep report a HW hit for a flow that has not matched a single frame - so
+	 * hw_hits / us_hits / ds_hits climb under pure connection CHURN with zero
+	 * packets forwarded, and the witness stops meaning what it claims.
+	 *
+	 * Step the age back DOWN to IDLE(1) as the last act of the install (the two
+	 * manual /proc install paths already did exactly this; the automatic
+	 * cn_flow_replace path did not, which is the defect this closes).  IDLE is
+	 * live - the sweep itself writes it back to live slots - and the HW ager only
+	 * counts UP on a lookup hit, so from here a slot above IDLE is unambiguous
+	 * proof the engine matched a frame in silicon.
+	 *
+	 * A failure here is NOT an install failure: the entry is live and correct,
+	 * only its witness is inflated.  Report it and keep the entry.
+	 */
+	ret = cn_l3e_age_set(l3e, idx, CN_L3E_AGE_IDLE);
+	if (ret)
+		pr_warn_ratelimited("cortina-l3fe: flow_add: idx=%u age step-down to IDLE FAILED (%d) - the entry is LIVE but its first sweep will over-count one hw_hit\n",
+				    idx, ret);
+
 	l3e->shadow_crc32[idx] = crc32;
 	l3e->shadow_crc16[idx] = crc16;
 	*idx_out = idx;
@@ -1165,7 +1190,31 @@ MODULE_PARM_DESC(hw_l3_fwd,
  * hw_pppoe_set().  A bootarg `cortina_ni.hw_pppoe=1` works too and is the
  * cleaner way to benchmark, since it removes the "old conntrack" caveat.
  */
-static bool hw_pppoe;
+/*
+ * ★ DEFAULT ON since 2026-07-25 (board-measured, both directions, far-end
+ * witnessed).  It was OFF while the DS reply leg was refused; with that fixed
+ * the offload is a UNIFORM win over the SW fastpath, so per the project's
+ * "best-performing mode is the default" rule it ships enabled:
+ *
+ *   PPPoE-PAP, session verified HELD across every window, keepalive 5x30s:
+ *     direction        hw_pppoe=0     hw_pppoe=1
+ *     tcp upstream        3.3 Mbps     916.9 Mbps   <- 278x; the US-TCP collapse
+ *     tcp downstream    922.5 Mbps     923.9 Mbps
+ *     udp upstream      552.1 Mbps     947.4 Mbps
+ *   IPoE reference is 941/941 tcp and 956 udp, so PPPoE now runs at 97-99% of
+ *   it.  us_hits AND ds_hits both climb, so both legs are ASIC-forwarded.
+ *
+ * The wire format is proven by the FAR END, not by a local counter: iperf3's
+ * sum_received is measured on the peer, so 916.9 Mbps of accepted TCP means the
+ * 8-byte session header, the session id and the source MAC are all correct --
+ * a malformed encapsulation cannot be received and acknowledged at line rate.
+ *
+ * Stability is NOT provided by this parameter: the session teardowns under load
+ * were an LCP-echo-timeout problem, fixed in base-files/etc/config/network
+ * (keepalive "5 30").  Do not conflate the two -- with the aggressive OpenWrt
+ * default keepalive the session still bounces regardless of this setting.
+ */
+static bool hw_pppoe = true;
 static int hw_pppoe_set(const char *val, const struct kernel_param *kp);
 
 static const struct kernel_param_ops hw_pppoe_ops = {
@@ -1176,7 +1225,7 @@ static const struct kernel_param_ops hw_pppoe_ops = {
 };
 module_param_cb(hw_pppoe, &hw_pppoe_ops, &hw_pppoe, 0644);
 MODULE_PARM_DESC(hw_pppoe,
-	"install HW hash entries for PPPoE-WAN flows - BOTH legs: US with the 8-byte session-header push, DS with the pop the LAN egress L3-IF entry performs (default OFF: PPPoE rides the SW fastpath; IPoE HW offload unaffected). RUNTIME-flippable (needs cortina_ni.hw_l3_fwd=1 from boot, and the DS half also needs hw_ds_offload=1 + cortina_gpon.hw_l3_ds=1); only flows offered AFTER the flip are affected, and flipping to 0 clears the armed session");
+	"install HW hash entries for PPPoE-WAN flows - BOTH legs: US with the 8-byte session-header push, DS with the pop the LAN egress L3-IF entry performs (default ON since 2026-07-25: board-measured 916.9/923.9 Mbps tcp both ways and 947.4 Mbps udp US, vs 3.3 Mbps US-tcp on the SW fastpath; set 0 to fall back). Needs cortina_ni.hw_l3_fwd=1 from boot, and the DS half also needs hw_ds_offload=1 + cortina_gpon.hw_l3_ds=1; only flows offered AFTER a runtime flip are affected, and flipping to 0 clears the armed session");
 
 /*
  * ★ DS (WAN->LAN) offload leg - default OFF.
@@ -1344,14 +1393,33 @@ static void cn_pppoe_entry_gone(const struct cn_flow_entry *e, bool count_flap)
  * downstream ran 934.2 Mbps end-to-end over that same PPPoE WAN while the CPU
  * saw essentially no punted session frames (the punt ledger: seen=92, of which
  * ctrl=84, over the whole run - i.e. ~8 data frames, so the reply traffic was
- * NOT going through the CPU).  A DS entry therefore does pop the header: the
- * egress L3-IF entry the DS action selects carries {pppoe_set=1, pppoe_vld=0}
- * (l3fe_l3if_entry() - the very word the IPoE path has always written), and on
- * this die that is the no-session-header case; the packet editor rebuilds the
- * egress encapsulation from that entry, so "pppoe_vld=0" means "no PPPoE header
- * on the way out".  Nothing in the DS action or key is PPPoE-specific: the
- * 5-tuple mask 8 excludes all four PPPoE fields, so the entry matches on the
- * INNER 5-tuple whatever the encap (host-proven, Step 12g).
+ * NOT going through the CPU).
+ *
+ * ★ And the stock oracle says the same, at tier-2 PROVEN.  RE of the shipped
+ * flow-cache manager (the module that decides and installs stock's HW flows and
+ * egress interface entries) shows it builds this same 32-bit egress L3-IF word
+ * from a 4-valued per-interface PPPoE action, with exactly three encodings:
+ *     KEEP   -> pppoe_set 0, pppoe_vld 0            (leave the layer alone)
+ *     ADD    -> pppoe_set 1, pppoe_vld 1, session   (MODIFY packs identically)
+ *     REMOVE -> pppoe_set 1, pppoe_vld 0            (a DISTINCT encoding, so
+ *                                                    set=1/vld=0 is NOT "inert")
+ * (the same three values that the sibling reference SDK names KEEP/ADD/MODIFY/
+ * REMOVE).  So the DS pop is a property of the EGRESS INTERFACE word, and it is
+ * the only place it can live: stock's per-flow hash action has just two inline
+ * PPPoE bits and NO session-id field at all, and its flow-action builder never
+ * writes those two bits in ANY mode - for either direction.  There is no
+ * dedicated pop bit anywhere in that action (`pop_l3_*` is the IP-in-IP /
+ * DS-Lite / 6RD outer-header decap, named by the engine's own drop-reason
+ * strings - nothing to do with PPPoE).  The packet editor rebuilds the egress
+ * encapsulation from the selected L3-IF word, so an entry that does not say
+ * "carry PPPoE" emits no session header: an effective strip, with no pop bit.
+ * Our LAN egress entry is the explicit REMOVE form (l3fe_l3if_entry() always
+ * sets PPPOE_SET; stock's LAN interface uses KEEP) - both mean "no PPPoE out",
+ * and ours is the one that ran at 934.2 Mbps.
+ *
+ * Nothing in the DS action or key is PPPoE-specific: the 5-tuple mask 8 excludes
+ * all four PPPoE fields, so the entry matches on the INNER 5-tuple whatever the
+ * encap (host-proven, Step 12g).
  *
  * Flipping hw_pppoe to 1 armed the shadow and thereby switched that working DS
  * leg OFF (`ds_refused` counted the refusals) - which is what collapsed
@@ -2261,6 +2329,16 @@ static int cn_l3e_set_us_egress(struct cn_l3e *l3e, struct cn_l3e_act *act,
 			if (r)
 				return r;
 		}
+		/* ★ KNOWN DEVIATION FROM STOCK, left in place deliberately.  RE of
+		 * the stock flow-cache manager (2026-07-25, tier-2) shows it never
+		 * writes these two inline action bits - in any mode, in either
+		 * direction - and the action carries no session-id field at all:
+		 * stock's entire PPPoE encap is the egress L3-IF word below, which
+		 * we also program.  So these two are at best redundant here.  They
+		 * are NOT removed in the same change that re-opens the DS leg (one
+		 * variable at a time, and the US leg is the board-proven-to-hit
+		 * side), but if a far-end capture shows the US frame's header is
+		 * wrong, clearing these two to match stock is the FIRST A/B to run. */
 		act->pppoe_set = 1;
 		act->pppoe_vld = 1;
 		act->l3_if_vld = 1;
@@ -2473,9 +2551,12 @@ static void cn_l3e_set_ds_egress(struct cn_l3e_act *act, u32 lan_ldpid)
 	 * de-encapsulated.  Tier-1: with hw_pppoe=0 (shadow never armed, so the
 	 * leg gate never fired) THIS action carried a PPPoE-WAN reply flow at
 	 * 934.2 Mbps end-to-end, with the CPU punt ledger flat - see
-	 * cn_pppoe_leg_check().  ⇒ do NOT "complete" it by stamping
-	 * act->pppoe_set/pppoe_vld here: that would change the one DS shape known
-	 * to work, on a static argument, and it is not needed.
+	 * cn_pppoe_leg_check().  Tier-2: stock's flow-action builder never writes
+	 * the action's two inline PPPoE bits in ANY mode or direction, and that
+	 * action carries no session-id field at all - the encap is ENTIRELY the
+	 * egress interface word.  ⇒ do NOT "complete" this by stamping
+	 * act->pppoe_set/pppoe_vld here: it is redundant, it deviates from stock,
+	 * and it would change the one DS shape known to work on a static argument.
 	 */
 	act->l3_if_vld = 1;
 	act->egr_l3_if_idx = CN_L3E_LAN_L3IF_IDX;
@@ -2597,6 +2678,57 @@ static void cn_l3e_sweep_work(struct work_struct *work)
  * is not info-spammy under a many-flow load. */
 #define cn_rep_dbg(fmt, ...) \
 	pr_debug("cn_flow_replace: " fmt, ##__VA_ARGS__)
+
+/*
+ * ★ THE REFUSAL LEDGER (/proc/cortina_l3fe `refused:`).
+ *
+ * Until this existed, a flow the driver REFUSED was indistinguishable from a flow
+ * the kernel never offered: both show up as "auto_flows did not go up".  That
+ * ambiguity is expensive - it cost a whole investigation - because the two have
+ * opposite meanings ("we said no, here is why" vs "nothing ever asked us").  The
+ * per-branch cn_rep_dbg() lines compile out (dynamic debug is off in this build),
+ * so a COUNTER is the only witness that survives into the shipping image.
+ *
+ * Counted at the single choke point where every REPLACE outcome passes
+ * (cn_setup_tc_block_cb), so no refusal branch can be added later and silently
+ * escape the ledger.  The breakdown names the three outcomes that mean different
+ * things:
+ *   unsupp (-EOPNOTSUPP) a shape this engine cannot express (not IPv4, not TCP/UDP,
+ *                        not the NAT action shape, the offload gate is off, ...)
+ *   full   (-ENOSPC)     the 8-way hash bucket is full - capacity, not a bug
+ *   dup    (-EEXIST)     already installed (typically the other direction's cookie)
+ *   err    (everything else) a REAL failure: SWO timeout, age-commit timeout, ENOMEM
+ * `last` keeps the most recent errno so a single refusal is still identifiable.
+ * All four are cumulative since boot; read twice and difference for a rate.
+ */
+static atomic_t cn_flow_refused = ATOMIC_INIT(0);
+static atomic_t cn_flow_refused_unsupp = ATOMIC_INIT(0);
+static atomic_t cn_flow_refused_full = ATOMIC_INIT(0);
+static atomic_t cn_flow_refused_dup = ATOMIC_INIT(0);
+static atomic_t cn_flow_refused_err = ATOMIC_INIT(0);
+static atomic_t cn_flow_refused_last = ATOMIC_INIT(0);
+
+static void cn_flow_refused_account(int err)
+{
+	if (!err)
+		return;
+	atomic_inc(&cn_flow_refused);
+	atomic_set(&cn_flow_refused_last, err);
+	switch (err) {
+	case -EOPNOTSUPP:
+		atomic_inc(&cn_flow_refused_unsupp);
+		break;
+	case -ENOSPC:
+		atomic_inc(&cn_flow_refused_full);
+		break;
+	case -EEXIST:
+		atomic_inc(&cn_flow_refused_dup);
+		break;
+	default:
+		atomic_inc(&cn_flow_refused_err);
+		break;
+	}
+}
 
 static int cn_flow_replace(struct flow_cls_offload *f, struct net_device *dev)
 {
@@ -3023,7 +3155,7 @@ static int cn_flow_replace(struct flow_cls_offload *f, struct net_device *dev)
 
 	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
 	if (!entry) {
-		pr_err("cn_flow_replace: entry alloc failed\n");
+		pr_err_ratelimited("cn_flow_replace: entry alloc failed\n");
 		return -ENOMEM;
 	}
 	entry->cookie = f->cookie;
@@ -3043,19 +3175,33 @@ static int cn_flow_replace(struct flow_cls_offload *f, struct net_device *dev)
 	err = cn_l3e_flow_add(cn_l3e, &key, &act, profile, CN_L3E_WAN_MASK_ID,
 			      &entry->hash_idx, &entry->crc16);
 	if (err) {
-		pr_err("cn_flow_replace: %s install FAILED (%d) %pI4h:%u->%pI4h:%u proto=%u pppoe=%#x\n",
-		       ds_leg ? "DS" : "US",
-		       err, &(u32){ key.ip_sa_0 }, (u16)key.l4_sport,
-		       &(u32){ key.ip_da_0 }, (u16)key.l4_dport,
-		       (u8)key.ip_protocol, pppoe_sid);
+		/* ★ NEVER un-ratelimited here.  nf_flow_table RE-OFFERS a refused
+		 * flow about once a second, forever, so N refused flows = N log
+		 * lines per second - which at the top of a scale ramp floods (and
+		 * can wedge) the very serial console the witnesses are read over.
+		 * -ENOSPC (hash bucket full) and -EEXIST (already installed) are
+		 * NORMAL refusals, not errors: the flow simply stays on the Linux
+		 * software fastpath.  They are counted in the refusal ledger
+		 * (/proc/cortina_l3fe `refused:`) instead of logged. */
+		if (err == -ENOSPC || err == -EEXIST)
+			cn_rep_dbg("%s install refused (%d) - flow stays on the SW fastpath\n",
+				   ds_leg ? "DS" : "US", err);
+		else
+			pr_err_ratelimited("cn_flow_replace: %s install FAILED (%d) %pI4h:%u->%pI4h:%u proto=%u pppoe=%#x\n",
+					   ds_leg ? "DS" : "US",
+					   err, &(u32){ key.ip_sa_0 },
+					   (u16)key.l4_sport,
+					   &(u32){ key.ip_da_0 },
+					   (u16)key.l4_dport,
+					   (u8)key.ip_protocol, pppoe_sid);
 		goto free;
 	}
 
 	err = rhashtable_insert_fast(&cn_flow_table, &entry->node,
 				     cn_flow_ht_params);
 	if (err) {
-		pr_err("cn_flow_replace: rhashtable insert FAILED (%d) - undoing idx=%u\n",
-		       err, entry->hash_idx);
+		pr_err_ratelimited("cn_flow_replace: rhashtable insert FAILED (%d) - undoing idx=%u\n",
+				   err, entry->hash_idx);
 		cn_l3e_flow_del(cn_l3e, entry->hash_idx, entry->crc16);
 		goto free;
 	}
@@ -3176,6 +3322,9 @@ static int cn_setup_tc_block_cb(enum tc_setup_type type, void *type_data,
 	switch (f->command) {
 	case FLOW_CLS_REPLACE:
 		err = cn_flow_replace(f, cb_priv);
+		/* every REPLACE outcome passes here: a refusal is counted, never
+		 * silent (see the refusal-ledger comment above cn_flow_replace) */
+		cn_flow_refused_account(err);
 		break;
 	case FLOW_CLS_DESTROY:
 		err = cn_flow_destroy(f);
@@ -3824,6 +3973,18 @@ static int cn_l3e_proc_show(struct seq_file *m, void *v)
 		   READ_ONCE(l3e->data_gem), READ_ONCE(l3e->data_tcont),
 		   READ_ONCE(l3e->data_pppoe_session),
 		   readl(l3e->ne_base + CN_L3E_HS_AGING_GRANULARITY));
+	/* ★ the REFUSAL ledger: without it, "auto_flows did not go up" cannot be
+	 * told apart from "the kernel never offered a flow".  Cumulative since
+	 * boot; read twice and difference for a rate.  unsupp/full/dup are NORMAL
+	 * refusals (the flow rides the SW fastpath); err is a real failure. */
+	seq_printf(m,
+		   "refused: total=%d unsupp=%d full=%d dup=%d err=%d last_errno=%d [refused != never-offered; unsupp/full/dup are normal, err is not]\n",
+		   atomic_read(&cn_flow_refused),
+		   atomic_read(&cn_flow_refused_unsupp),
+		   atomic_read(&cn_flow_refused_full),
+		   atomic_read(&cn_flow_refused_dup),
+		   atomic_read(&cn_flow_refused_err),
+		   atomic_read(&cn_flow_refused_last));
 	/* DS (WAN->LAN) leg: hw_ds = the gate, ds_flows = reply legs actually
 	 * installed (a subset of auto_flows), ds_ldpid = the LAN egress port the
 	 * last accepted DS install resolved from the client's L2FE FDB entry
@@ -4160,15 +4321,18 @@ static int cn_l3e_proc_show(struct seq_file *m, void *v)
 			verdict = "INCONCLUSIVE: the age-re-arm witness itself is silent on the PROVEN IPoE leg too (us_hits=0), so no PPPoE conclusion may be drawn - fix the witness first";
 		else if (!hits)
 			verdict = "STAGE HIT: pushed entries are live and the witness works (us_hits>0), but no pushed entry EVER matched => the US frame does not reach the T2 lookup or hashes to a different key. This is exactly what 2026-07-20 observed; do NOT chase the encap yet";
-		else if (atomic_read(&cn_pppoe_ds_refused))
+		else if (!atomic_read(&cn_pppoe_ds_hits))
 			/* ★ THE 2026-07-25 root cause, reported before anything
-			 * downstream of it: while the DS leg is refused, EVERY reply
-			 * frame rides the CPU punt path - that alone is the
+			 * downstream of it.  While the reply leg is not offloaded,
+			 * EVERY DS frame rides the CPU punt path: that alone is the
 			 * 934->243 Mbps collapse, and it also puts every DS TCP flag
-			 * byte back under nf_flow_state_check(), which is what tears
-			 * the US entry down inside the flap window.  Never read the
-			 * punt counters as a cause while this is non-zero. */
-			verdict = "DOWNSTREAM IS REFUSED: ds_refused>0 means the reply leg fell back to the CPU punt path, which by itself costs ~700 Mbps downstream AND flaps the upstream entry (every punted DS frame is inspected by nf_flow_state_check, so one FIN/RST tears the offload down). Fix that before reading any punt counter as a cause. Expected causes now: hw_ds_offload=0, cortina_gpon.hw_l3_ds=0, a DS-leg profile invariant that failed, or the LAN next-hop missing from the L2-FDB";
+			 * byte back under nf_flow_state_check(), which is what kills
+			 * the US entry (permanently - the conntrack is never
+			 * re-offered).  Never read the punt counters as a cause while
+			 * this holds.  Keyed on ds_hits, not on ds_refused: the
+			 * refusal counter is cumulative across a runtime flip, so at
+			 * hw_pppoe=1 it can only be a leftover from before it. */
+			verdict = "DOWNSTREAM NOT OFFLOADED (pppoe_ds_hits=0 while the US leg hits): every reply frame is on the CPU punt path. That by itself is the 934->243 Mbps collapse, AND it flaps the upstream entry - nf_flow_state_check() inspects every punted frame, so one FIN/RST (or one corrupted flag byte) tears the offload down for good. Check, in order: ds_refused (non-zero = the PPPoE leg gate refused a reply rule), hw_ds_offload=1, cortina_gpon.hw_l3_ds=1, the DS-leg profile invariants, and whether the LAN next-hop is in the L2-FDB. Do NOT read the punt counters as a cause while this holds";
 		else if (atomic_read(&cn_pppoe_early_gone))
 			verdict = "STAGE HOLD FAIL: pushed entries HIT but are torn down within the flap window, i.e. the flow keeps falling back to software (a FIN/RST or a mangled flag byte on a CPU-punted frame -> NF_FLOW_CLOSING -> GC). With the DS leg offloaded, punted DS frames should be rare, so check pppoe_punt data= and shape= before concluding, and remember that a benchmark's own connection teardowns land here too";
 		else if (bad)
@@ -4347,10 +4511,10 @@ static ssize_t cn_l3e_proc_write(struct file *file, const char __user *ubuf,
 			err = cn_l3e_flow_add_rawcrc(l3e, c32, c16, &act,
 						     &e->idx);
 			if (!err) {
-				/* same hit witness as the manual install:
-				 * re-arm DOWN to IDLE(1); only a HW T2 HIT
-				 * re-arms it up to START(2) */
-				cn_l3e_age_set(l3e, e->idx, CN_L3E_AGE_IDLE);
+				/* the age step-down to IDLE(1) is done by
+				 * cn_l3e_flow_add_rawcrc for EVERY install path
+				 * now (manual and automatic alike), so only a HW
+				 * T2 HIT re-arms this slot up to START(2) */
 				e->crc16 = c16;
 				e->sa = 0;
 				e->da = 0;
@@ -4434,13 +4598,13 @@ static ssize_t cn_l3e_proc_write(struct file *file, const char __user *ubuf,
 		err = cn_l3e_flow_add(l3e, &key, &act, profile, mask_id,
 				      &e->idx, &e->crc16);
 		if (!err) {
-			/* ★ HIT WITNESS: cn_l3e_flow_add armed the entry at
-			 * START(2); re-arm it DOWN to IDLE(1) so the go-live is a
-			 * valid slot below START.  On a HW T2 HIT the lookup engine
-			 * re-arms the slot back UP to START(2), so a subsequent read
-			 * of age > IDLE(1) is UNAMBIGUOUS proof the entry matched a
+			/* ★ HIT WITNESS: cn_l3e_flow_add arms the entry at START(2)
+			 * then steps it DOWN to IDLE(1) inside cn_l3e_flow_add_rawcrc
+			 * - for EVERY install path, so the go-live is a valid slot
+			 * below START.  On a HW T2 HIT the lookup engine re-arms the
+			 * slot back UP to START(2), so a subsequent read of
+			 * age > IDLE(1) is UNAMBIGUOUS proof the entry matched a
 			 * frame in silicon (the HW ager only decrements). */
-			cn_l3e_age_set(l3e, e->idx, CN_L3E_AGE_IDLE);
 			e->sa = key.ip_sa_0;
 			e->da = key.ip_da_0;
 			e->sp = sp;

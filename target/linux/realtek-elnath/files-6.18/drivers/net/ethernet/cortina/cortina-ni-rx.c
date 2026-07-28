@@ -46,6 +46,7 @@
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/netdevice.h>
 #include <linux/platform_device.h>
 #include <linux/proc_fs.h>
@@ -996,8 +997,12 @@ static void cortina_ni_rx_ind_read(struct cortina_ni *ni, u32 access_reg, unsign
 	writel(CA_NI_IND_ACCESS_GO | idx, acc);
 	if (readl_poll_timeout(acc, v, !(v & CA_NI_IND_ACCESS_GO),
 			       CA_NI_TX_POLL_US, CA_NI_TX_POLL_TIMEOUT_US))
-		dev_warn(ni->dev, "indirect read @0x%x[%u] GO stuck (0x%08x)\n",
-			 access_reg, idx, v);
+		/* RATELIMITED: this runs from /proc show paths, which a soak or a
+		 * benchmark harness polls in a loop - an un-ratelimited warn there
+		 * floods the serial console the witnesses are read over. */
+		dev_warn_ratelimited(ni->dev,
+				     "indirect read @0x%x[%u] GO stuck (0x%08x)\n",
+				     access_reg, idx, v);
 }
 
 /*
@@ -2208,6 +2213,161 @@ static const struct { u16 off; u32 val; } cortina_ni_deepq_cb_cfg[] = {
 };
 
 /*
+ * ★★ UPSTREAM QUEUE DEPTH - the L2TM deep-queue per-VoQ admission thresholds.
+ *
+ * There are TWO different things at 0x2d.. / 0x2e.. that both hold 0x7fff7fff, and
+ * confusing them costs a wrong "we diverge from stock" reading:
+ *
+ *  (1) the DIRECT registers in cortina_ni_deepq_cb_cfg[] - 0x2d80/0x2d88/0x2d8c/
+ *      0x2d90/0x2d94/0x2d98 and 0x2ec8..0x2ee8.  These are tier-1 stock live golden
+ *      (dev/x411axf/stock/stock_dqsch_2d00.txt, devmem on stock 2026-07-12): stock
+ *      itself reads 0x7FFF7FFF there.  We MATCH stock at every one of them - they
+ *      are NOT a divergence and are deliberately NOT touched by the knob below.
+ *
+ *  (2) the two INDEXED per-VoQ threshold profile tables, written through the
+ *      two-phase ACCESS/DATA protocol:
+ *        DQSCH VOQ  ACCESS 0x2e70 / DATA  0x2e74   - stock residual 0x00700070
+ *                                                    (lo = hi = 0x70 = 112)
+ *        CB    VOQ  ACCESS 0x2da0 / DATA1 0x2da4   - stock residual 0x0FFFFFFF
+ *                            DATA0 0x2da8         - stock residual 0xFFFFFFFF
+ *      Here we DO diverge: we write the permissive 0x7fff7fff into all 8 entries of
+ *      both tables.  On the DQSCH table that is 32767 vs stock's 112 = ~292x DEEPER,
+ *      the prime bufferbloat suspect on the upstream path (the central buffer is the
+ *      reservoir that fills when the GPON upstream grant is the bottleneck).  On the
+ *      CB table it is the other way round: stock's {0x0FFFFFFF, 0xFFFFFFFF} is far
+ *      MORE permissive than our 0x7fff7fff, so "match stock" there means going
+ *      DEEPER, not shallower.
+ *      ⚠ The stock values are the DATA-register RESIDUAL after stock's last indexed
+ *      write (ACCESS read back as 0x40000007 = last index 7), i.e. proven for entry
+ *      7 and assumed uniform across the 8 entries - the same assumption our own
+ *      uniform write makes.
+ *
+ * ★ SCOPE - WHICH traffic this actually governs (know it before reading a result):
+ * only frames that take the DEEP-QUEUE path go through these thresholds.
+ *   - HW-offloaded UPSTREAM (LAN->WAN) flows: YES, but CONDITIONALLY - the L3FE US
+ *     egress action sets deepq only when the live data T-CONT <= 7
+ *     (CN_L3E_PON_DEEPQ_TCONT_MAX in cortina-ni-flowoffload.c).  Read the live
+ *     T-CONT off the box first: /proc/cortina_l3fe prints `live_pon{gem= tcont=}`.
+ *     With a T-CONT above 7 the upstream offloaded path does NOT use the deep
+ *     queue and this knob cannot move an upstream number at all.
+ *   - CPU-forwarded UPSTREAM frames (the pon_data_enq path in cortina-ni-tx.c):
+ *     NO - that path never sets deep_q in its HEADER_A.
+ *   - HW-offloaded DOWNSTREAM flows: only with hw_ds_deepq=1, which is default OFF.
+ *   - CPU-RX (frames trapped to the CPU): YES - this is the path the deep queue was
+ *     brought up for in the first place.
+ *
+ * DEFAULT = the CURRENT permissive behaviour, byte-identical to what shipped: this
+ * knob exists to MEASURE the trade (depth vs latency vs throughput), and picking a
+ * different default is the operator's call, from numbers, never a silent change.
+ *
+ * RUNTIME-settable (not boot-time only): the tables are plain indexed RAM behind the
+ * ACCESS/DATA protocol, so a write re-walks all 8 entries of both tables in place.
+ *   echo 0x00700070 > /sys/module/cortina_ni/parameters/deepq_voq_thrsh
+ *   echo 1          > /sys/module/cortina_ni/parameters/deepq_cb_stock
+ * A bootarg works too and is the cleaner A/B (no in-flight transition):
+ *   cortina_ni.deepq_voq_thrsh=0x00700070 cortina_ni.deepq_cb_stock=1
+ * Read the ACTIVE value back off the running device with
+ *   grep deepq-thrsh /proc/net/cortina_ni_rx
+ * which prints BOTH the parameters AND a live indirect read of the HW table, so a
+ * benchmark's configuration is provable after the fact.
+ */
+static unsigned int deepq_voq_thrsh = CA_NI_L2TM_DEEPQ_PROFILE_PERMISSIVE;
+static bool deepq_cb_stock;
+/* set once the NI is probed, so a sysfs write can re-walk the tables */
+static struct cortina_ni *cortina_ni_deepq_ni;
+static DEFINE_MUTEX(cortina_ni_deepq_lock);
+
+/* Write the CURRENT parameter values into all 8 entries of BOTH per-VoQ threshold
+ * profile tables (DQSCH @0x2e70/0x2e74 and CB @0x2da0/0x2da4/0x2da8).  Every entry
+ * of every table, always - a partial walk would leave some VoQs deep and make any
+ * measurement meaningless. */
+static void cortina_ni_rx_deepq_thrsh_program(struct cortina_ni *ni)
+{
+	u32 dq = READ_ONCE(deepq_voq_thrsh);
+	bool cbs = READ_ONCE(deepq_cb_stock);
+	u32 cb1 = cbs ? CA_NI_L2TM_CB_VOQ_THRSH_D1
+		      : CA_NI_L2TM_DEEPQ_PROFILE_PERMISSIVE;
+	u32 cb0 = cbs ? CA_NI_L2TM_CB_VOQ_THRSH_D0
+		      : CA_NI_L2TM_DEEPQ_PROFILE_PERMISSIVE;
+	unsigned int i;
+
+	mutex_lock(&cortina_ni_deepq_lock);
+	for (i = 0; i < CA_NI_L2TM_DEEPQ_VOQ_ENTRIES; i++) {
+		writel(dq, ni_base(ni) + CA_NI_L2TM_DQSCH_VOQ_THRSH_DATA);
+		cortina_ni_rx_ind_store(ni, CA_NI_L2TM_DQSCH_VOQ_THRSH_ACCESS, i);
+
+		writel(cb1, ni_base(ni) + CA_NI_L2TM_CB_VOQ_THRSH_DATA1);
+		writel(cb0, ni_base(ni) + CA_NI_L2TM_CB_VOQ_THRSH_DATA0);
+		cortina_ni_rx_ind_store(ni, CA_NI_L2TM_CB_VOQ_THRSH_ACCESS, i);
+	}
+	mutex_unlock(&cortina_ni_deepq_lock);
+
+	dev_info(ni->dev,
+		 "deepq-thrsh: %u entries x {dqsch(0x2e74)=0x%08x, cb(0x2da4/0x2da8)={0x%08x,0x%08x}} [dqsch stock=0x%08x permissive=0x%08x; cb stock={0x%08x,0x%08x}]\n",
+		 CA_NI_L2TM_DEEPQ_VOQ_ENTRIES, dq, cb1, cb0,
+		 CA_NI_L2TM_DQSCH_VOQ_THRSH_VAL,
+		 CA_NI_L2TM_DEEPQ_PROFILE_PERMISSIVE,
+		 CA_NI_L2TM_CB_VOQ_THRSH_D1, CA_NI_L2TM_CB_VOQ_THRSH_D0);
+}
+
+/* Live readback of one entry of each table (indirect read: ACCESS = GO|idx, then
+ * the entry is latched in DATA).  Bounded + non-fatal; the ACCESS word is printed
+ * alongside so a GO that never cleared is visible instead of silently believed. */
+static void cortina_ni_rx_deepq_thrsh_read(struct cortina_ni *ni, unsigned int idx,
+					   u32 *dq, u32 *cb1, u32 *cb0)
+{
+	mutex_lock(&cortina_ni_deepq_lock);
+	cortina_ni_rx_ind_read(ni, CA_NI_L2TM_DQSCH_VOQ_THRSH_ACCESS, idx);
+	*dq = readl(ni_base(ni) + CA_NI_L2TM_DQSCH_VOQ_THRSH_DATA);
+	cortina_ni_rx_ind_read(ni, CA_NI_L2TM_CB_VOQ_THRSH_ACCESS, idx);
+	*cb1 = readl(ni_base(ni) + CA_NI_L2TM_CB_VOQ_THRSH_DATA1);
+	*cb0 = readl(ni_base(ni) + CA_NI_L2TM_CB_VOQ_THRSH_DATA0);
+	mutex_unlock(&cortina_ni_deepq_lock);
+}
+
+static int cortina_ni_rx_deepq_thrsh_reprogram(void)
+{
+	struct cortina_ni *ni = READ_ONCE(cortina_ni_deepq_ni);
+
+	/* set before probe (bootarg / insmod): the init walk picks it up */
+	if (ni)
+		cortina_ni_rx_deepq_thrsh_program(ni);
+	return 0;
+}
+
+static int deepq_voq_thrsh_set(const char *val, const struct kernel_param *kp)
+{
+	int ret = param_set_uint(val, kp);
+
+	return ret ? ret : cortina_ni_rx_deepq_thrsh_reprogram();
+}
+
+static int deepq_cb_stock_set(const char *val, const struct kernel_param *kp)
+{
+	int ret = param_set_bool(val, kp);
+
+	return ret ? ret : cortina_ni_rx_deepq_thrsh_reprogram();
+}
+
+static const struct kernel_param_ops deepq_voq_thrsh_ops = {
+	.set	= deepq_voq_thrsh_set,
+	.get	= param_get_uint,
+};
+static const struct kernel_param_ops deepq_cb_stock_ops = {
+	.flags	= KERNEL_PARAM_OPS_FL_NOARG,	/* bare name = 1, like a bool param */
+	.set	= deepq_cb_stock_set,
+	.get	= param_get_bool,
+};
+
+module_param_cb(deepq_voq_thrsh, &deepq_voq_thrsh_ops, &deepq_voq_thrsh, 0644);
+MODULE_PARM_DESC(deepq_voq_thrsh,
+	"L2TM DQSCH per-VoQ admission threshold, all 8 profile entries (0x2e70/0x2e74). 0x7fff7fff = permissive/DEFAULT (32767 per half, ~292x stock - the shipping behaviour, unchanged); 0x00700070 = the tier-1 stock value (112 per half); any other value is written verbatim. RUNTIME-settable (re-walks the table); read the active value back with 'grep deepq-thrsh /proc/net/cortina_ni_rx'");
+
+module_param_cb(deepq_cb_stock, &deepq_cb_stock_ops, &deepq_cb_stock, 0644);
+MODULE_PARM_DESC(deepq_cb_stock,
+	"L2TM central-buffer per-VoQ threshold, all 8 profile entries (0x2da0/0x2da4/0x2da8). 0 = DEFAULT 0x7fff7fff in both words (the shipping behaviour); 1 = the tier-1 stock pair {hi=0x0fffffff, lo=0xffffffff}, which is DEEPER than ours, not shallower. RUNTIME-settable");
+
+/*
  * ★★ THE DEEP-QUEUE / DQSCH init (stock aal_l2_tm_cb_init) - the block our driver
  * never ran, so a deep_q=1 frame is enqueued into the central buffer but the DQSCH +
  * arbiter never dequeue it to ES port 7 -> RMU0 (0x6900 stuck 0, NO drop).  Vendor
@@ -2236,20 +2396,13 @@ static void cortina_ni_rx_deepq_sched_init(struct cortina_ni *ni)
 	}
 
 	/* (3) the two INDEXED per-VOQ profile tables (8 entries each) via the two-phase
-	 * ACCESS-command protocol (DATA then ACCESS=idx|GO|WR, poll GO clear).  Permissive
-	 * threshold so a frame is admitted (a 0 profile = zero threshold = drop-all).
-	 * table A = DQSCH VOQ (0x2e74/0x2e70); table B = CB VOQ (0x2da4+0x2da8/0x2da0). */
-	for (i = 0; i < CA_NI_L2TM_DEEPQ_VOQ_ENTRIES; i++) {
-		writel(CA_NI_L2TM_DEEPQ_PROFILE_PERMISSIVE,
-		       ni_base(ni) + CA_NI_L2TM_DQSCH_VOQ_THRSH_DATA);
-		cortina_ni_rx_ind_store(ni, CA_NI_L2TM_DQSCH_VOQ_THRSH_ACCESS, i);
-
-		writel(CA_NI_L2TM_DEEPQ_PROFILE_PERMISSIVE,
-		       ni_base(ni) + CA_NI_L2TM_CB_VOQ_THRSH_DATA1);
-		writel(CA_NI_L2TM_DEEPQ_PROFILE_PERMISSIVE,
-		       ni_base(ni) + CA_NI_L2TM_CB_VOQ_THRSH_DATA0);
-		cortina_ni_rx_ind_store(ni, CA_NI_L2TM_CB_VOQ_THRSH_ACCESS, i);
-	}
+	 * ACCESS-command protocol (DATA then ACCESS=idx|GO|WR, poll GO clear).  A 0
+	 * profile = zero threshold = drop-all, so the value must be non-zero for a frame
+	 * to be admitted at all.  The VALUE is the runtime-selectable queue depth
+	 * (deepq_voq_thrsh / deepq_cb_stock, default = the permissive shipping value);
+	 * table A = DQSCH VOQ (0x2e74/0x2e70), table B = CB VOQ (0x2da4+0x2da8/0x2da0). */
+	WRITE_ONCE(cortina_ni_deepq_ni, ni);
+	cortina_ni_rx_deepq_thrsh_program(ni);
 
 	/* (4) ARB_CTRL.dbuf_sel (bit1)=1 so a PDPID-8 frame takes the deep-buffer path */
 	ni_rmw(ni, CA_NI_L2FE_ARB_CTRL, 0, CA_NI_L2FE_ARB_DBUF_SEL);
@@ -3314,16 +3467,11 @@ static void cortina_ni_rx_es_enable(struct cortina_ni *ni)
 	       FIELD_PREP(CA_NI_QM_ES_NI_EN, 0xff) |
 	       FIELD_PREP(CA_NI_QM_ES_INCCFG_PKT, CA_NI_QM_ES_INCCFG_PKT_VAL) |
 	       FIELD_PREP(CA_NI_QM_ES_INCCFG_ERR, CA_NI_QM_ES_INCCFG_ERR_VAL));
-	/* ★★ build67: ALSO program the REAL L3QM ES_CTRL (0x7108) - enable_tx: tx_en(b31) +
-	 * ni_en=0xff + cpu_en=0 (cpu_en armed by es_cpu at open).  We'd only written 0x6108. */
-	ni_rmw(ni, CA_NI_QM_ES_CTRL_REAL,
-	       CA_NI_QM_ES_CPU_EN | CA_NI_QM_ES_NI_EN |
-	       CA_NI_QM_ES_INCCFG_PKT | CA_NI_QM_ES_INCCFG_ERR |
-	       CA_NI_QM_ES_RSVD25,
-	       CA_NI_QM_ES_TX_EN |
-	       FIELD_PREP(CA_NI_QM_ES_NI_EN, 0xff) |
-	       FIELD_PREP(CA_NI_QM_ES_INCCFG_PKT, CA_NI_QM_ES_INCCFG_PKT_VAL) |
-	       FIELD_PREP(CA_NI_QM_ES_INCCFG_ERR, CA_NI_QM_ES_INCCFG_ERR_VAL));
+	/* (A second copy of this write used to go to 0x7108 as a supposed "real"
+	 * ES_CTRL.  0x7108 is EPP64_RDPTR(cpu_port 0, voq 2) - a ring read pointer -
+	 * so that wrote a control word into hardware ring state.  It was harmless only
+	 * by accident: cortina_ni_rx_poll_voq stores the rdptr unconditionally, so the
+	 * next NAPI poll overwrote it.  Removed; 0x6108 above is the real register.) */
 }
 
 /* arm/disarm the CPU-port drain (stock aal_l3qm_enable_tx_cpu / l3_tm
@@ -3336,16 +3484,10 @@ static void cortina_ni_rx_es_cpu(struct cortina_ni *ni, bool enable)
 {
 	u32 mask = FIELD_PREP(CA_NI_QM_ES_CPU_EN, CA_NI_QM_ES_CPU_EN_ALL);
 
-	if (enable) {
+	if (enable)
 		ni_rmw(ni, CA_NI_QM_ES_CTRL, CA_NI_QM_ES_RSVD25, mask);
-		/* ★★ build67: cpu_en on the REAL ES_CTRL (0x7108) - THIS is the CPU-port ES
-		 * drain enable (enable_tx_cpu); without it the CPU-EPP writeback never runs
-		 * (epp_wptr frozen).  0xff covers CPU port 0. */
-		ni_rmw(ni, CA_NI_QM_ES_CTRL_REAL, CA_NI_QM_ES_RSVD25, mask);
-	} else {
+	else
 		ni_rmw(ni, CA_NI_QM_ES_CTRL, mask, 0);
-		ni_rmw(ni, CA_NI_QM_ES_CTRL_REAL, mask, 0);
-	}
 }
 
 /* FBM pools the RMU allocates CPU-RX buffers from.  RE (aca2223c): the pool is chosen
@@ -4174,7 +4316,6 @@ static const struct {
 	/* L3QM / RMU (RX drain path) */
 	{ "qm_rmu0_ctrl",	CA_NI_QM_RMU0_CTRL },
 	{ "qm_es_ctrl_6108",	CA_NI_QM_ES_CTRL },
-	{ "qm_es_ctrl_REAL_7108", CA_NI_QM_ES_CTRL_REAL },	/* build67: real ES_CTRL (tx_en b31 + cpu_en) */
 	{ "qm_l3tm_ni_ena",	CA_NI_QM_L3TM_NI_PORT_ENA },	/* 0x610c */
 	{ "qm_int_en0",		CA_NI_QM_EPP64_INT_EN0 },
 	{ "qm_int_en1",		CA_NI_QM_EPP64_INT_EN1 },
@@ -4354,6 +4495,38 @@ static const u16 cortina_ni_qmdump_offs[] = {
 	0x7000, 0x7004, 0x7008, 0x700c, 0x7010, 0x7014, 0x7018, 0x701c,
 	0x7020, 0x7024, 0x7028, 0x702c,
 };
+
+/*
+ * ★ BOTH DIRECTIONS' CPU-forward witness, in ONE read.
+ *
+ * `data_enq` (tx->pon_data_enq) counts ONLY the UPSTREAM leg: LAN->WAN frames the
+ * CPU enqueued to the PON TX.  Reading it alone and concluding "the CPU-forward
+ * counter stayed flat, so the flow was HW-offloaded" is wrong by construction - it
+ * says nothing about the DOWNSTREAM direction, which is CPU-punted through an
+ * entirely different counter.  The downstream complement is on the RX side:
+ *   wan_l3  (rx->wan_l3_frames) - DS frames the HW-L3 engine MISSED and punted to
+ *                                 the CPU (lspid = L3_WAN), delivered to the WAN
+ *                                 netdev.  This is the DS "software forwarded"
+ *                                 counter, the true mirror of us data_enq.
+ *   wan_pon (rx->wan_frames)    - DS frames arriving with lspid = PON: terminating
+ *                                 traffic (DHCP/ICMP to the router itself) plus
+ *                                 every DS frame when HW-L3 forwarding is off.  Not
+ *                                 all of it is transit, so it is reported SEPARATELY
+ *                                 rather than folded into one number.
+ * Printed identically into /proc/net/cortina_ni_rx AND /proc/net/cortina_ni_tx so
+ * either file alone answers "was EITHER direction on the CPU during this run".
+ */
+void cortina_ni_cpu_fwd_show(struct seq_file *m, struct cortina_ni *ni)
+{
+	struct cortina_ni_rx *rx = ni->rx;
+	struct cortina_ni_tx *tx = ni->tx;
+
+	seq_printf(m,
+		   "cpu_fwd: us_data_enq=%llu [UPSTREAM only: LAN->WAN frames the CPU enqueued to PON TX] ds_wan_l3=%llu [DOWNSTREAM: HW-L3 miss punted to CPU] ds_wan_pon=%llu [DOWNSTREAM: lspid=PON, incl. terminating traffic] -- BOTH directions must stay FLAT to claim HW offload; us_data_enq alone proves nothing about DS\n",
+		   tx ? tx->pon_data_enq : 0ULL,
+		   rx ? rx->wan_l3_frames : 0ULL,
+		   rx ? rx->wan_frames : 0ULL);
+}
 
 static int cortina_ni_rx_proc_show(struct seq_file *m, void *v)
 {
@@ -5108,6 +5281,36 @@ static int cortina_ni_rx_proc_show(struct seq_file *m, void *v)
 			   !!(readl(ni_base(ni) + CA_NI_QM_EQM_PA_REQ(CA_NI_RX_EQ12_ID)) & CA_NI_QM_PA_REQ_READY),
 			   f0, f8);
 	}
+	/* ★ QUEUE-DEPTH READBACK - which setting was actually in force.  Prints the
+	 * parameters AND a live indirect read of the first and last profile entry of
+	 * both per-VoQ threshold tables, so a benchmark's queue depth is provable after
+	 * the run instead of remembered.  A benchmark whose configuration cannot be read
+	 * back afterwards is not evidence. */
+	{
+		u32 dq0, cb0_1, cb0_0, dq7, cb7_1, cb7_0;
+
+		cortina_ni_rx_deepq_thrsh_read(ni, 0, &dq0, &cb0_1, &cb0_0);
+		cortina_ni_rx_deepq_thrsh_read(ni,
+					       CA_NI_L2TM_DEEPQ_VOQ_ENTRIES - 1,
+					       &dq7, &cb7_1, &cb7_0);
+		seq_printf(m,
+			   "deepq-thrsh: param{deepq_voq_thrsh=0x%08x deepq_cb_stock=%d} hw_dqsch[0]=0x%08x hw_dqsch[%u]=0x%08x hw_cb[0]={0x%08x,0x%08x} hw_cb[%u]={0x%08x,0x%08x} acc{dqsch(0x2e70)=0x%08x cb(0x2da0)=0x%08x}\n",
+			   READ_ONCE(deepq_voq_thrsh), READ_ONCE(deepq_cb_stock),
+			   dq0, CA_NI_L2TM_DEEPQ_VOQ_ENTRIES - 1, dq7,
+			   cb0_1, cb0_0, CA_NI_L2TM_DEEPQ_VOQ_ENTRIES - 1,
+			   cb7_1, cb7_0,
+			   readl(ni_base(ni) + CA_NI_L2TM_DQSCH_VOQ_THRSH_ACCESS),
+			   readl(ni_base(ni) + CA_NI_L2TM_CB_VOQ_THRSH_ACCESS));
+		seq_puts(m,
+			 "deepq-thrsh: SCOPE = the deep-queue path only: CPU-RX always; HW-offloaded US only when the live data T-CONT <= 7 (see live_pon{tcont=} in /proc/cortina_l3fe); HW-offloaded DS only with hw_ds_deepq=1 (default off); CPU-forwarded US (pon_data_enq) never\n");
+		seq_printf(m,
+			   "deepq-thrsh: dqsch stock=0x%08x permissive=0x%08x (ours ~292x deeper); cb stock={0x%08x,0x%08x} permissive=0x%08x (stock is DEEPER here); direct regs 0x2d80/88/8c/90/94/98 + 0x2ec8..0x2ee8 are tier-1 stock golden and are NOT part of this knob\n",
+			   CA_NI_L2TM_DQSCH_VOQ_THRSH_VAL,
+			   CA_NI_L2TM_DEEPQ_PROFILE_PERMISSIVE,
+			   CA_NI_L2TM_CB_VOQ_THRSH_D1, CA_NI_L2TM_CB_VOQ_THRSH_D0,
+			   CA_NI_L2TM_DEEPQ_PROFILE_PERMISSIVE);
+	}
+	cortina_ni_cpu_fwd_show(m, ni);
 	seq_printf(m, "destport0: eq_cfg=0x%08x pkt_buf=0x%08x profile%d=0x%08x voq_en=0x%08x\n",
 		   readl(ni_base(ni) +
 			 CA_NI_QM_DEST_PORT_EQ_CFG(CA_NI_RX_CPU_DEST_PORT)),
