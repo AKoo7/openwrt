@@ -1,0 +1,39 @@
+From: Airtel AAP321NK port
+Subject: [PATCH] remoteproc: qcom_q6v5_mpd: tolerate foreign bootinfo SMEM size
+
+On a kernel-only boot (tftp/bootm of just the Linux FIT on top of the
+vendor's already-running SBL+TZ firmware), SMEM item 507
+(UPD_BOOT_INFO_SMEM_ID) may already be allocated by the vendor Q6/TZ stack
+at a size different from the upstream-hardcoded 4096. SMEM is allocate-only
+and lives in a reserved region untouched by bootm, so our kernel inherits
+that foreign item and the original `size != 4096` check aborts Q6 bring-up
+even though qcom_smem_get() returned a valid mapping.
+
+The bootinfo payload actually written is tiny, so fail only on a real error
+pointer and merely warn on a foreign size, then proceed -- letting the
+handshake advance to the Q6/TZ firmware's own version/auth validation.
+
+--- a/drivers/remoteproc/qcom_q6v5_mpd.c
++++ b/drivers/remoteproc/qcom_q6v5_mpd.c
+@@ -324,13 +324,20 @@
+ 	}
+ 
+ 	ptr = qcom_smem_get(REMOTE_PID, UPD_BOOT_INFO_SMEM_ID, &size);
+-	if (IS_ERR(ptr) || size != UPD_BOOT_INFO_SMEM_SIZE) {
++	if (IS_ERR(ptr)) {
+ 		dev_err(wcss->dev,
+ 			"Unable to acquire smp2p item(%d) ret:%ld\n",
+ 			UPD_BOOT_INFO_SMEM_ID, PTR_ERR(ptr));
+ 		return PTR_ERR(ptr);
+ 	}
+ 
++	/* A foreign (vendor-allocated) item of a different size is tolerated on
++	 * kernel-only boots over vendor firmware; the payload written is tiny. */
++	if (size != UPD_BOOT_INFO_SMEM_SIZE)
++		dev_warn(wcss->dev,
++			 "bootinfo smem(%d) size %zu != %d, proceeding (vendor-allocated)\n",
++			 UPD_BOOT_INFO_SMEM_ID, size, UPD_BOOT_INFO_SMEM_SIZE);
++
+ 	/*Version*/
+ 	version = (wcss->desc->bootargs_version) ? wcss->desc->bootargs_version : VERSION2;
+ 	memcpy_toio(ptr, &version, sizeof(version));
