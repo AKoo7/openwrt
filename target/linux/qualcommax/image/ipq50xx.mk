@@ -19,6 +19,28 @@ define Build/mstc-header
 	rm -f $@.crclen
 endef
 
+define Device/airtel_aap321nk
+	$(call Device/FitImage)
+	$(call Device/UbiFit)
+	DEVICE_VENDOR := Airtel
+	DEVICE_MODEL := AAP321NK
+	SOC := ipq5018
+	KERNEL_LOADADDR := 0x41000000
+	KERNEL_IN_UBI := 1
+	BLOCKSIZE := 128k
+	PAGESIZE := 2048
+	NAND_SIZE := 256m
+	DEVICE_DTS_CONFIG := config@mp03.5-c1
+	# kmod-ath11k-ahb comes from the qualcommax DEFAULT_PACKAGES; the
+	# DWMAC/UNIPHY/qca8337 ethernet drivers need no separate device
+	# packages. The combined firmware package ships both the IPQ5018
+	# (integrated 2.4G) and QCN6122 (5G) blobs. No ipq-wifi-* package:
+	# real per-unit ath11k caldata is pulled from the ART partition at
+	# runtime (see 11-ath11k-caldata), not a generic board file.
+	DEVICE_PACKAGES := ath11k-firmware-ipq5018-qcn6122
+endef
+TARGET_DEVICES += airtel_aap321nk
+
 define Device/cmcc_mr3000d-ci
 	$(call Device/FitImageLzma)
 	$(call Device/UbiFit)
