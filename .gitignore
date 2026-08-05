@@ -41,3 +41,14 @@ CLAUDE.md
 .claude
 .claude/
 **/.claude/
+
+# ★ NO BACKUPS INSIDE THIS TREE (operator, 2026-08-05).  Three .config.*.bak had
+# been committed and published, and one still carried a product spelling that had
+# been removed everywhere else -- the risk is not losing the file, it is
+# publishing it, or sweeping it into a later commit without noticing.
+# Backups belong in /home/user/Desktop/CatchChallenger/dev/backup/, which is not
+# a git tree and therefore cannot be committed by accident.
+*.bak
+*.orig
+*.prerename
+*.prestate
