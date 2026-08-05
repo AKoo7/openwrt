@@ -77,8 +77,8 @@ enum cortina_ni_win {
  * the GPHY LINE side still links).  Must be deasserted EARLY (before the GPHY/
  * MAC bring-up) - a late release does not re-init the sub-block.
  */
-#define CA_NI_GLB_DPHY_RESET		0xa0
-#define CA_NI_GLB_DPHY_RESET_VAL	0x10000000u	/* stock golden (all NE sub-blocks released) */
+#define CA_NI_GLB_BLOCK_RESET		0xa0
+#define CA_NI_GLB_BLOCK_RESET_VAL	0x10000000u	/* stock golden (all NE sub-blocks released) */
 
 /*
  * NE block-reset controller (GLB +0x28, phys 0xf4320028; "cortina,rst-mgr"
@@ -94,7 +94,7 @@ enum cortina_ni_win {
  * rtl8277C-soc_asic.dtsi - it pointed at an unmapped/RO word, so every asserted
  * bit read back 0.)  Never pulse SDRAM: that would reset DRAM.
  */
-#define CA_NI_GLB_BLOCK_RST		0x28
+#define CA_NI_GLB_BIST_CONTROL4		0x28
 #define  CA_NI_GLB_RST_NI		BIT(0)	/* NI_RESET  (U-Boot TX path) */
 #define  CA_NI_GLB_RST_L2FE		BIT(1)	/* L2FE_RESET */
 #define  CA_NI_GLB_RST_L2TM		BIT(2)	/* L2TM_RESET */
@@ -108,15 +108,15 @@ enum cortina_ni_win {
  * diagnostic dumps ALL of these via the GLB window (correct 0x4_ addressing) so
  * the DATA settles which is the real reset (structured value vs 0/BIST); 0xa0
  * dphy_rst is the known-mapped reference (reads ~0x10000000). */
-#define CA_NI_GLB_BLOCK_RESET_98	0x98
-#define CA_NI_GLB_BLOCK_RESET_EXT	0x9c
-#define CA_NI_GLB_FABRIC_RESET		0xa4
+#define CA_NI_GLB_OPT_MODULE_STATUS	0x98
+#define CA_NI_GLB_PON_CNTL	0x9c
+#define CA_NI_GLB_BLOCK_RESET_EXT		0xa4
 /* ★ GLOBAL_FABRIC_RESET bit5 = the NI-MCE (multicast-expansion) sub-block reset.
  * "rsrvd1" in the rtl8277c header, but the ours-vs-stock devmem differential
  * proves it: ours 0xa4=0x00079F20 (bit5 SET), stock=0x00079F00 (bit5 CLEAR).
  * With bit5 set the NI-MCE RAM (0xaa6x) is held in reset -> the plain mce_indx
  * DATA write async-SErrors.  DEASSERT-ONLY (clear, no pulse) to match stock. */
-#define  CA_NI_GLB_FABRIC_RST_MCE	BIT(5)
+#define  CA_NI_GLB_BLOCK_RESET_EXT_MCE	BIT(5)
 /* cortina_ni_qm_reset pulses NI+L2FE+L2TM+L3FE+TQM sequentially (full stock
  * ca_ni_global_reset order, SDRAM=bit4 skipped).  The QM's init-done depends on
  * the NI<->QM handshake, so NI must be reset too; cortina_ni_tx_hw_init (run in
@@ -189,6 +189,11 @@ enum cortina_ni_win {
  */
 #define CA_NI_GPHY_FIRST		1
 #define CA_NI_GPHY_COUNT		4
+/* The four RJ45 sockets ARE the four internal-GPHY NI ports (MDIO address =
+ * CA_NI_GPHY_FIRST + port).  For a LAN NI port the L2FE ARB ldpid->pdpid map is
+ * the identity (cortina_ni_arb_lan_map_init), so ldpid == physical port == the
+ * value a direct-TX descriptor carries in CA_NI_TX_DESC1_DEST. */
+#define CA_NI_LAN_PORT_COUNT		CA_NI_GPHY_COUNT
 #define CA_NI_GPHY_BANK_STRIDE		0x40000
 #define CA_NI_GPHY_MII_BASE		0x29000
 #define CA_NI_GPHY_REG_STRIDE		8
@@ -651,8 +656,22 @@ enum cortina_ni_win {
 #define  CA_NI_MIB_ACCESS_OPCODE	GENMASK(29, 28)
 #define  CA_NI_MIB_ACCESS_PORT		GENMASK(7, 5)
 #define  CA_NI_MIB_ACCESS_CNTID		GENMASK(4, 0)
-#define CA_NI_HV_RXMIB_DATA0		0xa16c		/* counter value [31:0]  */
-#define CA_NI_HV_RXMIB_DATA1		0xa170		/* byte-count hi word    */
+/* ★★ THE TWO WORDS ARE THE OTHER WAY ROUND, AND THE OLD ORDER IS WHY THIS
+ * COUNTER WAS WRITTEN OFF AS A PHANTOM (fixed 2026-08-05).  Anchored on three
+ * independent tiers: stock's own register table (reg.txt:2638-2639) names
+ * 0xa16c DATA1 and 0xa170 DATA0; stock's `ca-ne.ko` composes them in
+ * aal_ni_eth_port_mib_get with `orr x0,x1,x0,lsl #32` on the 0xa16c load, i.e.
+ * 0xa16c is the HIGH half; and a live stock dump reads 0xa16c=0 with
+ * 0xa170=0x399A under traffic.
+ * ⇒ reading "DATA0" at 0xa16c returned the HIGH 32 bits, which is ZERO for any
+ * count below 2^32 - so the per-socket ingress counter looked dead on a working
+ * board and was recorded as a phantom.  That was OUR INSTRUMENT, not the
+ * silicon.  The TX triplet in this header was already correct.
+ * ⚠ STILL NOT A WITNESS YET: the counter IDs below (UC/MC/BC = 0/1/2) are
+ * derived, never measured - fixing the word order is necessary and NOT
+ * sufficient before mac_rx_pN is quoted in any verdict. */
+#define CA_NI_HV_RXMIB_DATA1		0xa16c		/* counter value [63:32]  */
+#define CA_NI_HV_RXMIB_DATA0		0xa170		/* counter value [31:0]   */
 #define  CA_NI_MIB_OP_READ_ONLY		0		/* read, do not clear    */
 /* RX counter ids (subset the spy reads) */
 #define  CA_NI_MIB_RX_UC_PKT		0
@@ -661,6 +680,38 @@ enum cortina_ni_win {
 /* bounded poll for the indirect MIB access (stock caps at ~5000 reads) */
 #define CA_NI_MIB_POLL_US		1
 #define CA_NI_MIB_POLL_TIMEOUT_US	5000
+
+/* ★★ UNVALIDATED - DO NOT USE AS A WITNESS WITHOUT RE-DERIVING FROM STOCK.
+ * Measured 2026-07-29 (dev/x400axf/txmib_identify.py): every cell of
+ * {8 ACCESS port values} x {ids 0,1,2,3,0xf} moved by ZERO while this driver
+ * transmitted 1164 CPU->LAN frames out the cabled port, and some cells read
+ * non-zero and never changed.  So either these offsets, the ACCESS-word port
+ * field, or the counter ids below mean something other than assumed.  The ids
+ * were DERIVED from the vendor table's size-bin anchor, never measured - that
+ * derivation is now known to be wrong.  Kept only to record the addresses and
+ * the negative result; the /proc TX spy deliberately does NOT print them.
+ *
+ * NI TX MIB (per-port transmit statistics) - the TX twin of the RX MIB above:
+ * same ACCESS word layout, its own register triplet.  This is the ONLY
+ * per-PHYSICAL-port egress packet counter on this silicon, and with access
+ * opcode CA_NI_MIB_OP_READ_ONLY it is CUMULATIVE (unlike the NI_HV_INTPT_*
+ * per-stage counters, which are read-and-clear) - which is what makes it usable
+ * as a per-socket TX witness.  Offsets from the shipped firmware's own
+ * name->address table, corroborated by a live stock read taken while the port
+ * was transmitting: DATA0 = 0x000055fa, DATA1 = 0. */
+#define CA_NI_HV_TXMIB_ACCESS		0xa174
+#define CA_NI_HV_TXMIB_DATA1		0xa178		/* byte-count hi word    */
+#define CA_NI_HV_TXMIB_DATA0		0xa17c		/* counter value [31:0]  */
+/* TX counter ids.  The vendor table's size-bin anchor is
+ * counter_id_TxStatsFrm65to127Oct = 0xf, one id LOWER than the RX table's
+ * counter_id_RxStatsFrm64Oct = 0xf, which places TX UC/MC/BC at 1/2/3.  That is
+ * a DERIVATION, not a measurement, so the /proc spy prints the anchor counter
+ * next to them: a stock-vs-ours read CONFIRMS the mapping instead of us
+ * trusting it. */
+#define  CA_NI_MIB_TX_UC_PKT		1
+#define  CA_NI_MIB_TX_MC_PKT		2
+#define  CA_NI_MIB_TX_BC_PKT		3
+#define  CA_NI_MIB_TX_FRM65_127		0x0f	/* the vendor-table anchor */
 
 /* per-port block, port 0..3 = the four internal GbE MACs, stride 0x90.
  * ★ The block BASE is 0xa5c0 = NI_HV_PT_PORT_STATIC_CFG (aal_ni_eth_if_set,
@@ -867,6 +918,156 @@ enum cortina_ni_win {
 #define CA_DMA_LSO_LSPID_MAP_ENTRIES	16
 #define CA_DMA_LSO_LSPID_CPU0		0x10	/* AAL_LPORT_CPU_0 */
 
+/* ------------------------------------------------------------------ *
+ * DMA-AFT ("DMA After") - the HARDWARE VLAN/PPPoE egress header edit.
+ *
+ * This is where stock puts the WAN VLAN tag, and stock names the engine
+ * itself: fc_mgr.ko logs "force disable hw vlan/pppoe offload for this
+ * case with AFT Map idx %d" when it runs out of map entries.
+ *
+ * ★ THE FIELD THAT MISLED US FOR A DAY: vlan_vld does NOT mean "valid".
+ * The vendor decoder's own legend is
+ *     vlan_vld: (0: VLAN stacking operation mode, 1: VLAN set mode)
+ *     vlan_cnt: (redefined as TOP_VLAN_CMD[1:0] under stacking mode)
+ * so in SET mode vlan_cnt is the number of tags the EGRESS frame carries.
+ * An entry reading "vlan_vld 1, vlan_cnt 0, top_vid 0" is therefore a
+ * correctly programmed VLAN *STRIP* - which is exactly what the DOWNSTREAM
+ * leg of a tagged WAN must do - NOT an empty entry.  Reading it as "enabled
+ * and empty" is what wrongly excluded this table on 2026-08-04.
+ *
+ * Two tables, indirect, both inside the already-mapped 4K CA_NI_WIN_DMA
+ * window at 0x4_f7001000 (so no new ioremap):
+ *   MAP   [lspid]  -> fib_id      (which edit applies to frames from lspid)
+ *   L2FIB [fib_id] -> the edit    (top/inner VID, TPID sel, PPPoE session)
+ *
+ * Offsets and field positions recovered from the stock binaries, and every
+ * one of them agrees across TWO independent modules:
+ *   ca-ne.ko  aal_ni_dma_lso_set_aft_l2fib      - the raw table writer
+ *   ca-ne.ko  aal_ni_set_dma_lso_aft_l2fib_*    - one setter per field
+ *   ca-ne.ko  aal_ni_dma_lso_set_dmaaft_map_tbl - the map writer
+ *   fc_mgr.ko rtk_9607f_asic_dmaAftFib_set      - the struct serialiser,
+ *             independently emitting top_vid with the SAME `bfi #0x13,#0xc`
+ *   fc_mgr.ko rtk_9607f_asic_dmaAftTpid_set     - the 4 TPID slots
+ * The ACCESS address derived this way (0x4f7001f38) is the one already
+ * measured live on the board, which is the third agreeing tier.
+ * ------------------------------------------------------------------ */
+#define CA_DMA_AFT_MAP_ACCESS		0x0e4	/* idx[5:0] | WRITE | GO */
+#define CA_DMA_AFT_MAP_DATA		0x0e8
+#define  CA_DMA_AFT_MAP_FIB_ID		GENMASK(5, 0)
+#define  CA_DMA_AFT_MAP_EN		BIT(6)	/* DMAAFT_en */
+#define  CA_DMA_AFT_MAP_LSPID		GENMASK(10, 7)	/* lspid - CPU0 */
+#define  CA_DMA_AFT_MAP_VLD		BIT(11)
+#define CA_DMA_AFT_MAP_COUNT		64
+#define CA_DMA_AFT_MAP_DYN_FIRST	2	/* 0-1 are vendor-reserved */
+
+/* the 4 TPID slots the edit selects between; 2 per register, low half
+ * first (fc_mgr rtk_9607f_asic_dmaAftTpid_set).  ★ These decide whether an
+ * edit does anything at all: a tag whose TPID matches no slot makes the
+ * hardware SILENTLY drop the whole DMA-AFT for that flow. */
+#define CA_DMA_AFT_TPID01		0xf04
+#define CA_DMA_AFT_TPID23		0xf08
+#define CA_DMA_AFT_TPID_SLOTS		4
+#define CA_DMA_AFT_TPID_8021Q		0x8100	/* slot 0 on stock AND ours */
+
+#define CA_DMA_AFT_L2FIB_ACCESS		0xf38	/* idx[5:0] | WRITE | GO */
+#define CA_DMA_AFT_L2FIB_DATA2		0xf3c
+#define CA_DMA_AFT_L2FIB_DATA1		0xf40
+#define CA_DMA_AFT_L2FIB_DATA0		0xf44
+#define  CA_DMA_AFT_ACCESS_IDX		GENMASK(5, 0)
+#define  CA_DMA_AFT_ACCESS_WRITE	BIT(30)
+#define  CA_DMA_AFT_ACCESS_GO		BIT(31)	/* poll until it self-clears */
+/* ★★ THE FIELD POSITIONS BELOW ARE THE CORRECTED ONES (2026-08-04).  An
+ * earlier map recorded in cortina-ni-flowoffload.c put vlan_vld at DATA2[0],
+ * vlan_cnt at DATA2[3:1] and top_tpid_enc at DATA2[7:6].  That is WRONG, and
+ * it is refuted by stock's own code twice over:
+ *   fc_mgr rtk_9607f_asic_dmaAftFib_set packs the software struct into DATA2
+ *     as  [0]=s[13]  [3:1]=s[16:14]  [5:4]=s[18:17]  [7:6]=s[20:19]  [8]=s[21]
+ *   fc_mgr dump_dmaAftAction_table_by_idx prints those SAME struct fields, in
+ *     order, against the legends vlan_vld / vlan_cnt / top_tpid_enc /
+ *     top_tpid_sel / top_vid - which pins each name to its bits.
+ * Writing the old map would have put the tag count where the TPID index goes.
+ *
+ * ★ NAMES.  Ours say what the field DOES; the vendor spelling is kept beside
+ * each one so a stock-vs-ours diff still lands on the same bit.
+ */
+/* DATA2 */
+/* vendor: vlan_vld.  NOT "valid" - it selects the MODE, and the vendor's own
+ * decoder says so verbatim:
+ *     "(0: VLAN stacking operation mode, 1: VLAN set mode)"
+ * Reading it as "valid" is what made a correctly programmed POP look like an
+ * empty entry and wrongly excluded this table for a day.  We write 0 on every
+ * flow today, i.e. we have been in STACKING mode all along. */
+#define  CA_DMA_AFT_D2_VLAN_SET_MODE	BIT(8)
+/* vendor: vlan_cnt.  MEANING DEPENDS ON CA_DMA_AFT_D2_VLAN_SET_MODE:
+ *   set mode (1)      -> the number of tags the frame carries AFTER the edit,
+ *                        so 1 = push one tag, 0 = strip to untagged
+ *   stacking mode (0) -> REDEFINED as TOP_VLAN_CMD[1:0], an opcode
+ *                        (0 = no-op, 1 = push, 2 = pop, 3 = swap)
+ * Never read this field without reading the mode bit first. */
+#define  CA_DMA_AFT_D2_EGRESS_TAG_CNT	GENMASK(7, 6)
+#define  CA_DMA_AFT_D2_TOP_VLAN_CMD	GENMASK(7, 6)	/* same bits, stacking */
+#define  CA_DMA_AFT_D2_UNK_18_17	GENMASK(5, 4)	/* not yet identified */
+/* vendor: top_tpid_enc.  A 1-BASED INDEX into the 4-entry TPID slot table,
+ * NOT an enum and NOT a 0-based slot number: 0 means "no tag / any other
+ * value", and n selects slot n-1.  Proven by stock's dumper, which prints
+ * TPID_%d with the argument (field - 1), and by
+ * aal_ni_set_dma_lso_aft_l2fib_top_vlan writing 1 when it programs a tag
+ * whose TPID is slot 0 (0x8100).  3 bits, so slots 0..3 use 1..4. */
+#define  CA_DMA_AFT_D2_TOP_TPID_SLOT_P1	GENMASK(3, 1)
+#define  CA_DMA_AFT_D2_TOP_TPID_SRC_HI	BIT(0)		/* src[1] - SPLIT */
+/* DATA1 */
+#define  CA_DMA_AFT_D1_INNER_VID_HI	GENMASK(5, 0)	/* inner_vid[11:6] */
+#define  CA_DMA_AFT_D1_INNER_UNK_7_6	GENMASK(7, 6)
+#define  CA_DMA_AFT_D1_INNER_TPID_SLOT_P1 GENMASK(10, 8)	/* 1-based, as above */
+#define  CA_DMA_AFT_D1_UNK_12_11	GENMASK(12, 11)
+#define  CA_DMA_AFT_D1_UNK_15_13	GENMASK(15, 13)
+#define  CA_DMA_AFT_D1_UNK_17_16	GENMASK(17, 16)
+#define  CA_DMA_AFT_D1_UNK_18		BIT(18)
+#define  CA_DMA_AFT_D1_TOP_VID		GENMASK(30, 19)	/* <== the WAN VLAN */
+#define  CA_DMA_AFT_D1_TOP_TPID_SRC_LO	BIT(31)		/* src[0] - SPLIT */
+/* DATA0 */
+#define  CA_DMA_AFT_D0_PPPOE_SID	GENMASK(15, 0)
+#define  CA_DMA_AFT_D0_PPPOE_CMD	GENMASK(17, 16)
+#define  CA_DMA_AFT_D0_INNER_VID_LO	GENMASK(31, 26)	/* inner_vid[5:0] */
+/* vendor: top_tpid_sel.  WHERE the pushed tag's TPID comes from:
+ *   0 = no-op, 1 = top_tpid_enc, 2 = inner_tpid_enc, 3 = fib.top_tpid_enc
+ * ⚠ SPLIT: bit0 in DATA1[31], bit1 in DATA2[0].  inner_vid is split too, the
+ * other way round (high half in DATA1[5:0], low half in DATA0[31:26]).
+ * Treating either as contiguous corrupts a live table. */
+#define  CA_DMA_AFT_TPID_SRC_NOOP	0
+#define  CA_DMA_AFT_TPID_SRC_TOP_SLOT	1
+
+/* ------------------------------------------------------------------ *
+ * L3FE packet-parser TPID table - a FAIL-CLOSED GATE on action generation.
+ *
+ * Stock's _rtk_9607f_asic_flow_action_gen looks the WAN tag's TPID up here
+ * and, on no match, ABORTS action generation entirely (`cbnz w0, ...`) so the
+ * flow silently falls back to software.  A correct VLAN edit that is never
+ * GENERATED is indistinguishable from a wrong one, which is exactly the
+ * symptom this port has been chasing - so read these before concluding
+ * anything from a tagged flow that did not offload.
+ *
+ * Two 16-bit TPID values per register, plus a 4-bit enable bitmap: a slot
+ * whose bit is CLEAR does not match even when the value is right.
+ * (Offsets are NE-window relative; NE = CA_NI_WIN_NI = 0x4_f4300000, so the
+ * absolute addresses are 0x4_f4303278 / _327c / _3280.)
+ *
+ * ★ Measured, and NOT a blocker for a plain 802.1Q tag: stock's PP_TPID_CTRL
+ * reads 0x13 and ours 0x77, but aal_l3fe_pp_top_tpid_get(0x8100) returns 1 on
+ * BOTH - the pools only diverge for 0x9100.
+ */
+#define CA_NI_L3FE_PP_TPID01		0x3278
+#define CA_NI_L3FE_PP_TPID23		0x327c
+#define CA_NI_L3FE_PP_TPID_CTRL		0x3280
+#define  CA_NI_L3FE_PP_TPID_TOP_MASK	GENMASK(3, 0)	/* per-slot enable */
+#define  CA_NI_L3FE_PP_TPID_INNER_MASK	GENMASK(7, 4)
+
+#define CA_DMA_AFT_FIB_COUNT		64
+/* stock's allocator (fc_mgr __rtk_fc_dmaAftAction_add) searches [0x10,0x40)
+ * for runtime entries and [0x00,0x10) for the init-set pool; the live
+ * tagged flow used FibIdx 0x11, inside the dynamic range. */
+#define CA_DMA_AFT_FIB_DYN_FIRST	0x10
+
 /* per-VP block, stride 0xa0, VP 0..11; CPU n transmits on VP n+2
  * (verified in the 07f __ca_ni_start_xmit_buf_for_fc_dirTx: vp = cpu + 2) */
 #define CA_DMA_LSO_VP_STRIDE		0xa0
@@ -967,6 +1168,9 @@ enum cortina_ni_win {
  */
 #define CA_NI_TX_DESC_WORDS		2
 #define CA_NI_TX_DESC1_DEST		GENMASK(4, 1)	/* LAN port 0..3 */
+/* how many distinct values the DEST field can hold - the range check on the
+ * per-frame egress port / the force_dest_ldpid diagnostic knob */
+#define CA_NI_TX_DEST_LDPID_COUNT	16
 #define CA_NI_TX_DESC1_COS		GENMASK(7, 5)
 #define CA_NI_TX_DESC1_LEN		GENMASK(18, 8)	/* frame len, no FCS */
 #define CA_NI_TX_DESC1_CHK_SEL		GENMASK(21, 19)

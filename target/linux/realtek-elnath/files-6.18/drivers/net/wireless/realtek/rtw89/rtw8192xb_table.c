@@ -9,7 +9,7 @@
  * facts (not copyrightable); the layout matches the mainline rtw89 driver so
  * the generic phy loader consumes them unchanged.  The conversion was proven
  * by reproducing the mainline RTL8852C tables from the vendor 8852C facts of
- * the same generation (see dev/x411axf scratch converter).
+ * the same generation (see dev/x400axf scratch converter).
  *
  * This chip is 2.4 GHz only: the 5 GHz / 6 GHz limit pointers in the rfe
  * parms are NULL (never dereferenced -- the driver only reads a band's limit

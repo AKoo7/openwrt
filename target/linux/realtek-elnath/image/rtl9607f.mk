@@ -2,10 +2,10 @@
 #
 # Per-board image definitions for the rtl9607f subtarget.
 
-define Device/realtek_rtl9607f_x411axf
+define Device/realtek_rtl9607f_x400axf
   DEVICE_VENDOR := HSGQ
-  DEVICE_MODEL := X411AXF
-  DEVICE_DTS := rtl9607f_x411axf
+  DEVICE_MODEL := X400AXF
+  DEVICE_DTS := rtl9607f_x400axf
   DEVICE_DTS_DIR := $(DTS_DIR)/realtek-elnath
   SOC := rtl9607f
   # IPv4 HGU router layer (same pattern as realtek-luna/hsgq_x111w):
@@ -53,4 +53,4 @@ define Device/realtek_rtl9607f_x411axf
 	wpad-basic-mbedtls wifi-scripts wireless-regdb iw \
 	ppp ppp-mod-pppoe kmod-ppp kmod-pppox kmod-pppoe
 endef
-TARGET_DEVICES += realtek_rtl9607f_x411axf
+TARGET_DEVICES += realtek_rtl9607f_x400axf

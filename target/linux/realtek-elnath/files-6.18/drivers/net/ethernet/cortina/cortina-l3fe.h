@@ -47,7 +47,7 @@ int cortina_l3fe_engine_init(void __iomem *ne, const struct cn_l3e_tables *t);
 
 /*
  * Program the stock profile/tuple + mask-table classify config (tier-1
- * captured, dev/x411axf/stock_l3fe_dump_full.txt) so the main-hash engine
+ * captured, dev/x400axf/stock_l3fe_dump_full.txt) so the main-hash engine
  * parses/keys a routed packet like stock.  ★ Necessary but NOT sufficient for
  * a HW hit: our datapath software-forwards LAN->WAN so the L3FE lookup is not
  * yet consulted (see the comment on the definition).  Returns 0 or -ETIMEDOUT.

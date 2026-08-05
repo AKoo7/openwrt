@@ -12,7 +12,7 @@
  * that init in-kernel so the laser is ready BEFORE the ranging FSM starts.
  *
  * Register model (verified on-wire against the live stock init, ftrace i2c
- * capture dev/x411axf/stock/bosa/rtkbosa_i2c_trace.txt — our sequence below
+ * capture dev/x400axf/stock/bosa/rtkbosa_i2c_trace.txt — our sequence below
  * byte-matches all 638 init writes):
  *   - all writes are plain 2-byte {reg, val}; reads = reg pointer + 1 byte
  *   - regs 0x00-0x7F are un-paged; 0x80-0xFF are paged via table-select 0x7F

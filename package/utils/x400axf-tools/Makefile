@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-only
 #
-# Register-level diagnostic tools for the RTL9607F "Elnath" (X411AXF) board.
+# Register-level diagnostic tools for the RTL9607F "Elnath" (X400AXF) board.
 #
 # Built static on purpose: the same binary has to run on the vendor firmware
 # as well as on this one, because a measurement taken only on our own image
@@ -11,7 +11,7 @@
 
 include $(TOPDIR)/rules.mk
 
-PKG_NAME:=x411axf-tools
+PKG_NAME:=x400axf-tools
 PKG_RELEASE:=1
 
 PKG_LICENSE:=GPL-2.0-only
@@ -19,14 +19,14 @@ PKG_MAINTAINER:=Confiared <contact@confiared.com>
 
 include $(INCLUDE_DIR)/package.mk
 
-define Package/x411axf-tools
+define Package/x400axf-tools
   SECTION:=utils
   CATEGORY:=Utilities
-  TITLE:=Cortina Access register diagnostics (X411AXF / RTL9607F)
+  TITLE:=Cortina Access register diagnostics (X400AXF / RTL9607F)
   DEPENDS:=@TARGET_realtek_elnath
 endef
 
-define Package/x411axf-tools/description
+define Package/x400axf-tools/description
  caregt       read, write and poll-trace Cortina Access registers via /dev/mem.
               The poll-trace samples a set of registers and reports which one
               moved and in what order, which a static snapshot cannot show.
@@ -45,10 +45,10 @@ define Build/Compile
 	$(MAKE) -C $(PKG_BUILD_DIR) $(TARGET_CONFIGURE_OPTS) CFLAGS="$(TARGET_CFLAGS) -Wall -Wextra"
 endef
 
-define Package/x411axf-tools/install
+define Package/x400axf-tools/install
 	$(INSTALL_DIR) $(1)/usr/bin
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/caregt $(1)/usr/bin/
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/forge_inject $(1)/usr/bin/
 endef
 
-$(eval $(call BuildPackage,x411axf-tools))
+$(eval $(call BuildPackage,x400axf-tools))

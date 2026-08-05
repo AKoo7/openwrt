@@ -33,9 +33,9 @@
  *                       (punt-to-CPU) action.
  *
  * Full sequence + bit-layout documentation:
- *   dev/x411axf/HW_FLOW_OFFLOAD_FLOWBLOCK_MAP.md
+ *   dev/x400axf/HW_FLOW_OFFLOAD_FLOWBLOCK_MAP.md
  * Synthesized design (init chain, aging sync, >10k-flow scale plan):
- *   dev/x411axf/HW_FLOW_OFFLOAD_DESIGN.md
+ *   dev/x400axf/HW_FLOW_OFFLOAD_DESIGN.md
  */
 
 #include <linux/kernel.h>
@@ -44,6 +44,7 @@
 #include <linux/bitops.h>
 #include <linux/bitrev.h>
 #include <linux/crc32.h>
+#include <linux/delay.h>
 #include <linux/etherdevice.h>
 #include <linux/io.h>
 #include <linux/if_ether.h>
@@ -477,7 +478,31 @@ struct cn_flow_entry;
 struct cn_l3e {
 	struct device	*dev;
 	void __iomem	*ne_base;	/* NE register window */
+	void __iomem	*dma_base;	/* DMA/LDMA window - the DMA-AFT tables
+					 * that carry the WAN VLAN edit live
+					 * here (CA_NI_WIN_DMA, 0x4_f7001000) */
 	spinlock_t	reg_lock;	/* serializes indirect GO cycles */
+	/* DMA-AFT allocation state, guarded by aft_lock.  Tiny by construction:
+	 * 64 fib entries and 64 map entries, and this board has ONE WAN VLAN. */
+	spinlock_t	aft_lock;
+	u64		aft_fib_used;	/* bitmap over CA_DMA_AFT_FIB_COUNT */
+	u64		aft_map_used;	/* bitmap over CA_DMA_AFT_MAP_COUNT */
+	u16		aft_fib_vid[CA_DMA_AFT_FIB_COUNT];   /* content key: vid */
+	u8		aft_fib_cnt[CA_DMA_AFT_FIB_COUNT];   /* content key: tags */
+	u8		aft_fib_ref[CA_DMA_AFT_FIB_COUNT];   /* share by content */
+	u8		aft_fib_map[CA_DMA_AFT_FIB_COUNT][2];/* the map pair the fib
+						      * owns; freed with the FIB,
+						      * never with whichever flow
+						      * happens to release last */
+	/* ledger - every arm says which one fired, because that instrumentation
+	 * is why the DS-leg misread was diagnosable at all */
+	u32		aft_push;	/* US legs programmed with a tag   */
+	u32		aft_strip;	/* DS legs programmed to pop       */
+	u32		aft_reuse;	/* fib shared with an existing one */
+	u32		aft_no_tpid;	/* REFUSED: no TPID slot matched   */
+	u32		aft_tpid_armed;	/* L3FE PP TPID slots we programmed */
+	u32		aft_full;	/* REFUSED: fib or map table full  */
+	u32		aft_timeout;	/* REFUSED: a GO poll never cleared*/
 	/* DDR carve (one dma_alloc_coherent block, key then FIB - the NE
 	 * fabric is NON-coherent, a cached carve = stale matches) */
 	void		*carve;
@@ -853,6 +878,31 @@ static int cn_l3e_cache_invalidate(struct cn_l3e *l3e, u32 idx, u16 crc16)
  * HW-read lookup CRC without going through the SWO.  Behaviour of the normal
  * flow_add path is unchanged (it computes the SWO hash then calls this).
  */
+/**
+ * cn_fib_field() - read one field out of a raw 32-byte FIB entry BY BIT NUMBER.
+ * @fib:   the entry as it sits in the table the engine reads.
+ * @bit:   the field's first bit, LSB-first within the entry.
+ * @width: its width in bits (<= 64).
+ *
+ * ★ DELIBERATELY NOT struct cn_l3e_act.  A readback through the same struct
+ * that wrote the bytes is self-agreement, not verification: our WRITE and our
+ * READBACK once shared one wrong bit-packed offset and "matched stock" through
+ * three digs (the SID2QID saga), and only a read at an independently-derived
+ * offset exposed it.  The literal numbers this is called with are the ones the
+ * live STOCK oracle solved for on this silicon (top_vid@145, top_tpid_enc@157,
+ * vlan_cnt@160, vlan_vld@162), which is a different tier from our header.
+ */
+static u64 cn_fib_field(const void *fib, u32 bit, u32 width)
+{
+	const u8 *b = fib;
+	u64 v = 0;
+	u32 i;
+
+	for (i = 0; i < width; i++)
+		v |= (u64)((b[(bit + i) >> 3] >> ((bit + i) & 7)) & 1) << i;
+	return v;
+}
+
 static int cn_l3e_flow_add_rawcrc(struct cn_l3e *l3e, u32 crc32, u16 crc16,
 				  const struct cn_l3e_act *act, u32 *idx_out)
 {
@@ -988,6 +1038,14 @@ static int cn_l3e_flow_del(struct cn_l3e *l3e, u32 idx, u16 crc16)
 /* mainline flow_block glue (mtk_ppe_offload-shaped)                   */
 /* ------------------------------------------------------------------ */
 
+/* one flow's share of the DMA-AFT tables.  Lives in cn_flow_entry, but is
+ * filled BEFORE the entry exists (the decision to offload is taken first),
+ * so it is its own small type rather than fields on the entry. */
+struct cn_aft_ref {
+	u8	fib;
+	bool	valid;		/* holds a reference that must be released */
+};
+
 struct cn_flow_entry {
 	struct rhash_head	node;
 	unsigned long		cookie;
@@ -1006,6 +1064,8 @@ struct cn_flow_entry {
 						 * the GAP-2 HW->SW flap */
 	u8			probe;		/* hw_ds_probe mode this entry was
 						 * installed under (0 = real action) */
+	struct cn_aft_ref	aft;		/* the hardware WAN VLAN edit this
+						 * flow uses, if any */
 };
 
 static struct rhashtable cn_flow_table;
@@ -1214,15 +1274,43 @@ MODULE_PARM_DESC(hw_l3_fwd,
  * (keepalive "5 30").  Do not conflate the two -- with the aggressive OpenWrt
  * default keepalive the session still bounces regardless of this setting.
  */
-/* ★ DEFAULT OFF again 2026-07-28.  This shipped as `= true` in the first public
- * push by accident: the working tree was committed wholesale without auditing
- * the defaults inside it.  It is not a free win - the measurements recorded
- * above show upstream reaching 934.2 Mbps with it on while the DOWNSTREAM moved
- * to the CPU, and a sub-percent frame-malformation question on the session path
- * is still open.  That is a performance TRADE, which is the operator's call to
- * make deliberately with numbers in hand, not something to inherit from an
- * unreviewed commit.  Flip to 1 to measure it. */
-static bool hw_pppoe;
+/* ★ DEFAULT OFF 2026-07-28.  It had shipped as `= true` in the first public push
+ * by accident: the working tree was committed wholesale without auditing the
+ * defaults inside it.  Two reservations were recorded at the time - a reading in
+ * which upstream reached 934.2 Mbps while the DOWNSTREAM moved to the CPU, and a
+ * sub-percent frame-malformation question on the session path.  Enabling it was
+ * therefore called a performance TRADE and left as the operator's call to make
+ * deliberately with numbers in hand, not something to inherit from an unreviewed
+ * commit.
+ *
+ * ★★ DEFAULT ON again 2026-08-03 - that call, made, with the numbers above.  It
+ * is enabled on PERFORMANCE grounds alone, under the project's "best-performing
+ * mode is the default" rule: 916.9 vs 3.3 Mbps upstream TCP and 947.4 vs 552.1
+ * upstream UDP, at a LOWER CPU cost, so it dominates the SW fastpath on both
+ * axes rather than trading one for the other.
+ *
+ * What changed about each 2026-07-28 reservation, stated separately because they
+ * did not change in the same way:
+ *   - "the downstream moves to the CPU" is NOT visible in the table above, which
+ *     was taken after the DS reply leg was fixed: TCP downstream reads 922.5 ->
+ *     923.9 Mbps, i.e. unchanged.  If a later measurement reproduces the 934.2
+ *     reading with a degraded DS, that is the thing to re-open, and the DS half
+ *     has its own witnesses (ds_hits) to settle it with.
+ *   - the sub-percent frame-malformation question on the session path is STILL
+ *     OPEN.  It is not closed by this flip and must not be recorded as closed;
+ *     the far-end argument below bounds it but does not answer it.
+ *
+ * ★ AND IT IS NOT ENABLED FOR STABILITY - do not let that reasoning back in.  On
+ * 2026-08-03 a soak case (pppoe_soak_udp_1400_lan_wan) reported the session
+ * dying under upstream load, and enabling this parameter was briefly proposed as
+ * the fix.  That failure was a PHANTOM: every log line the verdict cited was
+ * timestamped 6-12 minutes BEFORE the measurement window and belonged to earlier
+ * cases re-dialling the session, the netdev-ifindex witness never fired, and the
+ * ppp interface transmitted 6.14 M packets across the window.  The session had
+ * survived.  The paragraph above still stands unamended: stability is governed
+ * by the LCP keepalive, never by this parameter.
+ */
+static bool hw_pppoe = true;
 static int hw_pppoe_set(const char *val, const struct kernel_param *kp);
 
 static const struct kernel_param_ops hw_pppoe_ops = {
@@ -1233,7 +1321,7 @@ static const struct kernel_param_ops hw_pppoe_ops = {
 };
 module_param_cb(hw_pppoe, &hw_pppoe_ops, &hw_pppoe, 0644);
 MODULE_PARM_DESC(hw_pppoe,
-	"install HW hash entries for PPPoE-WAN flows - BOTH legs: US with the 8-byte session-header push, DS with the pop the LAN egress L3-IF entry performs (default ON since 2026-07-25: board-measured 916.9/923.9 Mbps tcp both ways and 947.4 Mbps udp US, vs 3.3 Mbps US-tcp on the SW fastpath; set 0 to fall back). Needs cortina_ni.hw_l3_fwd=1 from boot, and the DS half also needs hw_ds_offload=1 + cortina_gpon.hw_l3_ds=1; only flows offered AFTER a runtime flip are affected, and flipping to 0 clears the armed session");
+	"install HW hash entries for PPPoE-WAN flows - BOTH legs: US with the 8-byte session-header push, DS with the pop the LAN egress L3-IF entry performs (default ON since 2026-08-03: board-measured 916.9/923.9 Mbps tcp both ways and 947.4 Mbps udp US, vs 3.3 Mbps US-tcp on the SW fastpath; set 0 to fall back). Needs cortina_ni.hw_l3_fwd=1 from boot, and the DS half also needs hw_ds_offload=1 + cortina_gpon.hw_l3_ds=1; only flows offered AFTER a runtime flip are affected, and flipping to 0 clears the armed session");
 
 /*
  * ★ DS (WAN->LAN) offload leg - default OFF.
@@ -2369,6 +2457,89 @@ static int cn_l3e_set_us_egress(struct cn_l3e *l3e, struct cn_l3e_act *act,
 }
 
 /*
+ * cn_l3e_set_us_wan_vlan() - put the WAN's 802.1Q tag ON the upstream hit-action.
+ *
+ * ★ WHY THIS AND NOT THE DMA-AFT (which this driver also programs).  The DMA-AFT
+ * edit is keyed by the CPU lspid and is selected per TX DESCRIPTOR, so it can
+ * only ever tag a frame the CPU transmits.  A hardware-forwarded flow never
+ * reaches that engine.  Both tiers say so and they were established
+ * independently:
+ *   - tier 1, this board, 2026-08-04: with the DMA-AFT correctly programmed
+ *     (fib[16] = SET mode, 1 tag, top_vid 46, TPID slot 0) a capture on the
+ *     OLT-facing NIC shows the offloaded upstream frames leaving UNTAGGED, and
+ *     pointing every lspid at that same push entry tagged the ONU's own
+ *     CPU-originated LAN traffic instead - the positive control.
+ *   - tier 2, the vendor binaries: aal_ni_set_dma_lso_aft_l2fib_top_vlan is
+ *     reached from the CPU TX descriptor path, and the vendor's flow-add
+ *     (RTK_RG_ASIC_FLOWPATH_SET) skips its dmaAftAction update for the PON
+ *     netif types while ALWAYS running the hash-action generator.
+ *
+ * ⇒ the per-flow, unconditional writer is the hash action, and this is it:
+ * _rtk_9607f_asic_flow_action_gen -> convert_act_flow_nomal_mode stores
+ * top_vid with `bfi w2, w4, #17, #12` into the word holding bits 128..191,
+ * i.e. top_vid@145:12 - exactly the field below.
+ *
+ * ★ THE PREVIOUS EXCLUSION OF THIS FIELD WAS VACUOUS, and it is worth saying why
+ * rather than merely reversing it.  It rested on stock's tagged and untagged
+ * hit-actions reading IDENTICALLY in the VLAN region (vlan_vld=1, vlan_cnt=0,
+ * top_vid=0).  But every entry it compared was a DOWNSTREAM one, and in SET mode
+ * vlan_cnt is the tag count AFTER the edit: a DS leg emits zero tags whether or
+ * not the WAN is tagged, so those two readings are identical BY CONSTRUCTION and
+ * carry no information about the pushing direction.  The upstream leg was never
+ * captured - the caveat is in that very comment.
+ *
+ * ★ top_tpid_enc is a 1-BASED INDEX into L3FE_PP_TPID, not an ethertype: 0 means
+ * NO TAG.  The slot is RESOLVED from the live table by cn_l3fe_tpid_ensure()
+ * rather than assumed to be 0 - the same helper the DMA-AFT path already uses,
+ * so the two can never disagree about where 0x8100 lives, and a board whose slot
+ * 0 holds something else still gets the right index.  vlan_vld is not a valid
+ * bit either: 0 selects VLAN stacking mode, 1 selects SET mode, which is the one
+ * where vlan_cnt means "tags on egress".
+ *
+ * Returns 0, or a negative errno when the TPID cannot be registered - in which
+ * case the caller must REFUSE the leg, never install a half-described edit.
+ */
+static int cn_l3fe_tpid_ensure(struct cn_l3e *l3e, u16 tpid);	/* below */
+
+static int cn_l3e_set_us_wan_vlan(struct cn_l3e *l3e, struct cn_l3e_act *act,
+				  u16 vid)
+{
+	int slot;
+
+	if (!vid)
+		return 0;		/* untagged WAN: leave the block at zero */
+	slot = cn_l3fe_tpid_ensure(l3e, CA_DMA_AFT_TPID_8021Q);
+	if (slot < 0)
+		return slot;
+	act->vlan_vld = 1;		/* SET mode (not a valid bit) */
+	act->vlan_cnt = 1;		/* one tag on the wire after the edit */
+	act->top_vid = vid;
+	act->top_tpid_enc = slot + 1;	/* 1-BASED; 0 would mean NO TAG */
+	act->top_pcp = 0;
+	act->top_dei = 0;
+	return 0;
+}
+
+/*
+ * cn_l3e_set_ds_wan_vlan() - make the DS leg POP the WAN tag, explicitly.
+ *
+ * The MIRROR of cn_l3e_set_us_wan_vlan(), and it needs no TPID slot: emitting
+ * ZERO tags names no ethertype.  See the call site for why an all-zero block is
+ * not the same thing as a pop.
+ */
+static void cn_l3e_set_ds_wan_vlan(struct cn_l3e_act *act, u16 vid)
+{
+	if (!vid)
+		return;			/* untagged WAN: nothing arrives to strip */
+	act->vlan_vld = 1;		/* SET mode (not a valid bit) */
+	act->vlan_cnt = 0;		/* zero tags on the wire after the edit */
+	act->top_vid = 0;
+	act->top_tpid_enc = 0;		/* 0 = no tag; no slot to resolve */
+	act->top_pcp = 0;
+	act->top_dei = 0;
+}
+
+/*
  * Stamp the DS (WAN->LAN) routed LAN egress into a hit-action - the MIRROR of
  * cn_l3e_set_us_egress above.  Every field that is not direction-specific is
  * kept IDENTICAL to the board-proven US shape (that shape is the only routed
@@ -2738,6 +2909,1039 @@ static void cn_flow_refused_account(int err)
 	}
 }
 
+/*
+ * ★★ VLAN-ENCAPSULATED WAN - REFUSE THE OFFLOAD, AND NAME THE REASON.
+ *
+ * THE DEFECT this closes (board-measured 2026-08-04, WAN moved from the plain
+ * `gpon0` to the sub-interface `gpon0.46`, shipped knobs flow_offloading=1 +
+ * flow_offloading_hw=1): a FORWARDED TCP/UDP flow blackholes.  ICMP crosses,
+ * because ICMP never reaches this code at all - the BASIC match above refuses
+ * anything that is not TCP/UDP, so ping rides the software path and "works",
+ * which is precisely what made the fault look like something else.
+ * The witness that named the mechanism: `refused/unsupp` stayed FLAT while
+ * auto_flows went +2 and hw_hits climbed.  So we ACCEPTED and PROGRAMMED HW
+ * entries for a VLAN egress, and only then did the traffic die.
+ *
+ * WHY IT DIES.  cn_l3e_set_us_egress() builds the ONLY upstream egress this
+ * engine knows: forward to the live PON T-CONT/GEM (mcgid =
+ * CN_L3E_WAN_EGR_MCGID), SMAC from the egress L3-IF, next-hop DMAC by L2-FDB
+ * index.  It never writes vlan_vld / top_vid / vlan_cnt / top_tpid_enc.  So a
+ * matched frame leaves the PON *untagged* while the kernel's route required an
+ * 802.1Q tag on it, and the far end drops every one.
+ *
+ * ★ WHY THE STATIC READING WAS WRONG - recorded because it misled twice.
+ * This file has no FLOW_ACTION_VLAN_PUSH case, so "a tagged flow is already
+ * refused by the default: arm, therefore nothing can be installed" looked
+ * airtight.  It is false, because the kernel does not always EMIT that action.
+ * Read on this build's own tree (linux-6.18.31):
+ *   - nf_flow_table_offload.c nf_flow_rule_route_common() derives VLAN_POP from
+ *     `tuple->encap[]` and VLAN_PUSH from `other_tuple->encap[]`.  No encap
+ *     entry, no VLAN action - the action list is then byte-for-byte the shape
+ *     of an untagged flow.
+ *   - that encap array is filled in exactly ONE place, nft_flow_offload.c
+ *     nft_dev_forward_path(), which walks dev_fill_forward_path() (flattening
+ *     gpon0.46 into DEV_PATH_VLAN + DEV_PATH_ETHERNET(gpon0), leaving
+ *     info.indev = the LOWER device) and then THROWS THE WHOLE WALK AWAY at
+ *         if (!info.indev || !nft_flowtable_find_dev(info.indev, ft)) return;
+ *     fw4 puts the WAN L3 device (gpon0.46) in the flowtable, not its lower
+ *     (gpon0), so the lookup misses, num_encaps stays 0, and the encap - the
+ *     only trace of the tag - is discarded before the rule is ever built.
+ *   - what still distinguishes the rule is FLOW_ACTION_REDIRECT, whose device
+ *     is other_tuple->iifidx = gpon0.46 (flow_offload_redirect(), XMIT_NEIGH).
+ *     And the redirect device was the one thing this function never looked at:
+ *     `odev` was captured at the top of the action walk and then only
+ *     null-checked.  That is the entire bug.
+ * The board's own numbers discriminate the two possible kernel shapes: had
+ * `gpon0` been a flowtable device, the encap would have survived, VLAN_PUSH
+ * would have been emitted, and `unsupp` would have CLIMBED.  It stayed flat.
+ *
+ * ⇒ THE EGRESS DEVICE IS THE EVIDENCE, NOT THE ACTION LIST.  Both kernel-side
+ * shapes are covered now: this predicate catches the flattened one, and the
+ * explicit FLOW_ACTION_VLAN_PUSH/POP arm in the action walk catches the other
+ * (which does occur if the lower device is ever a flowtable device).  That arm
+ * changes no behaviour - it already fell into `default:` - it changes
+ * ATTRIBUTION, so the branch stops being one of nine anonymous unsupp reasons.
+ * The absence of that distinction is why this was mis-diagnosed twice.
+ *
+ * ★ WHY REFUSING IS THE FIX AND NOT A CAPITULATION.  The SW fastpath has NO
+ * hardware gate (nf_flow_table_ip.c never tests NF_FLOW_HW / IPS_HW_OFFLOAD),
+ * so a leg we refuse still rides the flowtable fastpath - measured on this very
+ * configuration at ~585 Mbps delivered, against a total blackhole today.
+ *
+ * ★★ UPDATED 2026-08-04 - THE OFFSETS ARE NOW PROVEN, AND THE MEASUREMENT SAYS
+ * THE TAG IS NOT IN THIS ENTRY.  This paragraph used to read "those bits are
+ * unverified, so we may not write them".  That premise has been RESOLVED, and
+ * the answer went the other way, so the refusal stands on stronger ground than
+ * it did:
+ *
+ *   1. THE LAYOUT IS ESTABLISHED, from two independent directions.  The
+ *      write-side serializer convert_act_flow_nomal_mode (ca-ne.ko .text
+ *      0x93fe0) stores these fields with bfi/bfxil at top_dei@144,
+ *      top_vid@145:12, top_tpid_enc@157:3, vlan_cnt@160:2, vlan_vld@162,
+ *      inner_dei@128, inner_vid@129:12, inner_tpid_enc@141:3, top_pcp@125:3,
+ *      inner_pcp@121:3 - i.e. exactly this struct - and the read-side action
+ *      dumper's ubfx reads agree.  ★ They are MODE-SPECIFIC: naptv6 = these
+ *      + 50, br_mac_keep = these + 99.  We run normal mode (a_mask 0x140000),
+ *      so these are the right ones, and a single shared VLAN-offset constant
+ *      across modes would be a bug.
+ *   2. top_tpid_enc is NOT an ethertype enum - it is a 1-BASED INDEX into the
+ *      programmable table at L3FE_PP_TPID_0/1/CTRL (0x3278/0x327c/0x3280),
+ *      with 0 meaning NO TAG (aal_l3fe_pp_top_tpid_get does `*index += 1`).
+ *      Read live off stock: PP_TPID_0=0x88a88100 PP_TPID_1=0x92009100
+ *      => slots {0:0x8100, 1:0x88a8, 2:0x9100, 3:0x9200}, so a C-VLAN would
+ *      be top_tpid_enc=1.  vlan_vld is NOT "valid" either: fc_mgr.ko's own
+ *      dump text reads "0: VLAN stacking operation mode, 1: VLAN set mode",
+ *      and vlan_cnt is the tag COUNT after the edit in set mode.
+ *   3. ★★ RETRACTED 2026-08-05.  This point used to read "AND STOCK DOES NOT
+ *      USE ANY OF IT FOR THE WAN TAG", and concluded that writing these fields
+ *      would be evidence AGAINST the change.  IT WAS AN ABSENCE OF MEASUREMENT
+ *      REPORTED AS A DEVICE FINDING, and the code above it now does the exact
+ *      opposite of what it advised - at parity with stock.
+ *
+ *      WHAT WAS ACTUALLY MEASURED on 2026-08-04 (and is still true): untagged
+ *      DHCP vs DHCP over VID 46, the *DOWNSTREAM* hit-actions are BIT-IDENTICAL
+ *      across the whole VLAN region - vlan_vld=1, vlan_cnt=0, top_vid=0,
+ *      top_tpid_enc=0 in both - while the LAN address lands at ip_addr@45,
+ *      confirming normal mode.  That holds, and it is why the DS leg programs an
+ *      explicit "emit zero tags" rather than a pop.
+ *
+ *      WHAT WAS WRONG IS THE SCOPE: the sample held only DS entries.  The
+ *      2026-08-05 stock capture (persisted, results/stock_firmware/RTL9607F/
+ *      HSGQ/X400AXF/l3fe_action_oracle/) holds stock's UPSTREAM entries for a
+ *      tagged WAN - idx 43432 and 18872 - and they read top_vid@145 = 46,
+ *      top_tpid_enc = 1, vlan_cnt = 1, vlan_vld = 1, with the untagged
+ *      counter-case at 0/0/0/1.  145 is not assumed: it is the unique 12-bit
+ *      offset at which the three tagged captures read 46 and the untagged one
+ *      reads 0.  "VID 46 appears at NO 12-bit offset anywhere in the entry" was
+ *      a statement about entries that were all downstream, and "stock installs
+ *      NO upstream hash entry at all" is refuted by stock's own
+ *      /proc/fc/sw_dump/flow, which lists the US flow at mainHash_Idx 43432.
+ *
+ * ⇒ SO THE FIELDS ARE EXACTLY "WHAT STOCK DOES", ON THE US LEG.  We program them
+ * (cn_l3e_set_us_wan_vlan) and read the entry back by literal bit number before
+ * trusting it; the certified untagged path is bounded away by construction
+ * (vid 0 returns immediately).  The lesson worth keeping is the one this point
+ * paid for: a field read as zero in every entry OF ONE DIRECTION says nothing
+ * about the other, and "the sample did not contain it" must never be written
+ * down as "the device does not do it".
+ *
+ * ★ WHERE THE TAG ACTUALLY LIVES - the thread for whoever picks this up.  The
+ * egress framing is done by a SEPARATE engine: every offloaded flow on the
+ * tagged WAN carries "DMA AFT Map En: 1, MapIdx: N (DMA AFT En: 1, FibIdx: N)".
+ *
+ * ★★ AND A ONE-TIME PER-INTERFACE / PER-GEM VLAN PROGRAM IS *NOT* THE ANSWER -
+ * this paragraph proposed one and it is REFUTED three ways: the egress L3-IF
+ * word is fully accounted for with no VLAN bits (pppoe_set/pppoe_vld/
+ * pppoe_session_id/mac_sa_vld/mac_sa_an_sel/pppoe_len_control, plus
+ * snap_bri_len_control[24] and snap_tra_len_control[25] which cortina-l3fe.c
+ * does not yet define); no port2vid / vlan_tbl / egr_vlan descriptor exists in
+ * the NE at all; and the GPON block has only four GEM registers, none carrying
+ * a VID.  The vendor's own rtk_svlan_portSvid_set has NO kernel implementation
+ * on this SoC - it is emulated in userspace through CLS/ACL rules.
+ *
+ * ⇒ THE REAL TARGET IS THE DMA-AFT "L2FIB" VLAN-EDIT TABLE, an INDIRECT table:
+ *     ACCESS 0x4f7001f38  idx[5:0] (64 entries), bit30 write, bit31 GO (poll)
+ *     ★ CORRECTED 2026-08-04 - the map that used to stand here was WRONG:
+ *     it put vlan_vld at DATA2[0], vlan_cnt at DATA2[3:1] and top_tpid_enc at
+ *     DATA2[7:6], i.e. the tag COUNT and the TPID INDEX swapped.  The real
+ *     packing, from fc_mgr rtk_9607f_asic_dmaAftFib_set and confirmed field
+ *     for field by stock's own dump_dmaAftAction_table_by_idx, is:
+ *     DATA2  0x4f7001f3c  [0] top_tpid_sel[1]  [3:1] top_tpid_enc (1-BASED,
+ *                         0 = no tag)  [5:4] unidentified
+ *                         [7:6] vlan_cnt  [8] vlan_vld (0 = stacking mode,
+ *                         1 = set mode - NOT a valid bit)
+ *     DATA1  0x4f7001f40  [5:0] inner_vid[11:6]  [10:8] inner_tpid_enc
+ *                         [30:19] top_vid  <== the WAN VLAN
+ *                         [31] top_tpid_sel[0]
+ *     DATA0  0x4f7001f44  [15:0] pppoe_session_id  [17:16] pppoe_cmd
+ *                         [31:26] inner_vid[5:0]
+ *     The authoritative, commented version lives in cortina-ni-regs.h.
+ *   ⚠ inner_vid and top_tpid_sel are SPLIT ACROSS WORDS.  Treating either as
+ *   contiguous writes garbage into a live table - the same split-field family
+ *   that has already cost this port boots.
+ *   Allocation: MAP idx 0-1 reserved, FIB idx 0x10-0x3f dynamic (0x00-0x0f are
+ *   init-set).  The live tagged flow seen on 2026-08-04 used MapIdx 3 /
+ *   FibIdx 0x11 - both dynamic, i.e. allocated at runtime for that flow.
+ *
+ * ★★ AND IT FAILS CLOSED, SILENTLY, IN THREE PLACES - which is what would make
+ * a half-done port read as "configured but never engaging":
+ *   - the flow-cache derives the tag's TPID and LINEARLY COMPARES it against
+ *     the four DMA-AFT TPID slots; no match => it logs "Unmatch DMA AFT
+ *     configuration for TPID" and DISABLES DMA-AFT for that flow.  ★ Measured
+ *     live, the pools DIFFER: stock slot2 = 0xffc0, ours = 0x9100.  Slot0 is
+ *     0x8100 on both, so a plain C-VLAN would match either way.
+ *   - DMAAFT_en, bit 5 of the DMAAFT-MAP entry, keyed by lspid.
+ *   - forceDisDmaAft, per flow, when vlan_parsing_mode == OUTER_ONLY and the
+ *     ingress tag count >= 2.
+ *
+ * ★★ THAT MEASUREMENT HAS NOW BEEN TAKEN (2026-08-04), and the DMA-AFT action
+ * table is EXCLUDED.  With a live flow on a tagged WAN and the UNTAGGED control
+ * in the same session:
+ *     untagged : BOTH legs offloaded; dmaAftMap has ZERO enabled entries.
+ *     VID 46   : dmaAftMap has TWO enabled entries (fib_id 16 and 17, both in
+ *                the dynamic range) - so THE TAG SWITCHES THE ENGINE ON - yet
+ *                those very entries read, in the vendor's own decoder:
+ *                vlan_vld 1, vlan_cnt 0, top_vid 0, top_tpid_enc 0,
+ *                top_tpid_sel 0 (no-op), inner_* 0, pppoe_cmd 0.
+ * The engine is enabled and the VLAN edit it describes is EMPTY.  So the WAN
+ * tag is not written here either, and this table joins the L3FE hit-action, the
+ * egress L3-IF word and the per-interface/per-GEM search as EXCLUDED.
+ *
+ * ★ AND STOCK DOES FORWARD A TAGGED WAN IN HARDWARE - measured, not inferred,
+ * so no "it is unavoidably software" excuse is available.  Re-measured with the
+ * benchmark's own generator (UDP, 1400 B, ~1 Gbit/s offered) under RAM-only
+ * containment: 953.6 Mbps at 9.5 % CPU upstream and 953.7 at 5.1 % downstream,
+ * against a ~4.1 % idle floor - reproducing the certified 953.6 @ 6.7 % / 10.7 %
+ * cells.  ⇒ the capability is REAL and still unlocated; what remains excluded is
+ * every table listed above.
+ *
+ * ★ ONE CAVEAT ON THE UPSTREAM LEG, stated because it is not yet settled: in the
+ * capture above only the DOWNSTREAM leg appeared in the vendor flow table; the
+ * UPSTREAM leg - the direction that must ADD the tag - was absent, in a
+ * single-TCP-stream run taken shortly after a reconfiguration.  Under the UDP
+ * line-rate generator both directions reach 953 Mbps at near-idle CPU, so the
+ * upstream leg IS offloaded in steady state; it simply was not captured in the
+ * table dump.  Dumping the tables during a SUSTAINED UDP line-rate run is the
+ * remaining refinement.
+ *
+ * "Nothing is programmed at interface-configure time" is separately established:
+ * 16 registers and all 17 vendor /proc/fc decoder nodes were byte-identical
+ * across untagged / VID 46 / VID 100 (75613 bytes, 0 lines differ; VID 46 vs
+ * 100 differed only in L2 FDB MAC-learning churn).
+ *
+ * Re-run the evidence with ONU-test-case/l3fe_fib_oracle.py (--capture/--diff/
+ * --show) and ONU-test-case/stock_regdiff.py (--dump/--diff); both --self-check
+ * offline and pin the bytes above, and go red if anyone "fixes" this on the old
+ * assumption.
+ *
+ * ★★ HOW THIS IS BOUNDED SO IT CANNOT CATCH THE UNTAGGED PATH.  The test is
+ * applied to the WAN-SIDE netdev ONLY, and which netdev that is depends on the
+ * leg:
+ *     US (LAN->WAN) leg: the WAN is the EGRESS  -> the REDIRECT device (odev)
+ *     DS (WAN->LAN) leg: the WAN is the INGRESS -> the META device   (idev)
+ * The LAN-side device is NEVER tested on either leg.  That is not tidiness, it
+ * is the whole safety of the change: on this board the physical LAN ports ARE
+ * VLAN uppers (eth0.2..eth0.5, one HW VLAN per RJ45), so a test that looked at
+ * the LAN side would refuse the DS leg of EVERY flow, tagged WAN or not - and
+ * refusing the DS leg is exactly what once collapsed downstream from 934.2 to
+ * 242.9 Mbps.  With an untagged WAN both tested devices are the plain `gpon0`,
+ * is_vlan_dev() is false, and not one instruction of the 953.6 Mbps / 0.0 %
+ * control path changes.
+ *
+ * The counters are a BREAKDOWN, not a second total: the refusal returns
+ * -EOPNOTSUPP like every other, so it is also counted in `refused: unsupp`.
+ */
+/*
+ * ★★ EXTENDED 2026-08-04 TO THE EGRESS *CHAIN*, after the first version was
+ * board-proven on the IPoE half and left the PPPoE half untouched.
+ *
+ * MEASURED after the first fix booted: the six `dhcp-vlan` cells went from
+ * "never measured" to 577.5 Mbps US / 661.8 Mbps DS at 1400 B, while all twelve
+ * `pppoe-{pap,chap}-vlan` cells kept BLOCKING with the same signature the DHCP
+ * half had before (ICMP crosses at 0 %, the sized flow times out).
+ *
+ * WHY the first version missed it, and it is one layer, not one bug:
+ *   - IPoE-over-VLAN: the route's dst dev IS `gpon0.46`, so the REDIRECT device
+ *     is the 802.1Q upper and is_vlan_dev() fires.
+ *   - PPPoE-over-VLAN: the route's dst dev is `pppoe-wan`, whose LOWER is
+ *     `gpon0.46`.  is_vlan_dev(pppoe-wan) is FALSE, so nothing fired.
+ *
+ * ★ AND WHAT GETS INSTALLED IS WORSE THAN "a push entry missing its tag".  The
+ * SAME discarded dev-path walk that loses the VLAN encap loses the PPPoE encap
+ * with it - nf_flow_table_offload.c:715-737 builds BOTH FLOW_ACTION_PPPOE_PUSH
+ * and FLOW_ACTION_VLAN_PUSH out of the one `other_tuple->encap[]` array, and
+ * that array is only ever filled past nft_dev_forward_path()'s
+ * nft_flowtable_find_dev(<flattened lower>, ft) gate.  So on a tagged WAN the
+ * rule reaches us with NO push at all, pppoe_sid is 0, the session shadow is
+ * never armed, and cn_pppoe_leg_check(hw_pppoe, ds=0, rule_sid=0, armed_sid=0)
+ * returns CN_PPPOE_LEG_OK on its "IPoE WAN - nothing to decide" arm (:1490).
+ * The entry we install therefore carries NEITHER the 8-byte session header NOR
+ * the tag: a plain IPoE entry for a PPPoE-over-VLAN flow.  That also predicts
+ * that hw_pppoe=0 does NOT cure it (the leg check short-circuits before the
+ * mode test) while flow_offloading_hw=0 does - which is what was observed.
+ *
+ * ⇒ the question is not "is the egress device a VLAN upper" but "does the
+ * egress CHAIN carry an 802.1Q layer", and the kernel already owns the
+ * resolver: dev_fill_forward_path() is the very walk nft performs, and both
+ * halves of our chain implement it (ppp_fill_forward_path ->
+ * pppoe_fill_forward_path -> vlan_dev_fill_forward_path).  We ask it directly
+ * instead of re-deriving a device topology the driver has no business knowing.
+ */
+#define CN_VLAN_WAN_DIRECT	1	/* the WAN netdev IS an 802.1Q upper   */
+#define CN_VLAN_WAN_UNDER	2	/* an 802.1Q layer UNDER an encap      */
+#define CN_VLAN_WAN_ACTION	3	/* the rule carried VLAN_PUSH/POP      */
+
+static atomic_t cn_vlan_wan_refused_us = ATOMIC_INIT(0);
+static atomic_t cn_vlan_wan_refused_ds = ATOMIC_INIT(0);
+static atomic_t cn_vlan_wan_last_vid = ATOMIC_INIT(-1);
+/* ★ WHY the cause is counted separately and not merely totalled: a tagged
+ * EGRESS and a tag hiding UNDER a PPPoE session are different findings with
+ * different remedies, and the whole reason this defect survived two analyses is
+ * that the ledger could not tell one refusal from another.  A reader must never
+ * have to guess which arm fired. */
+static atomic_t cn_vlan_wan_direct = ATOMIC_INIT(0);
+static atomic_t cn_vlan_wan_under = ATOMIC_INIT(0);
+static atomic_t cn_vlan_wan_action = ATOMIC_INIT(0);
+
+static void cn_vlan_wan_account(bool ds_leg, u16 vid, int how)
+{
+	atomic_inc(ds_leg ? &cn_vlan_wan_refused_ds : &cn_vlan_wan_refused_us);
+	atomic_set(&cn_vlan_wan_last_vid, (int)vid);
+	switch (how) {
+	case CN_VLAN_WAN_DIRECT:
+		atomic_inc(&cn_vlan_wan_direct);
+		break;
+	case CN_VLAN_WAN_UNDER:
+		atomic_inc(&cn_vlan_wan_under);
+		break;
+	default:
+		atomic_inc(&cn_vlan_wan_action);
+		break;
+	}
+}
+
+/**
+ * cn_wan_chain_vlan() - does the egress chain under @dev carry an 802.1Q layer?
+ * @dev: the WAN-side netdev of one leg.
+ *
+ * Returns the VLAN id, or -1 for "no, OR could not resolve".  Collapsing those
+ * two into one negative answer is DELIBERATE and is what bounds this test: a
+ * refusal is issued only when the walk SUCCEEDS and AFFIRMATIVELY reports a
+ * DEV_PATH_VLAN, so a resolver that errors out (ppp_fill_forward_path returns
+ * -EOPNOTSUPP on a multilink bundle and -ENODEV with no channel;
+ * pppoe_fill_forward_path returns -1 on a dead or unconnected socket) can never
+ * turn one of the proven paths into a refusal.  The failure mode of this
+ * function is "we allow what we already allowed", never "we break the headline
+ * row".
+ *
+ * RCU: ppp_fill_forward_path walks ppp->channels with list_first_or_null_rcu,
+ * so the walk needs the RCU read side.  Nothing here sleeps, and it runs once
+ * per flow INSTALL - never per packet.
+ */
+/**
+ * struct cn_wan_encap - every encapsulation under one WAN netdev, from ONE walk.
+ * @vid:        the 802.1Q id, or -1 for "none / unresolved".
+ * @vproto:     that tag's TPID exactly as the walk reported it.
+ * @sid:        the LIVE PPPoE session id, or -1 for "no PPPoE layer".
+ * @ac_mac:     the PPPoE peer - the access concentrator's MAC.
+ * @ac_mac_vld: @ac_mac is a usable unicast address.
+ * @walk_ok:    dev_fill_forward_path() itself succeeded.
+ */
+struct cn_wan_encap {
+	int	vid;
+	__be16	vproto;
+	int	sid;
+	u8	ac_mac[ETH_ALEN];
+	bool	ac_mac_vld;
+	bool	walk_ok;
+};
+
+/*
+ * cn_wan_chain_encap() - the walk above, keeping everything it already finds.
+ *
+ * ★ THE VLAN NUMBER WAS NEVER THE MISSING DATUM.  Measured on this board
+ * 2026-08-05, one forwarded flow over a tagged PPPoE WAN, read from
+ * /proc/cortina_l3fe: `vlan_wan: refused_us=12 refused_ds=12 last_vid=46
+ * cause{direct=0 under_encap=24 action=0}` - so the walk below resolved 46 on
+ * BOTH legs and the refusal fired on the UNDER arm.  What no rule and no walk
+ * result ever reached the action with was the PPPoE SESSION ID: the same read
+ * shows `pppoe_stage: sess=0x0 arms=0`, i.e. nothing ever carried one.
+ *
+ * The kernel publishes all three in the SAME stack, and pppoe_fill_forward_path
+ * (drivers/net/ppp/pppoe.c) is explicit about it: `path->encap.id =
+ * be16_to_cpu(po->num)` is the live negotiated session, `path->encap.h_dest =
+ * po->pppoe_pa.remote` is the peer.  cn_wan_chain_vlan() has been walking past
+ * both of them and discarding them, which is exactly why a tagged PPPoE leg
+ * could only ever be refused.
+ *
+ * Failure is always "we resolved nothing", never a wrong value: a dead or
+ * unconnected socket (-1) or a multilink bundle (-EOPNOTSUPP) leaves sid < 0,
+ * the caller refuses the leg, and the flow stays on the software fastpath -
+ * which forwards PPPoE correctly.
+ */
+static void cn_wan_chain_encap(struct net_device *dev, struct cn_wan_encap *e)
+{
+	static const u8 zero_daddr[ETH_ALEN] = {};
+	struct net_device_path_stack stack;
+	int i;
+
+	memset(e, 0, sizeof(*e));
+	e->vid = -1;
+	e->sid = -1;
+	if (!dev)
+		return;
+	rcu_read_lock();
+	if (dev_fill_forward_path(dev, zero_daddr, &stack) >= 0) {
+		e->walk_ok = true;
+		for (i = 0; i < stack.num_paths; i++) {
+			const struct net_device_path *p = &stack.path[i];
+
+			if (p->type == DEV_PATH_VLAN && e->vid < 0) {
+				e->vid = p->encap.id;
+				e->vproto = p->encap.proto;
+			} else if (p->type == DEV_PATH_PPPOE && e->sid < 0) {
+				e->sid = p->encap.id;
+				ether_addr_copy(e->ac_mac, p->encap.h_dest);
+				e->ac_mac_vld =
+					is_valid_ether_addr(p->encap.h_dest);
+			}
+		}
+	}
+	rcu_read_unlock();
+	return;
+}
+
+static int cn_wan_chain_vlan(struct net_device *dev)
+{
+	struct cn_wan_encap e;
+
+	cn_wan_chain_encap(dev, &e);
+	return e.vid;
+}
+
+/* ------------------------------------------------------------------ */
+/* DMA-AFT: the hardware WAN VLAN edit.                                */
+/*                                                                     */
+/* Stock reaches ~953 Mbps on a tagged WAN at ~2.6 points over its idle */
+/* CPU floor.  That is not a software push - it is this engine, which   */
+/* stock names itself ("force disable hw vlan/pppoe offload").  Ours    */
+/* refused the flow outright and fell to the software flowtable         */
+/* (577.5 Mbps @ 53.5 %), which is the whole gap.                       */
+/*                                                                     */
+/* Programmed per flow by stock's _rtk_fc_flow_dmaAftAction_update,     */
+/* called from RTK_RG_ASIC_FLOWPATH_SET: one L2FIB entry describing the */
+/* edit, plus one MAP entry per CPU lspid pointing at it.               */
+/* ------------------------------------------------------------------ */
+
+/*
+ * ★★ HARDWARE-FORWARD AN IPoE FLOW ON A TAGGED WAN.  Default ON since
+ * 2026-08-04, on a measurement rather than an argument.
+ *
+ * ★ WHERE THE TAG GOES.  The tag for an offloaded flow is put on the PER-FLOW
+ * HIT ACTION - cn_l3e_set_us_wan_vlan() upstream and cn_l3e_set_ds_wan_vlan()
+ * downstream - and that is what the measurements below were taken with.
+ *
+ * ⚠ CORRECTED 2026-08-05.  This banner used to add "and the DMA-AFT edit is
+ * STRUCTURALLY INERT for a hardware-forwarded frame", from the MAP being keyed
+ * by CPU lspid (cn_aft_install() writes bias 0 and 1 = AAL_LPORT_CPU_0/_1) plus
+ * a TX-descriptor arming a forwarded frame has no descriptor for.  The map-key
+ * fact holds - stock's own map reads lspid 0x10/0x11, and those ARE CPU_0/CPU_1
+ * (CA_NI_LPORT_CPU_0 = 0x10; CA_DMA_AFT_MAP_LSPID is 4 bits biased by CPU0 and
+ * cannot encode anything else).  The INERTNESS does not follow: stock's per-flow
+ * record binds a DMA-AFT fib and map to each flow (dma_aft{En=1 FibIdx MapIdx},
+ * forceDisDmaAft=0), so there is a second, per-flow selection path we have not
+ * characterised.  Which engine performs stock's wire edit is UNSETTLED; the full
+ * evidence and the A/B that would settle it are at the cn_aft_install() call
+ * site in cn_flow_replace().  Nothing below depends on the retracted half - the
+ * hit-action route is measured end to end.
+ *
+ * THE EVIDENCE, one rig session, one variable at a time, tagged WAN on VID 46,
+ * 1400 B, both legs, with the untagged sibling as the same-session control:
+ *   - tier 1, far end.  A capture on the OLT-facing NIC filtered by the ONU's
+ *     own WAN MAC showed, with the DMA-AFT alone, the FIRST upstream frames
+ *     leaving TAGGED (107 B) and every frame after the flow was offloaded
+ *     leaving UNTAGGED (103 B - exactly the 4 tag bytes, same 5-tuple, same
+ *     MACs).  With the hit-action push added: 46 of 46 frames TAGGED, none
+ *     untagged.
+ *   - the positive control for the CPU-lspid reading: pointing every lspid at
+ *     the DMA-AFT push entry put VID 46 on the ONU's OWN CPU-originated LAN
+ *     traffic and took the management path down.
+ *   - throughput, delivered, with its CPU cost:
+ *         DMA-AFT only        lan>wan BLOCKED      wan>lan BLOCKED
+ *         refuse (SW path)    lan>wan 588.4        wan>lan 661.7  @53-63 % CPU
+ *         + US hit-action     every frame tagged, flow still stalled on the
+ *                             return leg (the DS action left the VLAN block at
+ *                             zero = STACKING mode, which is not a pop)
+ *         + DS explicit pop   lan>wan 983.1        wan>lan 983.2  @4.0 % CPU
+ *         untagged control    lan>wan 983.1        wan>lan 983.2  @4.0 % CPU
+ *     against stock's 983.0 @ 6.7 % and 983.1 @ 10.7 % on the same rig: parity
+ *     on throughput, and less CPU than the vendor.
+ *
+ * ⇒ ON is the default because it is better on every axis measured and the
+ * untagged path is provably untouched (cn_l3e_set_*_wan_vlan return immediately
+ * at vid 0, so an untagged action is byte-identical to before).  The knob stays
+ * so the tagged path can still be A/B'd against the software fastpath without a
+ * rebuild.
+ *
+ * ⚠ SCOPE: IPoE only.  A VID found UNDER an encapsulation (PPPoE on gpon0.46)
+ * is refused whatever this knob says - see the call site for why.
+ */
+static bool hw_vlan_wan = true;
+module_param(hw_vlan_wan, bool, 0644);
+MODULE_PARM_DESC(hw_vlan_wan,
+		 "hardware-forward an IPoE flow on a VLAN-tagged WAN, carrying the tag on the per-flow hit action (default on; off = the software-fastpath behaviour). PPPoE over a tagged WAN is refused either way.");
+
+/*
+ * cn_aft_go() - run one indirect access and WAIT for it, loudly.
+ *
+ * A silent timeout here would leave a half-written table entry behind and
+ * look exactly like the bug this change fixes, so it never returns success
+ * on a timeout and the caller always unwinds.
+ */
+static int cn_aft_go(struct cn_l3e *l3e, u32 access_off, u32 val)
+{
+	int i;
+
+	writel(val, l3e->dma_base + access_off);
+	/* stock polls 200 times for the L2FIB and 100 for the map with no
+	 * delay between reads; 1000 with a 1 us gap is far more headroom
+	 * than either, and still bounded. */
+	for (i = 0; i < 1000; i++) {
+		if (!(readl(l3e->dma_base + access_off) & CA_DMA_AFT_ACCESS_GO))
+			return 0;
+		udelay(1);
+	}
+	l3e->aft_timeout++;
+	dev_err(l3e->dev,
+		"DMA-AFT: GO never cleared on access reg +0x%03x (wrote 0x%08x) - the VLAN edit is NOT programmed; this flow falls back to software\n",
+		access_off, val);
+	return -ETIMEDOUT;
+}
+
+/*
+ * cn_aft_tpid_slot() - which of the 4 TPID slots holds @tpid?
+ *
+ * ★ THE FAIL-CLOSED TRAP THIS ENGINE IS FULL OF.  The hardware compares the
+ * tag's TPID against these four slots and, on no match, SILENTLY disables
+ * the whole DMA-AFT for the flow - a perfectly good edit that does nothing,
+ * with a symptom indistinguishable from the bug we just fixed.  So the
+ * no-match case is LOUD and refuses, never a quiet skip.
+ *
+ * Measured live, the pools differ between firmwares (stock slot2 = 0xffc0,
+ * ours = 0x9100) - but slot 0 is 0x8100 on BOTH, so an ordinary C-VLAN
+ * matches either way.  We therefore SEARCH rather than assume a slot index,
+ * and we do not rewrite the slot table: repurposing a slot another engine
+ * is already comparing against is exactly the kind of shared-state edit
+ * that breaks something else silently.
+ */
+static int cn_aft_tpid_slot(struct cn_l3e *l3e, u16 tpid)
+{
+	u32 w[2];
+	int i;
+
+	w[0] = readl(l3e->dma_base + CA_DMA_AFT_TPID01);
+	w[1] = readl(l3e->dma_base + CA_DMA_AFT_TPID23);
+	for (i = 0; i < CA_DMA_AFT_TPID_SLOTS; i++) {
+		u16 slot = (i & 1) ? (w[i >> 1] >> 16) : (w[i >> 1] & 0xffff);
+
+		if (slot == tpid)
+			return i;
+	}
+	l3e->aft_no_tpid++;
+	dev_warn(l3e->dev,
+		 "DMA-AFT: TPID 0x%04x matches none of the 4 slots (0x%04x 0x%04x 0x%04x 0x%04x) - the hardware would silently drop the VLAN edit, so this flow stays on the software fastpath\n",
+		 tpid, w[0] & 0xffff, w[0] >> 16, w[1] & 0xffff, w[1] >> 16);
+	return -ENOENT;
+}
+
+/*
+ * cn_l3fe_tpid_ensure() - make sure the WAN tag's TPID is REGISTERED and ENABLED
+ * in the L3FE packet-parser slot table.  Returns the slot, or negative.
+ *
+ * ★ THIS IS A GATE, NOT A DIAGNOSTIC.  Stock's _rtk_9607f_asic_flow_action_gen
+ * calls aal_l3fe_pp_top_tpid_get() and ABORTS THE WHOLE ACTION when it returns
+ * -3, which is what it returns when the TPID is in no slot or the slot's enable
+ * bit is clear.  So an unregistered TPID does not produce a wrong flow - it
+ * produces NO flow, and the traffic silently falls back to software with every
+ * other register looking perfect.  That is indistinguishable from the bug this
+ * change exists to fix, which is why the gate is PROGRAMMED here rather than
+ * merely checked.  It gates BOTH candidate mechanisms (the L3FE hash action and
+ * the DMA-AFT edit), so it has to be satisfied whichever one actually fires.
+ *
+ * ⚠ THIS WRITES GLOBAL STATE shared with other engines, so it is deliberately
+ * conservative: it will claim a slot ONLY if that slot is currently DISABLED.
+ * An enabled slot holding a different TPID is left alone and we refuse instead
+ * - repurposing a value another engine is comparing against is exactly the kind
+ * of shared-state edit that breaks something unrelated and silently.
+ */
+static int cn_l3fe_tpid_ensure(struct cn_l3e *l3e, u16 tpid)
+{
+	u32 w[2], ctrl, mask;
+	int i, free_slot = -1;
+
+	w[0] = readl(l3e->ne_base + CA_NI_L3FE_PP_TPID01);
+	w[1] = readl(l3e->ne_base + CA_NI_L3FE_PP_TPID23);
+	ctrl = readl(l3e->ne_base + CA_NI_L3FE_PP_TPID_CTRL);
+	mask = FIELD_GET(CA_NI_L3FE_PP_TPID_TOP_MASK, ctrl);
+
+	for (i = 0; i < CA_DMA_AFT_TPID_SLOTS; i++) {
+		u16 slot = (i & 1) ? (w[i >> 1] >> 16) : (w[i >> 1] & 0xffff);
+		bool en = mask & BIT(i);
+
+		if (slot == tpid && en)
+			return i;			/* already satisfied */
+		if (slot == tpid && !en) {	/* right value, gate shut */
+			ctrl |= FIELD_PREP(CA_NI_L3FE_PP_TPID_TOP_MASK, BIT(i));
+			writel(ctrl, l3e->ne_base + CA_NI_L3FE_PP_TPID_CTRL);
+			l3e->aft_tpid_armed++;
+			dev_info(l3e->dev,
+				 "L3FE TPID gate: slot %d already held 0x%04x but was DISABLED - enabling it; action generation would have aborted for every tagged flow\n",
+				 i, tpid);
+			return i;
+		}
+		if (!en && free_slot < 0)
+			free_slot = i;			/* claimable */
+	}
+
+	if (free_slot < 0) {
+		l3e->aft_no_tpid++;
+		dev_warn(l3e->dev,
+			 "L3FE TPID gate: 0x%04x is not registered and all 4 slots are ENABLED with other values (%04x %04x %04x %04x, top_mask=0x%x) - refusing to repurpose one; tagged flows stay on the software fastpath\n",
+			 tpid, w[0] & 0xffff, w[0] >> 16, w[1] & 0xffff,
+			 w[1] >> 16, mask);
+		return -ENOSPC;
+	}
+
+	/* claim the disabled slot: value first, then the enable bit, so the
+	 * parser can never see the bit set against a stale value */
+	if (free_slot & 1)
+		w[free_slot >> 1] = (w[free_slot >> 1] & 0x0000ffff) |
+				    ((u32)tpid << 16);
+	else
+		w[free_slot >> 1] = (w[free_slot >> 1] & 0xffff0000) | tpid;
+	writel(w[free_slot >> 1], l3e->ne_base +
+	       (free_slot < 2 ? CA_NI_L3FE_PP_TPID01 : CA_NI_L3FE_PP_TPID23));
+	wmb();
+	ctrl |= FIELD_PREP(CA_NI_L3FE_PP_TPID_TOP_MASK, BIT(free_slot));
+	writel(ctrl, l3e->ne_base + CA_NI_L3FE_PP_TPID_CTRL);
+	l3e->aft_tpid_armed++;
+	dev_info(l3e->dev,
+		 "L3FE TPID gate: registered 0x%04x in slot %d and enabled it (top_mask 0x%x -> 0x%x); without this, action generation aborts for every tagged flow\n",
+		 tpid, free_slot, mask, (u32)(mask | BIT(free_slot)));
+	return free_slot;
+}
+
+/*
+ * cn_aft_fib_program() - write one L2FIB entry: the actual VLAN edit.
+ *
+ * @vid:      the WAN VLAN, or 0 for the strip direction
+ * @tag_cnt:  tags the egress frame carries AFTER the edit.  1 = push @vid
+ *            (upstream), 0 = strip (downstream).  This is `vlan_cnt`, and
+ *            it is only a COUNT because vlan_vld selects SET mode below.
+ * @tpid_slot: which TPID slot the pushed tag uses; ignored when tag_cnt = 0
+ *
+ * vlan_vld = 1 selects "VLAN set mode", in which the edit is declarative:
+ * the frame LEAVES with exactly @tag_cnt tags.  It does NOT mean "this
+ * entry is valid" - see the banner in cortina-ni-regs.h.  Stock sets it on
+ * every flow, tagged or not.
+ */
+static int cn_aft_fib_program(struct cn_l3e *l3e, u8 idx, u16 vid,
+			      u8 tag_cnt, int tpid_slot)
+{
+	u32 d0 = 0, d1 = 0, d2 = 0;
+
+	/* SET mode: the edit is DECLARATIVE - the frame LEAVES with exactly
+	 * @tag_cnt tags.  In the other mode (stacking) this same tag_cnt field
+	 * would be an opcode instead, which is a different instruction set;
+	 * see the field comments in cortina-ni-regs.h. */
+	d2 |= CA_DMA_AFT_D2_VLAN_SET_MODE;
+	d2 |= FIELD_PREP(CA_DMA_AFT_D2_EGRESS_TAG_CNT, tag_cnt);
+	if (tag_cnt) {
+		d1 |= FIELD_PREP(CA_DMA_AFT_D1_TOP_VID, vid);
+		/* the slot index is 1-BASED here: 0 means "no tag", so slot 0
+		 * (0x8100) must be written as 1.  Writing the raw slot number
+		 * would disable the tag on the very slot we matched. */
+		d2 |= FIELD_PREP(CA_DMA_AFT_D2_TOP_TPID_SLOT_P1, tpid_slot + 1);
+		/* take the TPID from that slot.  The selector is SPLIT: bit0
+		 * lives in DATA1[31], bit1 in DATA2[0].  Value 1 = bit0 only. */
+		d1 |= CA_DMA_AFT_D1_TOP_TPID_SRC_LO;
+	}
+	/* inner_* and pppoe_* stay 0: one tag, and the PPPoE push is still
+	 * owned by hw_pppoe on the L3FE side. */
+
+	writel(d0, l3e->dma_base + CA_DMA_AFT_L2FIB_DATA0);
+	writel(d1, l3e->dma_base + CA_DMA_AFT_L2FIB_DATA1);
+	writel(d2, l3e->dma_base + CA_DMA_AFT_L2FIB_DATA2);
+	return cn_aft_go(l3e, CA_DMA_AFT_L2FIB_ACCESS,
+			 CA_DMA_AFT_ACCESS_GO | CA_DMA_AFT_ACCESS_WRITE |
+			 FIELD_PREP(CA_DMA_AFT_ACCESS_IDX, idx));
+}
+
+/*
+ * cn_aft_fib_read() - read one L2FIB entry back OUT of the hardware.
+ *
+ * "We wrote it" and "the table holds it" are different claims, and only the
+ * second one is evidence.  Takes aft_lock so it cannot interleave with our own
+ * install sequence on the shared ACCESS register.
+ */
+static int cn_aft_fib_read(struct cn_l3e *l3e, u8 idx, u32 *d0, u32 *d1, u32 *d2)
+{
+	unsigned long flags;
+	int err;
+
+	spin_lock_irqsave(&l3e->aft_lock, flags);
+	err = cn_aft_go(l3e, CA_DMA_AFT_L2FIB_ACCESS,
+			CA_DMA_AFT_ACCESS_GO |	/* bit30 clear = READ */
+			FIELD_PREP(CA_DMA_AFT_ACCESS_IDX, idx));
+	if (!err) {
+		*d0 = readl(l3e->dma_base + CA_DMA_AFT_L2FIB_DATA0);
+		*d1 = readl(l3e->dma_base + CA_DMA_AFT_L2FIB_DATA1);
+		*d2 = readl(l3e->dma_base + CA_DMA_AFT_L2FIB_DATA2);
+	}
+	spin_unlock_irqrestore(&l3e->aft_lock, flags);
+	return err;
+}
+
+/* write one MAP entry: "frames from this lspid use fib @fib". */
+static int cn_aft_map_program(struct cn_l3e *l3e, u8 idx, u8 lspid_map, u8 fib)
+{
+	u32 w = CA_DMA_AFT_MAP_VLD | CA_DMA_AFT_MAP_EN |
+		FIELD_PREP(CA_DMA_AFT_MAP_LSPID, lspid_map) |
+		FIELD_PREP(CA_DMA_AFT_MAP_FIB_ID, fib);
+
+	writel(w, l3e->dma_base + CA_DMA_AFT_MAP_DATA);
+	return cn_aft_go(l3e, CA_DMA_AFT_MAP_ACCESS,
+			 CA_DMA_AFT_ACCESS_GO | CA_DMA_AFT_ACCESS_WRITE |
+			 FIELD_PREP(CA_DMA_AFT_ACCESS_IDX, idx));
+}
+
+/* clear a MAP entry (vld = 0, en = 0) so a freed fib stops being reachable */
+static void cn_aft_map_clear(struct cn_l3e *l3e, u8 idx)
+{
+	writel(0, l3e->dma_base + CA_DMA_AFT_MAP_DATA);
+	cn_aft_go(l3e, CA_DMA_AFT_MAP_ACCESS,
+		  CA_DMA_AFT_ACCESS_GO | CA_DMA_AFT_ACCESS_WRITE |
+		  FIELD_PREP(CA_DMA_AFT_ACCESS_IDX, idx));
+}
+
+/*
+ * cn_aft_install() - give this leg a hardware VLAN edit.
+ *
+ * Returns 0 on success (the caller may then offload the flow), or a negative
+ * errno, in which case the caller must fall back to refusing - never proceed
+ * with a half-installed edit.
+ *
+ * Entries are shared by CONTENT and refcounted, exactly as stock does: this
+ * board has ONE WAN VLAN, so in practice two fib entries exist in total (one
+ * push, one strip) however many flows are up.
+ */
+static int cn_aft_install(struct cn_l3e *l3e, struct cn_aft_ref *ref,
+			  u16 vid, bool ds_leg)
+{
+	u8 tag_cnt = ds_leg ? 0 : 1;
+	int tpid_slot = 0;
+	int fib = -1, i, err;
+	int map[2] = { -1, -1 };
+	unsigned long flags;
+
+	if (!l3e->dma_base)
+		return -ENODEV;
+
+	/* the TPID probe reads global state and must happen before we take
+	 * anything; it is also the arm most likely to refuse. */
+	if (tag_cnt) {
+		/* TWO different TPID tables, both of which must accept the tag:
+		 * the L3FE packet-parser slots gate whether an action is
+		 * GENERATED at all, and the DMA-AFT slots supply the TPID the
+		 * edit inserts.  Satisfy the gate first - if it refuses there is
+		 * nothing downstream worth programming. */
+		if (cn_l3fe_tpid_ensure(l3e, CA_DMA_AFT_TPID_8021Q) < 0)
+			return -ENOSPC;
+		tpid_slot = cn_aft_tpid_slot(l3e, CA_DMA_AFT_TPID_8021Q);
+		if (tpid_slot < 0)
+			return tpid_slot;
+	}
+
+	spin_lock_irqsave(&l3e->aft_lock, flags);
+
+	/* reuse an identical edit if one is already programmed */
+	for (i = CA_DMA_AFT_FIB_DYN_FIRST; i < CA_DMA_AFT_FIB_COUNT; i++) {
+		if ((l3e->aft_fib_used & BIT_ULL(i)) &&
+		    l3e->aft_fib_ref[i] &&
+		    l3e->aft_fib_cnt[i] == tag_cnt &&
+		    l3e->aft_fib_vid[i] == (tag_cnt ? vid : 0)) {
+			l3e->aft_fib_ref[i]++;
+			ref->fib = i;
+			ref->valid = true;
+			l3e->aft_reuse++;
+			spin_unlock_irqrestore(&l3e->aft_lock, flags);
+			return 0;
+		}
+	}
+
+	for (i = CA_DMA_AFT_FIB_DYN_FIRST; i < CA_DMA_AFT_FIB_COUNT; i++) {
+		if (!(l3e->aft_fib_used & BIT_ULL(i))) {
+			fib = i;
+			l3e->aft_fib_used |= BIT_ULL(i);
+			break;
+		}
+	}
+	if (fib < 0)
+		goto full;
+
+	for (i = CA_DMA_AFT_MAP_DYN_FIRST; i < CA_DMA_AFT_MAP_COUNT &&
+	     (map[0] < 0 || map[1] < 0); i++) {
+		if (l3e->aft_map_used & BIT_ULL(i))
+			continue;
+		l3e->aft_map_used |= BIT_ULL(i);
+		if (map[0] < 0)
+			map[0] = i;
+		else
+			map[1] = i;
+	}
+	if (map[1] < 0)
+		goto full;
+
+	l3e->aft_fib_vid[fib] = tag_cnt ? vid : 0;
+	l3e->aft_fib_cnt[fib] = tag_cnt;
+	l3e->aft_fib_ref[fib] = 1;
+	l3e->aft_fib_map[fib][0] = map[0];
+	l3e->aft_fib_map[fib][1] = map[1];
+	spin_unlock_irqrestore(&l3e->aft_lock, flags);
+
+	err = cn_aft_fib_program(l3e, fib, vid, tag_cnt, tpid_slot);
+	if (err)
+		goto unwind;
+	/* one map entry per CPU lspid, as stock does (lspid_map 0 and 1 =
+	 * AAL_LPORT_CPU_0 / _1) */
+	for (i = 0; i < 2; i++) {
+		err = cn_aft_map_program(l3e, map[i], i, fib);
+		if (err)
+			goto unwind;
+	}
+
+	ref->fib = fib;
+	ref->valid = true;
+	if (tag_cnt)
+		l3e->aft_push++;
+	else
+		l3e->aft_strip++;
+	dev_dbg(l3e->dev,
+		"DMA-AFT: %s leg -> fib %d (%s vid %u, tpid slot %d), map %d/%d\n",
+		ds_leg ? "DS" : "US", fib, tag_cnt ? "push" : "strip",
+		tag_cnt ? vid : 0, tpid_slot, map[0], map[1]);
+	return 0;
+
+full:
+	l3e->aft_full++;
+	spin_unlock_irqrestore(&l3e->aft_lock, flags);
+	dev_warn(l3e->dev,
+		 "DMA-AFT: table full (fib %d, map %d/%d) - this flow stays on the software fastpath\n",
+		 fib, map[0], map[1]);
+	err = -ENOSPC;
+	goto release;
+
+unwind:
+release:
+	spin_lock_irqsave(&l3e->aft_lock, flags);
+	if (fib >= 0) {
+		l3e->aft_fib_used &= ~BIT_ULL(fib);
+		l3e->aft_fib_ref[fib] = 0;
+	}
+	for (i = 0; i < 2; i++)
+		if (map[i] >= 0)
+			l3e->aft_map_used &= ~BIT_ULL(map[i]);
+	spin_unlock_irqrestore(&l3e->aft_lock, flags);
+	for (i = 0; i < 2; i++)
+		if (map[i] >= 0)
+			cn_aft_map_clear(l3e, map[i]);
+	return err;
+}
+
+/* release this flow's share of the edit; clears the hardware only when the
+ * last user goes away, so a second flow on the same VLAN keeps working. */
+static void cn_aft_release(struct cn_l3e *l3e, struct cn_aft_ref *ref)
+{
+	unsigned long flags;
+	u8 map[2] = { 0, 0 };
+	bool last = false;
+	int i;
+
+	if (!ref->valid)
+		return;
+	ref->valid = false;
+
+	spin_lock_irqsave(&l3e->aft_lock, flags);
+	if (ref->fib < CA_DMA_AFT_FIB_COUNT && l3e->aft_fib_ref[ref->fib]) {
+		if (!--l3e->aft_fib_ref[ref->fib]) {
+			/* last user of this edit: the FIB owns its map pair, so
+			 * it is freed here whichever flow released last */
+			map[0] = l3e->aft_fib_map[ref->fib][0];
+			map[1] = l3e->aft_fib_map[ref->fib][1];
+			l3e->aft_fib_used &= ~BIT_ULL(ref->fib);
+			l3e->aft_map_used &= ~BIT_ULL(map[0]);
+			l3e->aft_map_used &= ~BIT_ULL(map[1]);
+			last = true;
+		}
+	}
+	spin_unlock_irqrestore(&l3e->aft_lock, flags);
+
+	if (last)
+		for (i = 0; i < 2; i++)
+			cn_aft_map_clear(l3e, map[i]);
+}
+
+/*
+ * cn_aft_wan_vid() - the VLAN this leg's WAN side carries, 0 for none.
+ *
+ * Mirrors cn_flow_refuse_vlan_wan()'s two arms exactly, minus the ledger, so
+ * the two can never disagree about WHICH flows are VLAN-carrying.  Returning
+ * 0 is what keeps the untagged path out of every line of the DMA-AFT code.
+ */
+static u16 cn_aft_wan_vid(struct net_device *wan_dev)
+{
+	int vid;
+
+	if (!wan_dev)
+		return 0;
+	if (is_vlan_dev(wan_dev))
+		return (u16)vlan_dev_vlan_id(wan_dev);
+	vid = cn_wan_chain_vlan(wan_dev);
+	return vid > 0 ? (u16)vid : 0;
+}
+
+/*
+ * ★★ HARDWARE-FORWARD A *PPPoE* FLOW WHOSE WAN RIDES AN 802.1Q TAG.
+ *
+ * The tag and the session header are programmed in TWO DIFFERENT PLACES, which
+ * is why the combination had to be refused rather than merely being broken:
+ *
+ *   the 802.1Q tag       the per-flow hit action - top_vid@145, top_tpid_enc@157,
+ *                        vlan_cnt@160, vlan_vld@162 (cn_l3e_set_us_wan_vlan /
+ *                        cn_l3e_set_ds_wan_vlan).
+ *   the session header   the EGRESS L3-INTERFACE word selected by
+ *                        egr_l3_if_idx@34 - programmed by
+ *                        cortina_ni_wan_pppoe_session_set() from
+ *                        cn_l3e_set_us_egress().  The action carries no
+ *                        session-id field at all.
+ *
+ * The two blocks are ORTHOGONAL BY CONSTRUCTION: the L3-IF word has no VLAN
+ * field and the action has no session field, so one action can legitimately
+ * carry vlan_vld=1/vlan_cnt=1/top_vid=46 AND point at an L3-IF word holding the
+ * live sid.  The stock oracle (read live on the vendor firmware over a tagged
+ * PPPoE WAN, 2026-08-05) shows exactly that pairing: its upstream hit action
+ * reads top_vid=46, top_tpid_enc=1, vlan_cnt=1, vlan_vld=1 with egr_l3_if_idx=1
+ * selecting the netif that carries PPPoE sid 0x1 - and its tagged-IPoE action is
+ * BIT-IDENTICAL in the VLAN region, so the hit action does not distinguish the
+ * two encapsulations at all.
+ *
+ * What was missing on our side was the SESSION ID, never the tag: on a tagged
+ * WAN nf emits no FLOW_ACTION_PPPOE_PUSH (measured: `pppoe_stage: arms=0`), so
+ * pppoe_sid stayed 0 and a leg installed here would have pushed the tag and
+ * omitted the 8-byte header - a correctly-tagged frame no access concentrator
+ * accepts.  cn_wan_chain_encap() now supplies it from the same walk that already
+ * supplied the vid.
+ */
+static bool hw_vlan_pppoe = true;
+module_param(hw_vlan_pppoe, bool, 0644);
+MODULE_PARM_DESC(hw_vlan_pppoe,
+	"hardware-forward a PPPoE flow whose WAN rides an 802.1Q tag (pppoe-wan over gpon0.46): the tag goes on the per-flow hit action, the 8-byte session header on the egress L3-IF, the next-hop MAC comes from the PPPoE peer. Needs hw_vlan_wan=1 and hw_pppoe=1. Writable at runtime, so ONE boot yields both the control (0) and the treatment (1); 0 is byte-identical to the pre-2026-08-05 software-fastpath behaviour.");
+
+/* The vlan+PPPoE ledger.  Every arm that can decline is counted, because a leg
+ * that quietly fell back to software is indistinguishable from one that was
+ * never offered - the same reason the vlan_wan cause breakdown exists. */
+static atomic_t cn_vlan_pppoe_ok = ATOMIC_INIT(0);
+static atomic_t cn_vlan_pppoe_no_sid = ATOMIC_INIT(0);
+static atomic_t cn_vlan_pppoe_no_mac = ATOMIC_INIT(0);
+static atomic_t cn_vlan_pppoe_badtpid = ATOMIC_INIT(0);
+static atomic_t cn_vlan_pppoe_mismatch = ATOMIC_INIT(0);
+/* ★★ THE AC-MAC SUBSTITUTION IS COUNTED PER LEG, AND THE DS COUNTER COUNTS THE
+ * CONDITION, NOT THE ACTION.  The substitution is US-only (see its site), so a
+ * DS counter placed after the `!ds_leg` guard could only ever read 0 - true by
+ * construction, which is exactly the worthless witness this driver has been
+ * burnt by before.  So `_ds_blocked` is incremented where the DS leg reaches
+ * the SAME three conditions and the guard refuses it:
+ *      0  = the situation never arose downstream (a measurement, not an axiom)
+ *     >0  = it did, and the access concentrator's MAC was kept OUT of the LAN
+ *           next hop - the latent bug, now visible in /proc instead of latent.
+ */
+static atomic_t cn_vlan_pppoe_acmac_us = ATOMIC_INIT(0);
+static atomic_t cn_vlan_pppoe_acmac_ds_blocked = ATOMIC_INIT(0);
+static atomic_t cn_vlan_pppoe_readback = ATOMIC_INIT(0);
+
+/**
+ * cn_wan_vlan_programmable() - may THIS leg's WAN tag go on the hit action?
+ * @wan_dev: the WAN-side netdev of this leg.
+ * @vid:     the VLAN cn_aft_wan_vid() already resolved for it (never 0 here).
+ * @enc:     filled with what the chain walk found, for the caller to program.
+ *
+ * Mirrors cn_flow_refuse_vlan_wan()'s arms so the two can never disagree about
+ * WHICH flows are VLAN-carrying.  Fail-closed everywhere: any missing piece
+ * returns false and the caller refuses the leg to the software fastpath, which
+ * is exactly today's behaviour - never a half-described entry.
+ */
+static bool cn_wan_vlan_programmable(struct net_device *wan_dev, u16 vid,
+				     struct cn_wan_encap *enc)
+{
+	if (!hw_vlan_wan || !vid)
+		return false;
+	/* (1) IPoE on a DIRECT 802.1Q upper - the 2026-08-04 board-proven path
+	 * (983.1/983.2 Mbps).  Deliberately NOT routed through the walk: it must
+	 * stay bit-for-bit the behaviour that was certified. */
+	if (is_vlan_dev(wan_dev)) {
+		memset(enc, 0, sizeof(*enc));
+		enc->vid = vid;
+		enc->sid = -1;
+		return true;
+	}
+	/* (2) a tag UNDER an encapsulation.  Only PPPoE is modelled. */
+	if (!hw_vlan_pppoe)
+		return false;
+	cn_wan_chain_encap(wan_dev, enc);
+	if (!enc->walk_ok || enc->vid != (int)vid)
+		return false;
+	if (enc->vproto != htons(ETH_P_8021Q)) {
+		/* only 0x8100 is registered in the packet-editor's TPID slots;
+		 * a QinQ outer would need a different slot and a different
+		 * nesting, neither of which has been established here */
+		atomic_inc(&cn_vlan_pppoe_badtpid);
+		return false;
+	}
+	if (enc->sid < 0 || enc->sid > 0xffff) {
+		atomic_inc(&cn_vlan_pppoe_no_sid);
+		return false;	/* a tag under something we have not RE'd */
+	}
+	if (!enc->ac_mac_vld) {
+		atomic_inc(&cn_vlan_pppoe_no_mac);
+		return false;
+	}
+	atomic_inc(&cn_vlan_pppoe_ok);
+	return true;
+}
+
+/**
+ * cn_flow_refuse_vlan_wan() - must this leg be refused for a VLAN-carrying WAN?
+ * @wan_dev: the WAN-side netdev of THIS leg - the egress (REDIRECT) device on
+ *           the US leg, the ingress (META) device on the DS leg.  NEVER the
+ *           LAN-side device; see the bounding note above.
+ * @ds_leg:  which leg is asking.  Ledger only - the policy is identical.
+ *
+ * Returns true when the caller must refuse.  Both call sites are BEFORE any HW
+ * write on their leg, so a refused flow leaves no L3-IF program, no L2-FDB
+ * append, no re-pointed hash profile and no hash entry behind.
+ *
+ * Two arms, cheapest first, and the order matters for robustness rather than
+ * for speed: the DIRECT arm is the one already proven on the board, so it stays
+ * independent of the forward-path API and would keep working even if that walk
+ * regressed.
+ */
+static bool cn_flow_refuse_vlan_wan(struct net_device *wan_dev, bool ds_leg)
+{
+	int vid;
+
+	if (!wan_dev)
+		return false;
+
+	/* (1) the WAN netdev IS the 802.1Q upper - IPoE on gpon0.46 */
+	if (is_vlan_dev(wan_dev)) {
+		vid = vlan_dev_vlan_id(wan_dev);
+		cn_vlan_wan_account(ds_leg, (u16)vid, CN_VLAN_WAN_DIRECT);
+		cn_rep_dbg("refuse: %s leg - WAN netdev %s is a VLAN upper (vid %u); this hit-action pushes no tag, so the flow stays on the SW fastpath\n",
+			   ds_leg ? "DS" : "US", wan_dev->name, vid);
+		return true;
+	}
+
+	/* (2) an 802.1Q layer hidden UNDER an encapsulation - PPPoE on gpon0.46 */
+	vid = cn_wan_chain_vlan(wan_dev);
+	if (vid >= 0) {
+		cn_vlan_wan_account(ds_leg, (u16)vid, CN_VLAN_WAN_UNDER);
+		cn_rep_dbg("refuse: %s leg - WAN netdev %s rides an 802.1Q layer (vid %u) under its encapsulation; neither the tag nor a reliable session id survives to this rule, so the flow stays on the SW fastpath\n",
+			   ds_leg ? "DS" : "US", wan_dev->name, vid);
+		return true;
+	}
+	return false;
+}
+
 static int cn_flow_replace(struct flow_cls_offload *f, struct net_device *dev)
 {
 	struct flow_rule *rule = flow_cls_offload_flow_rule(f);
@@ -2747,10 +3951,14 @@ static int cn_flow_replace(struct flow_cls_offload *f, struct net_device *dev)
 	struct cn_flow_entry *entry;
 	struct net_device *odev = NULL;
 	bool lan_ingress = false, snat_port = false;
-	bool ds_leg = false;
+	bool ds_leg = false, vlan_wan = false;
+	u16 vlan_wan_vid = 0;			/* 0 = untagged WAN = untouched */
 	int profile, i, err;
 	u16 addr_type = 0;
 	u16 pppoe_sid = 0;
+	struct cn_wan_encap wenc = { .vid = -1, .sid = -1 };
+	u16 vlan_wan_sid = 0;		/* PPPoE sid resolved from the WAN chain */
+	bool vlan_pppoe = false;	/* this leg is PPPoE *and* tagged */
 	u8 gw_dmac[6] = {};		/* next-hop MAC from the ETH mangle (A2) */
 	bool got_dmac_lo = false, got_dmac_hi = false;
 
@@ -2861,10 +4069,43 @@ static int cn_flow_replace(struct flow_cls_offload *f, struct net_device *dev)
 		if (idev) {
 			lan_ingress = netif_is_any_bridge_port(idev) ||
 				      netif_is_bridge_master(idev);
+			/* ★ The DS leg's WAN side is its INGRESS device, so this
+			 * is the only point where the DS half of the VLAN-WAN
+			 * refusal can be decided - and it is decided HERE, while
+			 * the reference is still held and BEFORE cn_l3e_arm_ds()
+			 * just below touches any HW: a VLAN-WAN board must not
+			 * even re-point the hash profiles.  Evaluated only when
+			 * the ingress is NOT the LAN, so the LAN-side device is
+			 * never tested (see cn_flow_refuse_vlan_wan). */
+			if (!lan_ingress) {
+				/* A tagged WAN is now PROGRAMMABLE: the DMA-AFT
+				 * carries the edit (push US / strip DS).  We
+				 * only refuse up front when that engine is
+				 * switched off; otherwise the decision moves to
+				 * the install below, which unwinds the flow if
+				 * the edit cannot be programmed. */
+				vlan_wan_vid = cn_aft_wan_vid(idev);
+				/* ★ The DS leg needs only the BOOLEAN, never
+				 * the number: cn_l3e_set_ds_wan_vlan() writes
+				 * vlan_vld=1 / vlan_cnt=0 / top_vid=0 /
+				 * top_tpid_enc=0 - an EXPLICIT "emit zero tags"
+				 * whose every value is vid-independent (the vid
+				 * is used solely as its `if (!vid) return`
+				 * guard).  The DS PPPoE strip is likewise
+				 * already unconditional, via the LAN L3-IF's
+				 * REMOVE encoding. */
+				if (vlan_wan_vid &&
+				    !cn_wan_vlan_programmable(idev, vlan_wan_vid,
+							      &wenc))
+					vlan_wan = cn_flow_refuse_vlan_wan(idev,
+									   true);
+			}
 			dev_put(idev);
 		}
 	}
 	ds_leg = !lan_ingress;
+	if (vlan_wan)
+		return -EOPNOTSUPP;
 	if (ds_leg) {
 		if (!hw_ds_offload) {
 			cn_rep_dbg("refuse: DS/reply leg, hw_ds_offload=0 (keeps the CPU punt path)\n");
@@ -2990,6 +4231,30 @@ static int cn_flow_replace(struct flow_cls_offload *f, struct net_device *dev)
 			 * constant. */
 			pppoe_sid = fa->pppoe.sid;
 			break;
+		case FLOW_ACTION_VLAN_PUSH:
+		case FLOW_ACTION_VLAN_POP:
+			/* The OTHER kernel-side shape of a VLAN-encapsulated WAN
+			 * (see the banner on cn_flow_refuse_vlan_wan): reached
+			 * only when the sub-interface's LOWER device is itself a
+			 * flowtable device, so nft_dev_forward_path() kept the
+			 * encap and nf_flow_rule_route_common() emitted a push
+			 * (egress side) or pop (ingress side) for it.
+			 * BEHAVIOUR IS UNCHANGED - this already fell into
+			 * `default:` and already refused.  What changes is
+			 * ATTRIBUTION: it now lands in the vlan_wan ledger
+			 * instead of being one of nine anonymous unsupp reasons,
+			 * which is the distinction whose absence made this defect
+			 * unreadable from /proc twice. */
+			cn_vlan_wan_account(ds_leg,
+					    fa->id == FLOW_ACTION_VLAN_PUSH ?
+					    fa->vlan.vid : 0,
+					    CN_VLAN_WAN_ACTION);
+			cn_rep_dbg("refuse: %s leg carries FLOW_ACTION_VLAN_%s (vid %u) - this hit-action cannot express a VLAN tag\n",
+				   ds_leg ? "DS" : "US",
+				   fa->id == FLOW_ACTION_VLAN_PUSH ? "PUSH" : "POP",
+				   fa->id == FLOW_ACTION_VLAN_PUSH ?
+				   fa->vlan.vid : 0);
+			return -EOPNOTSUPP;
 		default:
 			cn_rep_dbg("refuse: unsupported flow action id=%d\n",
 				   fa->id);
@@ -3002,6 +4267,85 @@ static int cn_flow_replace(struct flow_cls_offload *f, struct net_device *dev)
 			   ds_leg ? "DS/DNAT" : "US/SNAT",
 			   !!odev, (int)act.ip_addr_vld, snat_port);
 		return -EOPNOTSUPP;
+	}
+
+	/* ★ US leg ONLY: the WAN is this leg's EGRESS, i.e. the REDIRECT device.
+	 * Still before every HW write (cn_l3e_set_us_egress and the L2-FDB append
+	 * are both below).
+	 * ★★ THE `!ds_leg` GUARD IS LOAD-BEARING, NOT DEFENSIVE.  On the DS leg
+	 * `odev` is the LAN-side device, and this board's physical LAN ports ARE
+	 * VLAN uppers (eth0.2..eth0.5, one HW VLAN per RJ45), so dropping the
+	 * guard would refuse the DS leg of every flow on an untagged WAN too -
+	 * the 934.2 -> 242.9 Mbps downstream collapse, re-introduced.  The DS
+	 * leg's own WAN-side test is its INGRESS device, done in the META block
+	 * far above. */
+	if (!ds_leg && !vlan_wan_vid) {
+		/* the US leg's WAN side is the REDIRECT device */
+		vlan_wan_vid = cn_aft_wan_vid(odev);
+		/* ★ SCOPED TO A *DIRECT* VLAN UPPER - i.e. IPoE on gpon0.46, where
+		 * the tag is the whole encapsulation and the hit-action can carry
+		 * it.  A VID found UNDER an encapsulation (PPPoE on gpon0.46) is
+		 * still REFUSED whatever the knob says, because the same discarded
+		 * dev-path walk that hid the tag also hid the PPPoE session id: the
+		 * leg would install as a plain IPoE entry that pushes the tag and
+		 * omits the 8-byte session header, i.e. a correctly-tagged frame
+		 * that no access concentrator will accept.
+		 * Measured 2026-08-04: with this scoping absent, dhcp-vlan reached
+		 * 983.1/983.2 Mbps in hardware while pppoe-pap-vlan BLOCKED in both
+		 * directions - having previously carried 556.6/639.7 on the SW
+		 * fastpath.  Refusing PPPoE here keeps that software path.
+		 *
+		 * ★★ THE SCOPING IS LIFTED FOR PPPoE, 2026-08-05, and the reason it
+		 * was there is the reason it can go: the missing datum was the
+		 * SESSION ID, and cn_wan_chain_encap() now recovers it from the very
+		 * walk whose result was being thrown away.  The predicate below is
+		 * the same two arms - a DIRECT upper short-circuits before any walk,
+		 * so the certified tagged-IPoE path is bit-for-bit unchanged - plus
+		 * a PPPoE arm that only says YES once the vid, the TPID, the sid AND
+		 * the peer MAC have all been resolved.  Anything short of all four
+		 * still refuses, so the failure mode remains "we allow what we
+		 * already allowed". */
+		if (vlan_wan_vid &&
+		    !cn_wan_vlan_programmable(odev, vlan_wan_vid, &wenc))
+			vlan_wan = cn_flow_refuse_vlan_wan(odev, false);
+	}
+	if (!ds_leg && vlan_wan)
+		return -EOPNOTSUPP;
+
+	/*
+	 * ★★ THE PLUMBING.  The VLAN number was already reaching us - the chain
+	 * walk inside cn_aft_wan_vid() resolves it, and /proc's `last_vid=46`
+	 * proved it did.  The SESSION ID and the PEER MAC were not, because the
+	 * same discarded encap array that hid the tag hid both.  ONE walk, three
+	 * values; see cn_wan_chain_encap().
+	 *
+	 * Reachable only on a tagged WAN whose chain resolved completely.  On an
+	 * untagged WAN vlan_wan_vid is 0 and not one instruction below executes,
+	 * so every certified untagged row is untouched by construction.
+	 */
+	if (vlan_wan_vid && wenc.sid >= 0) {
+		vlan_pppoe = true;
+		vlan_wan_sid = (u16)wenc.sid;
+		/* TWO ROUTES, AND A DIFFERENCE IS THE FINDING.  Where the rule
+		 * DID carry a push, it must agree with the chain; a disagreement
+		 * is a topology we have not modelled, so refuse rather than
+		 * install on a guess. */
+		if (pppoe_sid && pppoe_sid != vlan_wan_sid) {
+			atomic_inc(&cn_vlan_pppoe_mismatch);
+			cn_rep_dbg("refuse: %s leg - the rule says sid=%#x, the WAN chain says sid=%#x (vid %u)\n",
+				   ds_leg ? "DS" : "US", pppoe_sid,
+				   vlan_wan_sid, vlan_wan_vid);
+			return -EOPNOTSUPP;
+		}
+		/* The US leg's encap is driven by pppoe_sid a few lines below
+		 * (cn_l3e_set_us_egress), which programs the egress L3-IF with
+		 * the live session and propagates a failed write as a refusal.
+		 * The DS leg must NOT be given one: nf never emits a push there,
+		 * and cn_pppoe_leg_check() would read it as an un-RE'd encap
+		 * model (UNEXPECTED_PUSH) - the refusal that once collapsed
+		 * downstream from 934.2 to 242.9 Mbps. */
+		if (!ds_leg && !pppoe_sid)
+			pppoe_sid = vlan_wan_sid;
 	}
 
 	/*
@@ -3019,8 +4363,16 @@ static int cn_flow_replace(struct flow_cls_offload *f, struct net_device *dev)
 	 * shadow is cleared on WAN data-path teardown, on the hw_pppoe 1->0 edge,
 	 * and by `echo 'pppoe 0' > /proc/cortina_l3fe`.
 	 */
+	/* ★ On a tagged PPPoE WAN the SHADOW is not armed - nothing arms it,
+	 * because the arming path is cn_l3e_set_us_egress() and no rule carried a
+	 * sid.  The chain-resolved session stands in as the ARMED value (never as
+	 * the RULE value: on the DS leg that would be UNEXPECTED_PUSH), which is
+	 * what lets the DS leg answer "this WAN IS PPPoE" - the only way it can
+	 * know.  The predicate itself is unchanged, so its host test stays valid:
+	 * it was never wrong, it was starved of inputs. */
 	switch (cn_pppoe_leg_check(hw_pppoe, ds_leg, pppoe_sid,
-				   READ_ONCE(cn_l3e->data_pppoe_session))) {
+				   vlan_pppoe ? vlan_wan_sid :
+					READ_ONCE(cn_l3e->data_pppoe_session))) {
 	case CN_PPPOE_LEG_OK:
 		break;
 	case CN_PPPOE_LEG_MODE_OFF:
@@ -3058,6 +4410,18 @@ static int cn_flow_replace(struct flow_cls_offload *f, struct net_device *dev)
 				   err);
 			return -EOPNOTSUPP;
 		}
+		/* ★ The WAN's 802.1Q tag goes ON THIS ACTION - see
+		 * cn_l3e_set_us_wan_vlan() for why the DMA-AFT cannot do it for a
+		 * hardware-forwarded frame, and why the earlier exclusion of this
+		 * field was vacuous.  Unreachable unless hw_vlan_wan is on: with it
+		 * off a tagged US leg has already been refused above, so this is
+		 * the ONE variable that knob now selects on the upstream side. */
+		err = cn_l3e_set_us_wan_vlan(cn_l3e, &act, vlan_wan_vid);
+		if (err) {
+			cn_rep_dbg("refuse: WAN VLAN %u not programmable into the action (%d)\n",
+				   vlan_wan_vid, err);
+			return -EOPNOTSUPP;
+		}
 	}
 	act.ip_ttl_dec = 1;
 	if (ds_leg) {
@@ -3084,6 +4448,59 @@ static int cn_flow_replace(struct flow_cls_offload *f, struct net_device *dev)
 	 * would blackhole). */
 	if (!got_dmac_lo || !got_dmac_hi) {
 		cn_rep_dbg("refuse: no ETH-mangle next-hop DMAC (keeps SW path)\n");
+		return -EOPNOTSUPP;
+	}
+	/* ★ SUSPECTED (kernel source read, ONE tier - so it is GATED, never an
+	 * unguarded default): on a tagged PPPoE WAN the ETH mangle can carry all
+	 * zeros.  With the encap array dropped, nf resolves the next hop from a
+	 * neighbour on the ppp device, which has no header_ops, so
+	 * arp_constructor() marks it NUD_NOARP and never fills n->ha - both
+	 * got_dmac_* go TRUE holding a zero value, which the guard just above
+	 * cannot catch.  The real next hop is the access concentrator, and the
+	 * same walk already handed us its MAC.  Whether this fires at all is a
+	 * MEASUREMENT: /proc reports it as vlan_pppoe{ac_mac{us= ds_blocked=}}.
+	 *
+	 * ★★ `!ds_leg` IS A CORRECTNESS GUARD, NOT A TIDY-UP - it closes a
+	 * latent bug that the previous shape left reachable.  `vlan_pppoe` is
+	 * set in a block reachable on BOTH legs: `wenc` is filled for the DS leg
+	 * too (the META block, from the DS leg's INGRESS device), and on a
+	 * tagged PPPoE WAN that walk resolves the sid and the AC MAC just as the
+	 * US one does.  So without this term, a DS leg whose ETH mangle carried
+	 * zeros would install THE ACCESS CONCENTRATOR'S WAN-SIDE MAC AS THE LAN
+	 * NEXT HOP - a frame addressed to the far side of the PON, handed to the
+	 * switch as if it were the local client.  The AC MAC is a fact about the
+	 * UPSTREAM peer and can only ever be a US next hop; the DS next hop is a
+	 * LAN host and comes from the L2FE FDB a few lines below.
+	 *
+	 * The old exclusion was a one-tier SOURCE argument ("nf will not offer a
+	 * zero mangle downstream"), and the single aggregate counter could not
+	 * have shown it wrong: `ac_mac=32` says the substitution fired 32 times
+	 * and nothing about WHICH leg.  Now the guard makes it unreachable and
+	 * the split counter makes the claim falsifiable. */
+	if (vlan_pppoe && wenc.ac_mac_vld && is_zero_ether_addr(gw_dmac)) {
+		if (ds_leg) {
+			/* counted, refused, and LOUD: reaching here at all means
+			 * the one-tier source argument above was wrong, and the
+			 * next session must see that from /proc rather than
+			 * re-deriving it.  The flow is not damaged - the
+			 * unicast guard just below keeps it on the SW path. */
+			atomic_inc(&cn_vlan_pppoe_acmac_ds_blocked);
+			pr_warn_ratelimited("cortina-l3fe: DS leg offered a ZERO next-hop MAC on a tagged PPPoE WAN; the PPPoE peer is an UPSTREAM address and is NOT substituted downstream - this flow stays on the SW fastpath\n");
+		} else {
+			ether_addr_copy(gw_dmac, wenc.ac_mac);
+			atomic_inc(&cn_vlan_pppoe_acmac_us);
+			cn_rep_dbg("US leg: the ETH mangle carried a zero next hop; using the PPPoE peer %pM\n",
+				   gw_dmac);
+		}
+	}
+	/* ★ UNCONDITIONAL, and it is fail-closed rather than defensive: the US
+	 * leg APPENDS a STATIC L2-FDB entry for this address, so a zero or
+	 * multicast value would be a permanent corruption of the switch table
+	 * rather than a transient failure.  Provably a no-op on every path that
+	 * works today - all of them carry a unicast gateway MAC. */
+	if (!is_valid_ether_addr(gw_dmac)) {
+		cn_rep_dbg("refuse: %s leg next-hop DMAC %pM is not unicast (keeps SW path)\n",
+			   ds_leg ? "DS" : "US", gw_dmac);
 		return -EOPNOTSUPP;
 	}
 	if (!ds_leg) {
@@ -3146,6 +4563,21 @@ static int cn_flow_replace(struct flow_cls_offload *f, struct net_device *dev)
 			return -EOPNOTSUPP;
 		}
 		cn_l3e_set_ds_egress(&act, lan_ldpid);
+		/* ★ The DS leg must POP the WAN tag, and "leave the block at zero"
+		 * is NOT a pop.  vlan_vld selects the MODE, not validity: 0 is VLAN
+		 * STACKING mode, 1 is SET mode, and only in SET mode does vlan_cnt
+		 * mean "tags on the wire after the edit".  An all-zero block is
+		 * therefore stacking-mode-with-no-command, i.e. the arriving tag is
+		 * carried through to the LAN - which is what stock's own DS entries
+		 * say too, read on the vendor firmware over a tagged WAN:
+		 * vlan_vld=1, vlan_cnt=0.  That reading was previously taken as
+		 * evidence the VLAN block was unused; it is the opposite - it is
+		 * stock explicitly asking for ZERO tags on egress.
+		 * Measured 2026-08-04: with the US push in place every upstream
+		 * frame left correctly tagged (46/46 on an OLT-side capture) and
+		 * the flow still stalled, with the far end's replies arriving
+		 * tagged and never reaching the LAN client. */
+		cn_l3e_set_ds_wan_vlan(&act, vlan_wan_vid);
 		act.mac_da_idx = lut;
 		act.mac_da_idx_vld = 1;
 		cn_rep_dbg("DS next-hop DMAC %pM -> L2-FDB[%d] ldpid=%u mcgid=0x%03x, egress SMAC via L3-IF[%u]\n",
@@ -3176,7 +4608,11 @@ static int cn_flow_replace(struct flow_cls_offload *f, struct net_device *dev)
 	 * DS leg was allowed to offload, this was `!ds_leg && pppoe_sid` and
 	 * pppoe_ds_hits was 0 by construction; now both legs are ledgered, so
 	 * pppoe_installed / pppoe_us_hits / pppoe_ds_hits describe the whole flow. */
-	entry->pppoe = pppoe_sid ||
+	/* ★ vlan_pppoe is ORed in for an ORDERING hazard, not for tidiness: on a
+	 * tagged WAN the shadow is never armed, so a DS entry would read
+	 * entry->pppoe = false and pppoe_ds_hits could never count - a phantom
+	 * FAIL on a perfectly offloaded flow. */
+	entry->pppoe = pppoe_sid || vlan_pppoe ||
 		       (ds_leg && READ_ONCE(cn_l3e->data_pppoe_session));
 	entry->probe = ds_leg ? hw_ds_probe : 0;
 
@@ -3205,12 +4641,126 @@ static int cn_flow_replace(struct flow_cls_offload *f, struct net_device *dev)
 		goto free;
 	}
 
+	/* ★★ READ THE ENTRY BACK OUT OF THE TABLE, BY LITERAL BIT NUMBER.
+	 *
+	 * The whole defect this repairs is that an entry with the WRONG VLAN
+	 * block installs perfectly happily, so "the flow installed" proves
+	 * nothing at all.  cn_fib_field() reads the bytes the engine will read,
+	 * at the offsets the live stock oracle solved for - never through the
+	 * struct that wrote them.
+	 *
+	 * A MISMATCH REMOVES THE ENTRY rather than merely logging it: a
+	 * half-described edit left live is worse than the software path it
+	 * replaced, and this is the one place that can still tell the
+	 * difference. */
+	if (vlan_wan_vid) {
+		const void *raw = cn_l3e->fib_tbl +
+				  (size_t)entry->hash_idx * CN_L3E_FIB_BYTES;
+		u64 rb_vid = cn_fib_field(raw, 145, 12);
+		u64 rb_tpid = cn_fib_field(raw, 157, 3);
+		u64 rb_cnt = cn_fib_field(raw, 160, 2);
+		u64 rb_vld = cn_fib_field(raw, 162, 1);
+
+		if (rb_vld != 1 ||
+		    rb_vid != (u64)(ds_leg ? 0 : vlan_wan_vid) ||
+		    rb_cnt != (u64)(ds_leg ? 0 : 1) ||
+		    (!ds_leg && rb_tpid == 0)) {
+			atomic_inc(&cn_vlan_pppoe_readback);
+			pr_err_ratelimited("cortina-l3fe: %s idx=%u VLAN READBACK MISMATCH: asked vid=%u, entry holds vid=%llu cnt=%llu vld=%llu tpid_enc=%llu - entry REMOVED, flow stays on the SW fastpath\n",
+					   ds_leg ? "DS" : "US", entry->hash_idx,
+					   vlan_wan_vid, rb_vid, rb_cnt, rb_vld,
+					   rb_tpid);
+			cn_l3e_flow_del(cn_l3e, entry->hash_idx, entry->crc16);
+			err = -EOPNOTSUPP;
+			goto free;
+		}
+	}
+
+	/* The hardware WAN VLAN edit, last: the flow is in HW and `entry` exists,
+	 * so a failure here has exactly one unwind path (the same one the
+	 * rhashtable failure uses) and can never leak a DMA-AFT reference.
+	 * Untagged flows never enter this - vlan_wan_vid is 0 for them, which is
+	 * how the certified untagged rows are bounded away from this change. */
+	if (vlan_wan_vid && !vlan_pppoe) {
+		/* ★★ A PPPoE tagged flow is kept OUT of the DMA-AFT.  THE REASON
+		 * THIS COMMENT USED TO GIVE - "structurally inert for a
+		 * hardware-forwarded frame" - IS NOT ESTABLISHED, and the code is
+		 * left as it is on a DIFFERENT and narrower argument.  Corrected
+		 * 2026-08-05 against the stock oracle captured the same day, so
+		 * the next session reads what was measured rather than what was
+		 * inferred.
+		 *
+		 * WHAT THE STOCK ORACLE ACTUALLY SAYS (tier 1, stock's own
+		 * decoders read live on a tagged-PPPoE WAN, VID 46, persisted at
+		 * results/stock_firmware/RTL9607F/HSGQ/X400AXF/l3fe_action_oracle/
+		 * 2026-08-05_vendor_decoder.json):
+		 *   - stock ARMS this engine on exactly this path.  Its per-flow
+		 *     record (/proc/fc/sw_dump/flow) carries dma_aft{En=1
+		 *     FibIdx=18 MapIdx=4} on the US flow and {En=1 FibIdx=19
+		 *     MapIdx=5} on the DS flow, with forceDisDmaAft=0.  So the
+		 *     entry is bound to the FLOW, not merely left armed globally.
+		 *   - stock's action 18 carries the VLAN block AND the PPPoE push
+		 *     in ONE entry (top_vid=46 vlan_cnt=1 vlan_vld=1
+		 *     top_tpid_enc=1, pppoe_cmd=1 push, session=1).  OURS carries
+		 *     the VLAN block only - cn_aft_fib_program() leaves pppoe_*
+		 *     at 0.  We would not be arming stock's entry.
+		 *
+		 * WHAT IS *NOT* REFUTED, contrary to the note inside that
+		 * artifact ("the map keys are lspid 0x10/0x11, not CPU lspids"):
+		 * 0x10 and 0x11 ARE the CPU lspids.  cortina-ni-regs.h has
+		 * CA_NI_LPORT_CPU_0 = 0x10 through CPU_7 = 0x17 and
+		 * CA_DMA_LSO_LSPID_CPU0 = 0x10, and CA_DMA_AFT_MAP_LSPID is a
+		 * 4-bit field documented "lspid - CPU0", so it cannot even encode
+		 * a non-CPU lspid.  Stock's 0x10/0x11 are the same two ports
+		 * cn_aft_install() programs as map bias 0 and 1.  The map-key half
+		 * of the old premise therefore stands; it was the conclusion drawn
+		 * from it that outran the evidence.
+		 *
+		 * WHAT REMAINS UNSETTLED, plainly: whether a hardware-forwarded
+		 * frame reaches this engine at all.  The per-flow FibIdx and the
+		 * lspid-keyed MAP are two selection paths and we have not shown
+		 * which one performs stock's wire edit.  Our own 2026-08-04
+		 * capture points one way (with the DMA-AFT armed and no hit-action
+		 * push, our offloaded frames left UNTAGGED) but that is OUR
+		 * driver, not stock's, and the "armed by a TX-descriptor field"
+		 * half was only ever a source reading.  Do not cite this block as
+		 * proof that the engine cannot matter here.
+		 *
+		 * WHY THE SKIP STAYS ANYWAY, and it does not depend on any of the
+		 * above: on a PPPoE WAN the CPU lspids carry the ONU's OWN PPP
+		 * control traffic, which the pppoe and 8021q layers have already
+		 * encapsulated in software.  Arming a VLAN-only entry there means
+		 * arming an edit stock does not arm, on the path whose loss drops
+		 * the session (LCP echo every ~20 s, three missed = down); the
+		 * 2026-08-04 positive control is precisely that collateral - this
+		 * engine, mis-scoped, tagged the ONU's own CPU traffic and took
+		 * the management path down.  Skipping is the fail-closed choice
+		 * and it is the one that was MEASURED: dma_aft push=0 strip=0 on
+		 * every tagged-PPPoE flow, 192/192 frames on the OLT-facing
+		 * capture carrying vlan 46 outside PPPoE ses 0x1, and the session
+		 * held.  Changing it needs a measured A/B against a stock-SHAPED
+		 * entry (one that carries pppoe_cmd/session as stock's does), not
+		 * a comment.  Tagged IPoE keeps calling it, byte-identically. */
+		err = cn_aft_install(cn_l3e, &entry->aft, vlan_wan_vid, ds_leg);
+		if (err) {
+			/* every arm already logged loudly and bumped its own
+			 * counter; keep the refusal ledger consistent so
+			 * /proc still reports this flow as VLAN-refused */
+			cn_vlan_wan_account(ds_leg, vlan_wan_vid,
+					    CN_VLAN_WAN_DIRECT);
+			cn_l3e_flow_del(cn_l3e, entry->hash_idx, entry->crc16);
+			err = -EOPNOTSUPP;
+			goto free;
+		}
+	}
+
 	err = rhashtable_insert_fast(&cn_flow_table, &entry->node,
 				     cn_flow_ht_params);
 	if (err) {
 		pr_err_ratelimited("cn_flow_replace: rhashtable insert FAILED (%d) - undoing idx=%u\n",
 				   err, entry->hash_idx);
 		cn_l3e_flow_del(cn_l3e, entry->hash_idx, entry->crc16);
+		cn_aft_release(cn_l3e, &entry->aft);
 		goto free;
 	}
 
@@ -3250,6 +4800,7 @@ static int cn_flow_destroy(struct flow_cls_offload *f)
 	cn_l3e->entry_by_idx[entry->hash_idx] = NULL;
 	cn_l3e->bucket_occ[entry->hash_idx / CN_L3E_AGE_SLOTS]--;
 	cn_l3e_flow_del(cn_l3e, entry->hash_idx, entry->crc16);
+	cn_aft_release(cn_l3e, &entry->aft);
 	rhashtable_remove_fast(&cn_flow_table, &entry->node,
 			       cn_flow_ht_params);
 	if (entry->ds)
@@ -3287,6 +4838,10 @@ static void cn_l3e_flush_auto_flows(struct cn_l3e *l3e)
 		l3e->entry_by_idx[idx] = NULL;
 		l3e->bucket_occ[idx / CN_L3E_AGE_SLOTS]--;
 		cn_l3e_flow_del(l3e, idx, e->crc16);
+		/* the third and last place an entry is freed - without this the
+		 * flow's DMA-AFT reference leaks, and a PPPoE session change on
+		 * a tagged WAN would exhaust the 64-entry fib table */
+		cn_aft_release(l3e, &e->aft);
 		rhashtable_remove_fast(&cn_flow_table, &e->node,
 				       cn_flow_ht_params);
 		if (e->ds)
@@ -3964,6 +5519,7 @@ static u32 cn_l3e_proc_parse_ip(const char *s)
 static int cn_l3e_proc_show(struct seq_file *m, void *v)
 {
 	struct cn_l3e *l3e = cn_l3e;
+	unsigned long flags;
 	u32 cache_cnt;
 	int i;
 
@@ -3993,6 +5549,128 @@ static int cn_l3e_proc_show(struct seq_file *m, void *v)
 		   atomic_read(&cn_flow_refused_dup),
 		   atomic_read(&cn_flow_refused_err),
 		   atomic_read(&cn_flow_refused_last));
+	/* ★ the VLAN-WAN breakdown of `unsupp`, so THIS branch is one read away
+	 * from the nine other reasons a flow can be refused as unsupported.  It
+	 * is a SUBSET of unsupp, never an extra total.  Non-zero here means the
+	 * WAN is on a VLAN sub-interface (e.g. gpon0.46): the hit-action pushes
+	 * no 802.1Q tag, so an offloaded frame would leave the PON untagged and
+	 * be dropped by the far end.  The flow is deliberately left on the SW
+	 * fastpath instead - slower, but it crosses.  us/ds name the LEG, and the
+	 * WAN-side netdev of that leg is what was tested (egress on US, ingress
+	 * on DS); last_vid is the last VLAN id seen, -1 = never fired.
+	 * ★ THE CAUSE BREAKDOWN NAMES WHICH ARM FIRED, so nobody has to guess:
+	 *   direct     the WAN netdev IS the 802.1Q upper  -> IPoE on gpon0.46
+	 *   under_encap an 802.1Q layer sits UNDER an encapsulation, found by
+	 *              dev_fill_forward_path -> PPPoE on gpon0.46.  This one also
+	 *              means the rule reached us with NO PPPoE push (the same
+	 *              discarded dev-path walk drops both encaps), so without the
+	 *              refusal the entry would have been installed as plain IPoE -
+	 *              no session header AND no tag.
+	 *   action     the rule carried an explicit FLOW_ACTION_VLAN_PUSH/POP,
+	 *              i.e. the walk DID survive because the sub-interface's lower
+	 *              device is itself a flowtable device.
+	 * direct+under_encap+action == refused_us+refused_ds, always. */
+	seq_printf(m,
+		   "vlan_wan: refused_us=%d refused_ds=%d last_vid=%d cause{direct=%d under_encap=%d action=%d} [subset of unsupp; non-zero = the WAN carries an 802.1Q layer, HW pushes no tag, flow kept on the SW fastpath]\n",
+		   atomic_read(&cn_vlan_wan_refused_us),
+		   atomic_read(&cn_vlan_wan_refused_ds),
+		   atomic_read(&cn_vlan_wan_last_vid),
+		   atomic_read(&cn_vlan_wan_direct),
+		   atomic_read(&cn_vlan_wan_under),
+		   atomic_read(&cn_vlan_wan_action));
+	/* ★ The tagged-PPPoE ledger.  `ok` counts legs whose vid, TPID, session
+	 * id AND peer MAC all resolved, i.e. legs that were PROGRAMMED with both
+	 * encapsulations; every other counter is a named DECLINE, so a leg that
+	 * quietly fell back to software can never look like one nobody offered.
+	 * `readback` is the one that must stay 0: a non-zero value means an entry
+	 * was installed and its VLAN block did NOT read back as asked, so it was
+	 * removed - which is a defect of ours, not a policy.
+	 * `ac_mac` is SPLIT PER LEG on purpose: `us` counts the substitution that
+	 * was APPLIED, `ds_blocked` counts a DS leg that reached the same three
+	 * conditions and was REFUSED it.  ds_blocked is therefore a real reading,
+	 * not a constant - 0 says the case never arose downstream, >0 says it did
+	 * and the AC's upstream MAC was kept out of the LAN next hop. */
+	seq_printf(m,
+		   "vlan_pppoe: hw_vlan_pppoe=%d ok=%d declined{no_sid=%d no_mac=%d bad_tpid=%d mismatch=%d} ac_mac{us=%d ds_blocked=%d} readback_fail=%d [ok>0 = tag AND session programmed on one action; readback_fail MUST be 0; ac_mac ds_blocked MUST be 0 or the DS leg was offered a zero next hop]\n",
+		   hw_vlan_pppoe ? 1 : 0,
+		   atomic_read(&cn_vlan_pppoe_ok),
+		   atomic_read(&cn_vlan_pppoe_no_sid),
+		   atomic_read(&cn_vlan_pppoe_no_mac),
+		   atomic_read(&cn_vlan_pppoe_badtpid),
+		   atomic_read(&cn_vlan_pppoe_mismatch),
+		   atomic_read(&cn_vlan_pppoe_acmac_us),
+		   atomic_read(&cn_vlan_pppoe_acmac_ds_blocked),
+		   atomic_read(&cn_vlan_pppoe_readback));
+	/* ★ THE ANCHOR that defeats the shared-wrong-offset trap: the driver's
+	 * own pointer against the base the ENGINE was given.  If these two
+	 * disagree, every readback above is of the wrong memory - and the
+	 * external oracle (l3fe_fib_oracle.py) reads the engine's registers, so
+	 * the two instruments can be compared in one reading. */
+	seq_printf(m,
+		   "fib_anchor: drv_pa=%pad entry_bytes=%u [must equal the engine's L3FE_HS_BA_MA0/MA1, which l3fe_fib_oracle.py reads independently]\n",
+		   &l3e->fib_tbl_pa, (unsigned int)CN_L3E_FIB_BYTES);
+	/* The DMA-AFT ledger: which arm fired for a tagged WAN.  push+strip are
+	 * legs whose VLAN edit IS in hardware; every other counter is a REFUSAL
+	 * with a named cause, because a tagged flow that silently fell back to
+	 * software is indistinguishable from one that was never tried.
+	 * ★ no_tpid is the fail-closed trap: the hardware compares the tag's
+	 * TPID against 4 slots and silently drops the whole edit on no match,
+	 * so a non-zero here means "correctly programmed and doing nothing". */
+	seq_printf(m,
+		   "dma_aft: push=%u strip=%u reuse=%u tpid_armed=%u refused{no_tpid=%u full=%u timeout=%u} hw_vlan_wan=%d [push/strip>0 = the WAN VLAN is edited in HW; all-zero on an untagged WAN is EXPECTED, not a fault]\n",
+		   l3e->aft_push, l3e->aft_strip, l3e->aft_reuse,
+		   l3e->aft_tpid_armed,
+		   l3e->aft_no_tpid, l3e->aft_full, l3e->aft_timeout,
+		   hw_vlan_wan);
+	if (l3e->dma_base) {
+		u32 t01 = readl(l3e->ne_base + CA_NI_L3FE_PP_TPID01);
+		u32 t23 = readl(l3e->ne_base + CA_NI_L3FE_PP_TPID23);
+		u32 tc = readl(l3e->ne_base + CA_NI_L3FE_PP_TPID_CTRL);
+		u32 a01 = readl(l3e->dma_base + CA_DMA_AFT_TPID01);
+		u32 a23 = readl(l3e->dma_base + CA_DMA_AFT_TPID23);
+		u64 used;
+		int k;
+
+		/* ★ the fail-closed gate: stock ABORTS action generation when the
+		 * WAN tag's TPID is absent here or its enable bit is clear, so a
+		 * tagged flow falls back to software with everything else correct.
+		 * 0x8100 must appear AND its slot bit must be set in top_mask. */
+		seq_printf(m,
+			   "l3fe_pp_tpid: slots{%04x %04x %04x %04x} ctrl=0x%02x top_mask=0x%x inner_mask=0x%x | dma_aft_tpid: slots{%04x %04x %04x %04x} [0x8100 must be present AND enabled or action-gen ABORTS and the flow goes to SW]\n",
+			   t01 & 0xffff, t01 >> 16, t23 & 0xffff, t23 >> 16,
+			   tc & 0xff,
+			   (u32)FIELD_GET(CA_NI_L3FE_PP_TPID_TOP_MASK, tc),
+			   (u32)FIELD_GET(CA_NI_L3FE_PP_TPID_INNER_MASK, tc),
+			   a01 & 0xffff, a01 >> 16, a23 & 0xffff, a23 >> 16);
+
+		spin_lock_irqsave(&l3e->aft_lock, flags);
+		used = l3e->aft_fib_used;
+		spin_unlock_irqrestore(&l3e->aft_lock, flags);
+		for (k = CA_DMA_AFT_FIB_DYN_FIRST; k < CA_DMA_AFT_FIB_COUNT; k++) {
+			u32 d0 = 0, d1 = 0, d2 = 0;
+
+			if (!(used & BIT_ULL(k)))
+				continue;
+			if (cn_aft_fib_read(l3e, k, &d0, &d1, &d2)) {
+				seq_printf(m, "  fib[%02d]: READ-BACK FAILED\n", k);
+				continue;
+			}
+			/* shadow = what we asked for, hw = what the table holds.
+			 * They must agree; a divergence is the finding. */
+			seq_printf(m,
+				   "  fib[%02d]: shadow{vid=%u cnt=%u ref=%u} hw{set_mode=%lu cnt=%lu vid=%lu tpid_slot_p1=%lu} raw{%08x %08x %08x} -> %s\n",
+				   k, l3e->aft_fib_vid[k], l3e->aft_fib_cnt[k],
+				   l3e->aft_fib_ref[k],
+				   FIELD_GET(CA_DMA_AFT_D2_VLAN_SET_MODE, d2),
+				   FIELD_GET(CA_DMA_AFT_D2_EGRESS_TAG_CNT, d2),
+				   FIELD_GET(CA_DMA_AFT_D1_TOP_VID, d1),
+				   FIELD_GET(CA_DMA_AFT_D2_TOP_TPID_SLOT_P1, d2),
+				   d0, d1, d2,
+				   FIELD_GET(CA_DMA_AFT_D2_EGRESS_TAG_CNT, d2) ?
+				   "PUSH (the US leg: this carries the WAN VLAN)" :
+				   "STRIP (the DS leg: vid is legitimately 0 here)");
+		}
+	}
 	/* DS (WAN->LAN) leg: hw_ds = the gate, ds_flows = reply legs actually
 	 * installed (a subset of auto_flows), ds_ldpid = the LAN egress port the
 	 * last accepted DS install resolved from the client's L2FE FDB entry
@@ -4185,6 +5863,21 @@ static int cn_l3e_proc_show(struct seq_file *m, void *v)
 					e->hits++;
 					atomic_inc(e->ds ? &cn_l3e_ds_hits :
 							   &cn_l3e_us_hits);
+					/* ★ THE SAME ATTRIBUTION THE 5 s SWEEP
+					 * DOES.  Without it this reader CONSUMES
+					 * age re-arms and drops the PPPoE half on
+					 * the floor - and monitor.py and
+					 * bench_matrix both poll this file, so a
+					 * perfectly offloaded PPPoE flow could
+					 * show pppoe_us_hits/pppoe_ds_hits flat
+					 * and FAIL a case for it.  A phantom FAIL
+					 * hides better than a phantom pass,
+					 * because it looks like the guard
+					 * working. */
+					if (e->pppoe)
+						atomic_inc(e->ds ?
+							&cn_pppoe_ds_hits :
+							&cn_pppoe_us_hits);
 					if (e->ds)
 						ds_now++;
 					else
@@ -4657,7 +6350,14 @@ int cortina_ni_flowoffload_probe(struct cortina_ni *ni)
 		return -ENOMEM;
 	l3e->dev = ni->dev;
 	l3e->ne_base = ne;
+	/* the DMA window is already mapped for the TX ring; the DMA-AFT VLAN
+	 * edit tables live in the same 4K page, so there is nothing to map. */
+	l3e->dma_base = ni->win[CA_NI_WIN_DMA];
+	if (!l3e->dma_base)
+		dev_warn(ni->dev,
+			 "DMA window absent - the hardware WAN VLAN edit is unavailable; a tagged WAN will stay on the software fastpath\n");
 	spin_lock_init(&l3e->reg_lock);
+	spin_lock_init(&l3e->aft_lock);
 
 	/* router MAC for the my-MAC FIELD-CAM commit (same source + fallback
 	 * as the RX steer init); WAN MAC is derived as base+1 in the enable */

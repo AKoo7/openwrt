@@ -1,7 +1,7 @@
 #!/bin/sh /etc/rc.common
 # SPDX-License-Identifier: GPL-2.0-only
 #
-# X411AXF / RTL9607F "Elnath": hand the GPON driver THIS board's serial number.
+# X400AXF / RTL9607F "Elnath": hand the GPON driver THIS board's serial number.
 #
 # The serial number is the ONU's identity on the PON - the OLT keys ranging,
 # authentication and the whole service profile on it - so it must be read from

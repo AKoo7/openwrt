@@ -41,6 +41,11 @@ struct cortina_ni_txq {
 		 * reclaim.  With skb set: 1 = PON WAN data skb (TX stats
 		 * counted on the WAN netdev at enqueue, not on eth0). */
 		u8		pon;
+		/* 1 = an extra copy of a FLOODED eth0 frame: it points at the
+		 * mapping owned by the LAST descriptor of the same burst, so
+		 * there is nothing here to unmap or free.  Fits in the struct's
+		 * existing tail padding - no extra memory. */
+		u8		dup;
 	} slot[CA_NI_TX_RING_SIZE];
 	/* spy counters (project rule: dump/probe capability is first-class) */
 	u64		enq;
@@ -59,6 +64,18 @@ struct cortina_ni_tx {
 	u64			drop_oversize;
 	u64			tx_busy;
 	u32			last_word1;	/* last descriptor word1 (spy) */
+
+	/* CPU->LAN egress port binding (cortina-ni-tx.c): DA -> RJ45, learned
+	 * from the ingress port of received frames.  One bucket = one atomically
+	 * published u64 {mac[47:0], port[50:48], valid[51]}, so the RX learn path
+	 * and the TX lookup need no lock.  512 bytes total. */
+	u64			lan_fdb[64];
+	u32			lan_link;	/* RJ45s with a PHY link, bit = port */
+	u64			lan_hit;	/* frames sent to a learned port */
+	u64			lan_flood;	/* frames flooded (BC/MC/unknown) */
+	u64			lan_dup;	/* extra descriptors a flood cost */
+	u64			lan_learn;	/* DA bindings installed/changed */
+	u64			lan_flush;	/* table flushes (link set changed) */
 
 	/* US PON control-frame (OMCI) TX: coherent scratch of
 	 * CA_NI_PON_TX_SLOTS slots, each {16B DMA-LSO header block @0,
@@ -346,6 +363,18 @@ netdev_tx_t cortina_ni_pon_data_tx(struct sk_buff *skb,
 
 int cortina_ni_tx_probe(struct cortina_ni *ni);
 int cortina_ni_rx_probe(struct cortina_ni *ni);
+
+/*
+ * CPU->LAN egress port binding (cortina-ni-tx.c), driven from the RX side:
+ *  - _learn(): one call per delivered LAN frame - bind @sa to the RJ45 it came
+ *    in on.  @lspid is HEADER_A.lspid, which for a LAN frame is the ingress NI
+ *    port (the same field the vendor RX demux uses to pick its per-port netdev).
+ *  - _link_set(): publish the set of RJ45s that currently have a PHY link, from
+ *    the 1 Hz poll (the only context that may take the MDIO mutex).  A change of
+ *    the set flushes every binding.
+ */
+void cortina_ni_lan_tx_learn(struct cortina_ni *ni, const u8 *sa, u32 lspid);
+void cortina_ni_lan_tx_link_set(struct cortina_ni *ni, u32 link);
 
 /*
  * Program a static L2FE FDB entry {mac -> ldpid} and return its 13-bit entry

@@ -4,7 +4,7 @@
  * for the Realtek RTL9607F "Elnath" GPON ONU SoC (Cortina CA8277C "TAURUS").
  *
  * Small PIO engine, one 0x50-byte register window ("qspi-base", on the
- * X411AXF at 0x4_F4324000), no interrupts, no clock gate to manage (the
+ * X400AXF at 0x4_F4324000), no interrupts, no clock gate to manage (the
  * block is always clocked; the boot ROM/U-Boot load from it).  Serves the
  * board's SPI-NAND (Fudan FM25S01A on this board — supported by the
  * mainline SPI-NAND core) through the generic "spi-nand" child node.

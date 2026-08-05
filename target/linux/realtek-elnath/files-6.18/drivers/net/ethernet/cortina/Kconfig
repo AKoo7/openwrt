@@ -62,6 +62,7 @@ config CORTINA_GPON
 	depends on OF
 	depends on HAS_IOMEM
 	select CRC32
+	select GPON_CORE	# shared core: drivers/net/gpon/Kconfig
 	help
 	  This driver supports the Cortina-Access GPON MAC (CA8277C class)
 	  found in the Realtek RTL9607F "Elnath" GPON ONU SoC: the PON-MAC

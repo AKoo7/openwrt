@@ -288,9 +288,9 @@ CONFIG_RTW89_8192XBE=y
 # LED pad (MAC GPIO 8) rather than a SoC GPIO, so they cannot be gpio-leds DT
 # children like the other ten -- rtw89 has to register them itself.  The prefix
 # makes the sysfs names line up with the DT-provided ones:
-# x411axf:green:2.4g and x411axf:green:5g.
+# x400axf:green:2.4g and x400axf:green:5g.
 CONFIG_RTW89_LEDS=y
-CONFIG_RTW89_LED_NAME_PREFIX="x411axf"
+CONFIG_RTW89_LED_NAME_PREFIX="x400axf"
 CONFIG_RTW89_DEBUGMSG=y
 CONFIG_RTW89_DEBUG=y
 CONFIG_RTW89_DEBUGFS=y

@@ -398,7 +398,7 @@ static int rtw8852c_pwr_off_func(struct rtw89_dev *rtwdev)
 
 /* RFE type used when the efuse RFE field is unprogrammed (0xff).
  *
- * On the RTL9607F "Elnath" ONU (X411AXF) the RTW8852CE module ships with a
+ * On the RTL9607F "Elnath" ONU (X400AXF) the RTW8852CE module ships with a
  * blank WiFi efuse: rfe_type reads 0xff, which matches no headline in the
  * 8852C radio A/B register tables, so rtw89_phy_init_reg() bails out with
  * "invalid PHY package: 255/x" and the RF frontend is never programmed --

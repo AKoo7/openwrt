@@ -20,7 +20,7 @@
  * Clean-room re-expression of the shipped stock ca-ne.ko (aal-07f) register
  * sequences + the Cortina aal HAL semantics.  No vendor source text reproduced.
  * Facts, bit layouts and Ghidra citations:
- *   dev/x411axf/HW_FLOW_OFFLOAD_AGING_GC.md
+ *   dev/x400axf/HW_FLOW_OFFLOAD_AGING_GC.md
  *
  * ★ Elnath-specific: the main-hash age is 2-BIT (0..3), START=2, STATIC=3 —
  *   NOT the 3-bit/START=6 model in the aal-77c HAL header.  Proven by the

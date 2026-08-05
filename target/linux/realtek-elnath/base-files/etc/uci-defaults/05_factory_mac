@@ -1,5 +1,5 @@
 #!/bin/sh
-# X411AXF / RTL9607F "Elnath": pin the per-board FACTORY MAC on the netdevs.
+# X400AXF / RTL9607F "Elnath": pin the per-board FACTORY MAC on the netdevs.
 #
 # Provisioning source (the same one stock uses; live-verified 2026-07-16):
 # the hardware-settings XML in the stock config UBI volume -

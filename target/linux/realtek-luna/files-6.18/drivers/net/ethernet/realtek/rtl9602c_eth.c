@@ -1,5 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
+ * TIER: CHIP — hardware shell for exactly ONE part: registers, DMA,
+ * interrupts, board glue.  It DOES; the core DECIDES.  GPON protocol
+ * logic belongs in the core tier (drivers/net/gpon), never here.
+ * Role: RTL9602C Ethernet/NIC shell.
+ *
+ * Canonical tier rule, the file map and the guard name live in ONE place:
+ * see "THE THREE TIERS" in gpon-common/files-6.18/drivers/net/gpon/gpon_common.h.
+ */
+/*
  * Ethernet driver for the Realtek RTL9602C (RLX) GPON SoC.
  *
  * Independent implementation from the SoC's register interface and the
@@ -1101,6 +1110,15 @@ static int rtl9602c_eth_refill(struct rtl9602c_eth *ep, unsigned int idx)
 #define RTL8_4_TAG_LEN		8			/* software rtl8_4 0x8899 cpu-tag (also used by the LAN xmit below) */
 
 /*
+ * LAYER BOUNDARY (2026-08-05): the MIC and the baseline trailer are G.988
+ * message facts, so their common home is omci_set_mic() / omci_finalize() in
+ * gpon-common .../drivers/net/gpon/gpon_omci_core.c.  They did NOT move: that
+ * one computes crc32_be (AAL5, G.984.4) where this one computes crc32_le
+ * (reflected zlib), which changes bytes 44..47 of EVERY OMCI message this ONU
+ * emits.  Divergence 1 (follow-up F3) of the nine listed in the responder
+ * boundary block further down — search "IT DID NOT MOVE".
+ */
+/*
  * GUARD: OMCI MIC (bytes 44..47) — MUST be correct or the OLT silently drops
  * every response. The OLT validates the CRC-32 MIC on every OMCI baseline
  * message; a zero or wrong MIC = silent drop -> the OLT never sees our
@@ -1685,6 +1703,87 @@ void rtl9602c_eth_omci_selftest(void)
 }
 EXPORT_SYMBOL(rtl9602c_eth_omci_selftest);
 
+/*
+ * ============================================================================
+ * OMCI (ITU-T G.988) BASELINE RESPONDER — LUNA'S OWN COPY.  IT DID NOT MOVE.
+ * ============================================================================
+ *
+ * WHAT THIS IS, AND WHY IT IS STILL SITTING IN AN ETHERNET DRIVER
+ *   Everything from here down to rtl9602c_eth_omci_report_oper_up() is
+ *   PROTOCOL, not hardware: the G.988 message types, the managed-entity model,
+ *   the dynamic OLT-provisioned ME store, the MIB-Upload row table and the
+ *   downstream-request to upstream-response dispatcher.  None of it touches a
+ *   register.  It lives in rtl9602c_eth.c only because the US-OMCI transmit
+ *   path (the OMCC SID, the TX descriptor steering, the ring) is here and the
+ *   responder was written next to its transmitter.  That is a layering
+ *   violation, and it is KNOWN — this block is the record of it.
+ *
+ * WHERE THE COMMON LAYER IS
+ *   target/linux/gpon-common/files-6.18/drivers/net/gpon/
+ *     gpon_omci_core.{c,h}  the G.988 MESSAGE layer (parse, dispatch, response
+ *                           build, trailer + MIC)
+ *     gpon_omci_me.{c,h}    the ME MODEL layer (attribute descriptor table,
+ *                           board identity, MIB-Upload rows, instance store)
+ *   That layer is common because G.988 is a specification, not a chip fact:
+ *   the same message rules hold on Luna (MIPS32, big-endian) and on Cortina
+ *   (ARM64, little-endian), so exactly ONE copy of them belongs in the tree.
+ *   realtek-elnath compiles it today.  realtek-luna does NOT, yet.
+ *
+ * WHY THIS CODE WAS NOT MOVED — MEASURED, NOT ASSUMED (2026-08-05)
+ *   Re-pointing this responder at the common core is NOT code motion: it
+ *   changes the octets this ONU puts on the fibre.  Both responders were
+ *   compiled on x86 and driven with the SAME 82 downstream PDUs (MIB-Reset,
+ *   MIB-Upload, a GET sweep over 18 classes x 3 masks, MIB-Upload-Next across
+ *   the row space, Create/Set/Delete including their error paths, the odd
+ *   message types, AR-clear, a non-baseline DevID, a runt, a retransmit, and
+ *   the autonomous VEIP AVC).  Result: 80 of the 82 responses DIFFER.  The
+ *   two that match are the two where both sides correctly emit nothing.
+ *
+ *   Nine independent causes, each of which ALONE breaks bit-identity:
+ *    1. MIC ALGORITHM.  This file computes crc32_le (reflected, zlib) — see
+ *       rtl9602c_omci_set_mic() above; the common core computes crc32_be
+ *       (AAL5, G.984.4).  Four different bytes at 44..47 on EVERY message,
+ *       including every message whose body is identical.  Follow-up F3.
+ *       Both firmwares provision against this OLT today and nothing yet
+ *       explains that — do not "fix" either side without an on-wire capture.
+ *    2. GET VALUE-AREA END.  rtl9602c_omci_get_fill() below fills [11,40) =
+ *       29 octets; the common core fills [11,36) = 25 and uses 36..39 for the
+ *       G.988 unsupported- and failed-attribute masks.  Follow-up F2.
+ *    3. GET RESULT CODE.  This file answers OK unless it overran the buffer;
+ *       the common core answers 0x09 ATTR_FAILED whenever the OLT asked for an
+ *       attribute the model does not know.  Measured: classes 2, 5, 7, 11,
+ *       131 and 262 all flip 0x00 to 0x09.
+ *    4. BOARD IDENTITY.  ME 257 attribute 1 reads "HSGQ-X111W" here and
+ *       "HSGQ-X400AXF" in the common ME model — a DIFFERENT PRODUCT.  The ME
+ *       model layer is per-board data by design, so Luna must supply its own
+ *       before it can share the message layer (plan item M5, not done yet).
+ *    5. CONFIG-APPLY RESULT CODES.  Create of an existing instance 0x00 to
+ *       0x07, Delete of an absent one 0x00 to 0x05, Set of an unmodelled
+ *       class 0x00 to 0x04.  This file never NAKs a config message.
+ *    6. AR-CLEAR.  With the acknowledgement-request bit clear this file still
+ *       transmits a reply; the common core applies the change and stays
+ *       silent, which is what G.988 asks for.
+ *    7. UNHANDLED MESSAGE TYPE.  This file answers 0x02 NOT_SUPPORTED; the
+ *       common core answers 0x00 with empty contents.
+ *    8. GET NEXT OPCODE.  OMCI_MT_GET_NEXT is 0x10 just below and 0x1a in the
+ *       common header — 0x10 is really the ALARM opcode, so this file answers
+ *       a real Get Next through its default arm.  Follow-up F1.  Adopting the
+ *       common header is not even a compile-clean no-op: it raises
+ *       "OMCI_MT_GET_NEXT redefined" (verified, not predicted).
+ *    9. MIB-DATA-SYNC.  This file bumps MDS on every config message; the
+ *       common core does not bump it on a rejected one.  After the same
+ *       sequence: 46 here against 44 there.
+ *
+ *   Anyone proposing the move must land F1/F2/F3, give the common ME model
+ *   Luna's board data, then re-run that differential — and a green x86
+ *   differential still only GATES a boot, it never proves the OLT accepts the
+ *   new bytes.  X111W is off the rig, so the change cannot be validated
+ *   end-to-end today, and an OMCI responder the OLT silently drops is a
+ *   churn-lock: three of this file's own guard comments below were written
+ *   after exactly that.
+ * ============================================================================
+ */
+
 /* G.988 baseline message-type action codes (low 5 bits of msg[2]). */
 #define OMCI_MT_CREATE		0x04
 #define OMCI_MT_DELETE		0x06
@@ -1743,6 +1842,18 @@ static inline void omci_put_be16(u8 *p, u16 v)
 #define OMCI_ME_TRAFFIC_SCHED	278
 #define OMCI_ME_VEIP		329
 
+/*
+ * LAYER BOUNDARY: the ME MODEL.  Its common home is omci_me_fill() in
+ * gpon-common .../drivers/net/gpon/gpon_omci_me.c, which expresses the same
+ * idea as a descriptor TABLE plus a board identity blob instead of a switch.
+ * It did NOT move, and here the blocker is not a bug on either side: the ME
+ * model is PER-BOARD DATA by design.  The common copy carries Elnath's blob
+ * ("HSGQ-X400AXF", its own software-image versions, its own ANI-G fallbacks);
+ * emitting those from an X111W would put a different product's identity on the
+ * fibre.  Sharing this layer therefore needs the board data lifted behind a
+ * per-board descriptor first (plan item M5) — it is not code motion.
+ * Divergence 4 of the nine in the responder boundary block above.
+ */
 /*
  * Instance-aware ME attribute filler — the SINGLE SOURCE of truth shared by the
  * discovery GET responder and the MIB-Upload-Next row builder, so the two
@@ -2032,6 +2143,15 @@ static struct omci_mib_row mib_rows[200];
 static u16 mib_nrows;
 
 /*
+ * LAYER BOUNDARY: the dynamic instance store.  Common home = the omci_store_*
+ * family in gpon-common .../drivers/net/gpon/gpon_omci_me.c, which keeps the
+ * same array-scan shape but hangs it off a caller-owned struct omci_onu (128
+ * entries here, OMCI_STORE_MAX there) instead of a file-scope array.  It did
+ * NOT move: the store is read by rtl9602c_omci_get_fill() and the config-apply
+ * arm below, and both of those diverge on the wire (divergences 2, 3 and 5).
+ * Moving the container alone would leave its two consumers behind.
+ */
+/*
  * Dynamic, auto-adaptive MIB store: the MEs the OLT PROVISIONS at runtime
  * (Create/Set), kept so GET and MIB-Upload reflect the ACTUAL configured MIB
  * rather than a fixed list. Without it, a GET of an OLT-created ME returns
@@ -2253,6 +2373,17 @@ static void omci_build_mib(void)
 }
 
 /*
+ * LAYER BOUNDARY: the GET response builder.  Common home = omci_get_fill() in
+ * gpon-common .../drivers/net/gpon/gpon_omci_core.c.  It did NOT move, and
+ * this is the single widest divergence: that one ends the value area at
+ * resp+36 (25 octets) and writes the G.988 unsupported- and failed-attribute
+ * masks into 36..39, then returns 0x09 ATTR_FAILED whenever the OLT asked for
+ * an attribute the model does not know; this one runs the value area to
+ * resp+40 (29 octets), leaves 36..39 as value bytes, and returns OK.  It also
+ * answers a store hit with the requested mask echoed where the common core can
+ * answer 0x05 UNKNOWN_INST.  Divergences 2 and 3 (follow-up F2).
+ */
+/*
  * Thin GET-response wrapper over omci_me_fill(): the GET reply layout is
  * result(8) + attr-mask(9,10) + values(11..39). Single source of truth with the
  * MIB-Upload, so the byte content matches for every ME.
@@ -2284,6 +2415,24 @@ static u8 rtl9602c_omci_get_fill(struct rtl9602c_eth *ep, u16 class_id,
 	return rc;
 }
 
+/*
+ * LAYER BOUNDARY: THE DISPATCHER — this is "the FSM" a reader comes looking
+ * for.  Common home = omci_onu_input() in gpon-common
+ * .../drivers/net/gpon/gpon_omci_core.c.  It did NOT move.  Same skeleton
+ * (runt guard, DevID gate, header echo, switch on the message type), but the
+ * common one additionally: suppresses the reply when the acknowledgement-
+ * request bit is clear, caches and replays a retransmitted request, counts a
+ * DevID 0x0b extended frame, NAKs a duplicate Create / an absent Delete / a
+ * Set of an unmodelled class, skips the MIB-Data-Sync bump on a rejected
+ * message, answers an unknown message type with 0x00 rather than 0x02, and
+ * zeroes MDS on MIB-Reset unconditionally where this one honours the
+ * mds_reset0 and omci_mds_seed module parameters.  Divergences 5, 6, 7 and 9.
+ *
+ * The two shells also differ in KIND, which is why the common one returns a
+ * length instead of transmitting: it decides, the caller does.  This function
+ * calls rtl9602c_eth_omci_xmit() itself at the bottom, so adopting the common
+ * core means moving the transmit decision out to the caller as well.
+ */
 /*
  * Downstream OMCI -> upstream OMCI response (M2 G.988 responder). @msg is the raw
  * baseline message (2-byte CPU prefix already stripped). Builds a 48-byte reply
@@ -2492,6 +2641,17 @@ static void rtl9602c_eth_omci_input(struct rtl9602c_eth *ep, const u8 *msg,
 	rtl9602c_eth_omci_xmit(ep, resp, sizeof(resp));	/* drop already counted */
 }
 
+/*
+ * LAYER BOUNDARY: the autonomous AVC.  Common home = omci_emit_avc() and its
+ * omci_onu_emit_veip_up_avc() wrapper in gpon-common
+ * .../drivers/net/gpon/gpon_omci_core.c — same MT 0x11, same VEIP inst 0x0601
+ * / mask 0x4000 / value 0.  It did NOT move: it shares rtl9602c_omci_finalize()
+ * with the responder, so it inherits divergence 1 (the MIC) and would change
+ * bytes 44..47 of the AVC too.  Measured in the same 82-PDU differential.
+ * The value-length clamp also differs (30 here; the common one is bounded by
+ * its own value area) — harmless for the 1-byte VEIP report, but it is a
+ * behavioural difference for any longer AVC added later.
+ */
 /*
  * Emit an autonomous OMCI Attribute-Value-Change (MT 0x11) for (class,inst): report that
  * the attribute(s) in @mask changed to @val. The OLT NEVER polls (GETs) the data-plane MEs

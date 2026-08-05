@@ -1,5 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
+ * TIER: FAMILY (prefix rtl960x_) — hardware shared by one silicon
+ * family.  Registers and bring-up sequences belong here; GPON PROTOCOL
+ * logic does NOT — that is the core tier (drivers/net/gpon).
+ * Role: RTL960x PON-MAC and SerDes bring-up (9601B/9602C/9603CVD/9607C).
+ *
+ * Canonical tier rule, the file map and the guard name live in ONE place:
+ * see "THE THREE TIERS" in gpon-common/files-6.18/drivers/net/gpon/gpon_common.h.
+ */
+/*
  * rtl960x_ponmac.c - clean-room RTL960x family GPON PON-MAC / SerDes bring-up.
  *
  * This is an ORIGINAL, data-driven reimplementation. The per-chip register
@@ -20,6 +29,98 @@
  *
  * Tested: the 9602C path on the realtek-luna board. The 9601B / 9603CVD / 9607C
  * paths are register-faithful but UNTESTED (no hardware); ready for a future board.
+ *
+ * ===================================================================== *
+ * WHERE THE GPON PROTOCOL LAYER IS - AND WHY IT IS NOT IN THIS FILE
+ * (navigation note, 2026-08-05 common-layer refactor. No code moved out of
+ *  this file; this block exists so the next reader does not go looking.)
+ *
+ * If you arrived here from the operator's brief - "rtl960x* para la familia
+ * para tener codigo comun" - this IS that file, but for the HARDWARE tier
+ * only, and it is already doing the job: one object serves two chip drivers
+ * (the Makefile links rtl960x_ponmac.o under BOTH CONFIG_RTL9602C_GPON and
+ * CONFIG_RTL9607C_GPON) and carries four chips' tables behind one
+ * enum rtl960x_chip dispatch. There is nothing to de-duplicate here.
+ *
+ * The 2026-08-05 refactor added a SECOND, HIGHER contract - the HW-decoupled
+ * GPON protocol core and its op table:
+ *     target/linux/gpon-common/files-6.18/drivers/net/gpon/gpon_common.h
+ *     struct gpon_shell_ops   (14 ops: ploam_tx, set_hw_state, set_hw_onu_id,
+ *                              set_eqd, apply_boh, analog_relock,
+ *                              aes_stage_key, aes_set_switch_time, rng,
+ *                              omcc_install, data_install, data_teardown,
+ *                              omci_tx, trace)
+ *
+ * NONE of those 14 ops is implemented here, and none can be. Measured
+ * 2026-08-05 over this file: ploam 0, gem 0, alloc 0, onu_id 0, eqd 0, aes 0,
+ * boh 0 occurrences. The 34 "OMCI" and 28 "T-CONT" hits are REGISTER NAMES
+ * and EGRESS-SCHEDULER SLOTS - the trap priority, and which physical queue
+ * the OMCC channel is steered to (C7_OMCI_FLOW / C7_OMCI_TCONT /
+ * C7_OMCI_QUEUE). This file never sees a PLOAM or OMCI message, never learns
+ * an ONU-ID, an alloc-id or a GEM port-id, and holds no FSM. It configures
+ * the pipe; it never reads what flows through it.
+ *
+ * Luna's implementation of gpon_shell_ops lives where those ops actually are,
+ * which is gpon-rtl9602c.c, plus rtl9602c_eth.c for the OMCI transmit. That
+ * is the file the Luna op-table instance belongs in - NOT this one. The
+ * implementing functions, each verified present at the line given
+ * (2026-08-05):
+ *     ploam_tx        :5041  gpon_send_cpu_ploam()
+ *     aes_stage_key   :5180  gpon_aes_stage_key()
+ *     omcc_install    :5420  gpon_install_omcc()
+ *     data_install    :5609  gpon_install_data_gem()
+ *     apply_boh       :5947  gpon_apply_boh()
+ *     set_eqd         :6017  gpon_set_eqd()
+ *     analog_relock   :6053  gpon_txpll_relock()
+ *     set_hw_state    :6068  gpon_fsm_set_state()
+ * Two entries are NOT stand-alone functions, and are listed apart so nobody
+ * goes looking for one:
+ *     :5765  gpon_install_tcont() is a helper BOTH omcc_install and
+ *            data_install call to bind their T-CONT; it is not an op itself.
+ *     :6499  aes_set_switch_time has no function - it is an inline
+ *            gpon_wr(0x3014, fc) (AES_KEY_SWITCH_TIME[29:0]) inside the
+ *            KEY_SW PLOAM handler, guarded by gpon_key_staged. Whoever wires
+ *            that op has to lift it out first; the guard must come with it.
+ *     data_teardown has no Luna implementation at all - the op is NULL here
+ *            (gpon_common.h says so; luna's stale-CAM story is a re-arm flag).
+ *
+ * TIER RELATIONSHIP, stated once so it is not re-derived:
+ *     gpon_*        protocol core - decides, no MMIO, runs on x86 too
+ *     gpon-rtl9602c.c / cortina-gpon.c   the two SHELLS - they implement
+ *                                        gpon_shell_ops and do the I/O
+ *     rtl960x_ponmac.c (this file) / the Cortina NE bring-up
+ *                                        a tier BELOW both shells: silicon
+ *                                        bring-up the shell calls at probe
+ * So this file is a PEER of the Cortina bring-up, never a base class for it,
+ * and nothing is promoted out of it. The two silicons share no register.
+ *
+ * ! DO NOT ADD a struct gpon_shell_ops instance to this file. It could only
+ *   be a table of pointers into gpon-rtl9602c.c's statics, which needs either
+ *   12 symbols un-static'd or a runtime registration - a redesign, not code
+ *   motion - and it would have no caller here. A shared-looking file with no
+ *   consumer is exactly what gpon_proto.c became (dead since 2026-06-18,
+ *   deleted by the refactor); do not build a second one.
+ * ! DO NOT merge struct rtl960x_ops (below) into gpon_shell_ops. It is a raw
+ *   REGISTER ACCESSOR {rd, wr} injected so this file needs no struct device.
+ *   It is a different contract at a different tier that happens to share the
+ *   word "ops".
+ *
+ * Two things found while verifying the above. Recorded, deliberately NOT
+ * fixed - this pass is code motion, and both are pre-existing:
+ *   N1. rtl960x_ponmac_serdes_cdr_reset() (the exported dispatcher at the
+ *       bottom of this file) has ZERO callers tree-wide. The live CDR reset
+ *       is gpon-rtl9602c.c:3153's own inline pulse under its serdes_cdr_reset
+ *       module param. Kept as-is: it is the family API for the boards not on
+ *       the bench, the same status as the untested 9601B/9603CVD tables.
+ *   N2. That CDR reset is NOT the analog_relock op, despite the similar name.
+ *       Different registers, different purpose: CDR reset pulses
+ *       SDS_ANA_COM_REG12 bit15, while analog_relock is
+ *       gpon-rtl9602c.c:6053 gpon_txpll_relock(), which toggles
+ *       SDS_ANA_COM_REG27 bit10 (CMU enable 1->0->1) and re-syncs the SerDes
+ *       word-FIFO pointer via WSDS_DIG_1D bit14. Wiring analog_relock to the
+ *       CDR reset would silently replace the cold-start TX-CMU relock this
+ *       board's ranging depends on.
+ * ===================================================================== *
  */
 
 #include "rtl960x_ponmac.h"

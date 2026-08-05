@@ -44,14 +44,15 @@
 
 #include "cortina-ni.h"
 
-/* Destination for the eth0 LAN TX path.  eth0 TX is FE-bypass direct-TX: the
+/* Fallback / revert destination for the eth0 LAN TX path, and the port whose
+ * speed+duplex adjust_link mirrors.  eth0 TX is FE-bypass direct-TX: the
  * descriptor's DEST field is an LDPID that the L2FE ARB resolves to a physical
- * egress port via the PDPID map (see cortina_ni_arb_lan_map_init).  On this rig
- * only port 3 (phy4) links; ports 0-2 are uncabled.  For LAN NI ports ldpid ==
- * physical port (identity), so DEST=3 -> physical port 3.
- * TODO(multi-port): to serve several LAN ports at once, FE-FORWARD eth0 TX
- * through the L2FE (drop MODE_DIRECT + FEBYPASS) so it forwards by DA and floods
- * broadcast, instead of this single fixed destination. */
+ * egress port via the PDPID map (see cortina_ni_arb_lan_map_init).  For LAN NI
+ * ports ldpid == physical port (identity), so DEST=3 -> physical port 3.
+ *
+ * Serving all four RJ45s no longer means a fixed DEST: the port is chosen per
+ * frame - see ca_ni_lan_tx_ports() and the lan_tx_mode parameter.  This value
+ * remains the single-port fallback (lan_tx_mode=0, or no link information). */
 #define CA_NI_TX_PORT		3
 #define CA_NI_TX_COS		0
 #define CA_NI_TX_TXQ		0
@@ -72,6 +73,157 @@ MODULE_PARM_DESC(tx_debug, "dump the first transmitted frames/descriptors");
 static int force_dest_ldpid = -1;
 module_param(force_dest_ldpid, int, 0644);
 MODULE_PARM_DESC(force_dest_ldpid, "override direct-TX DEST ldpid for the HW-forward loopback test (-1=off)");
+
+/* ------------------------------------------------------------------ */
+/* CPU -> LAN egress port selection                                    */
+/* ------------------------------------------------------------------ */
+
+/*
+ * A CPU-originated frame must leave the RJ45 the destination host is behind.
+ * The descriptor's DEST field is a LAN ldpid and the ARB map is the identity for
+ * LAN NI ports, so DEST *is* the physical port - the only question is which
+ * value to stamp.  We answer it the way the shipped firmware does: from an
+ * explicit netdev/port binding (its ca_ni_init_dev_port_mapping stamps a dest
+ * LDPID per netdev, and its RX demux is port2dev[HEADER_A.lspid]).  It registers
+ * one netdev per physical LAN port; we register one, so the binding lives here:
+ * a DA -> port table learned from HEADER_A.lspid on RX, with a flood to every
+ * LINKED port for broadcast/multicast and for a destination not yet seen.
+ *
+ * Deliberately NOT done by FE-forwarding the frame (dropping MODE_DIRECT +
+ * FEBYPASS): that needs an L2FE flood group holding LAN members and a DFT_FWD
+ * entry for the CPU source lspid.  Neither exists here (MCE_INDX[0x19] is
+ * written EMPTY, MC_FIB is never written, DFT_FWD covers lspid 0..3 only) and
+ * neither exists on stock either - and today's DFT_FWD value would redirect a
+ * CPU-sourced flood to mcgid 0x19 = L3_LAN, i.e. straight back to the CPU.
+ *
+ * Flooding to a LINKED port only: a frame stamped for a dead port sits in that
+ * port's egress MAC and consumes the shared L2TM buffer pool.
+ */
+enum {
+	CA_NI_LAN_TX_FIXED	= 0,	/* every frame -> CA_NI_TX_PORT (revert) */
+	CA_NI_LAN_TX_FLOOD	= 1,	/* every frame -> every linked port     */
+	CA_NI_LAN_TX_LEARN	= 2,	/* learned port, flood fallback         */
+};
+static int lan_tx_mode = CA_NI_LAN_TX_LEARN;
+module_param(lan_tx_mode, int, 0644);
+MODULE_PARM_DESC(lan_tx_mode,
+	"CPU->LAN egress port: 0=fixed CA_NI_TX_PORT (pre-multi-port behaviour), 1=flood every frame to all linked LAN ports (bring-up/bisect only, 4x TX cost), 2=per-DA learned port with flood fallback (default)");
+
+/* one bucket, published atomically: {mac[47:0], port[50:48], valid[51]} */
+#define CA_NI_LAN_FDB_SIZE	ARRAY_SIZE(((struct cortina_ni_tx *)0)->lan_fdb)
+#define CA_NI_LAN_FDB_MAC	GENMASK_ULL(47, 0)
+#define CA_NI_LAN_FDB_PORT	GENMASK_ULL(50, 48)
+#define CA_NI_LAN_FDB_VALID	BIT_ULL(51)
+
+/* explicit byte math: this driver must stay endianness-agnostic */
+static u64 ca_ni_mac_key(const u8 *mac)
+{
+	return ((u64)mac[0] << 40) | ((u64)mac[1] << 32) | ((u64)mac[2] << 24) |
+	       ((u64)mac[3] << 16) | ((u64)mac[4] << 8) | mac[5];
+}
+
+static unsigned int ca_ni_mac_bucket(const u8 *mac)
+{
+	return (mac[3] ^ mac[4] ^ mac[5]) & (CA_NI_LAN_FDB_SIZE - 1);
+}
+
+/*
+ * Bind @sa to the RJ45 it arrived on.  @lspid is HEADER_A.lspid.
+ *
+ * ★ The link check is the SAFETY GUARD on the one fact this rests on.  If lspid
+ * turned out NOT to be the ingress port it would read a constant (typically 0),
+ * which would bind every host to one port and kill LAN egress.  Refusing to
+ * learn a port whose PHY is down means such a value is never learned at all, so
+ * we keep flooding - which works.
+ */
+void cortina_ni_lan_tx_learn(struct cortina_ni *ni, const u8 *sa, u32 lspid)
+{
+	struct cortina_ni_tx *tx = ni->tx;
+	unsigned int b;
+	u64 ent;
+
+	if (!tx || lan_tx_mode != CA_NI_LAN_TX_LEARN)
+		return;
+	if (lspid >= CA_NI_LAN_PORT_COUNT ||
+	    !(READ_ONCE(tx->lan_link) & BIT(lspid)))
+		return;
+	if (is_multicast_ether_addr(sa) || is_zero_ether_addr(sa))
+		return;
+
+	ent = FIELD_PREP(CA_NI_LAN_FDB_MAC, ca_ni_mac_key(sa)) |
+	      FIELD_PREP(CA_NI_LAN_FDB_PORT, lspid) | CA_NI_LAN_FDB_VALID;
+	b = ca_ni_mac_bucket(sa);
+	if (READ_ONCE(tx->lan_fdb[b]) == ent)
+		return;			/* unchanged - the common case */
+	WRITE_ONCE(tx->lan_fdb[b], ent);
+	tx->lan_learn++;
+}
+
+/*
+ * Publish the set of RJ45s with a PHY link.  A change flushes every binding -
+ * which is exactly the operator's cable-move test: unplug LAN1, plug LAN2, and
+ * no stale DA->port binding may survive.
+ */
+void cortina_ni_lan_tx_link_set(struct cortina_ni *ni, u32 link)
+{
+	struct cortina_ni_tx *tx = ni->tx;
+	unsigned int i;
+
+	if (!tx || READ_ONCE(tx->lan_link) == link)
+		return;
+	dev_info(ni->dev, "lan_tx: LAN link set 0x%x -> 0x%x, flushing DA bindings\n",
+		 READ_ONCE(tx->lan_link), link);
+	WRITE_ONCE(tx->lan_link, link);
+	for (i = 0; i < CA_NI_LAN_FDB_SIZE; i++)
+		WRITE_ONCE(tx->lan_fdb[i], 0);
+	tx->lan_flush++;
+}
+
+static int ca_ni_lan_fdb_lookup(struct cortina_ni_tx *tx, const u8 *da)
+{
+	u64 ent = READ_ONCE(tx->lan_fdb[ca_ni_mac_bucket(da)]);
+
+	if (!(ent & CA_NI_LAN_FDB_VALID) ||
+	    FIELD_GET(CA_NI_LAN_FDB_MAC, ent) != ca_ni_mac_key(da))
+		return -1;
+	return FIELD_GET(CA_NI_LAN_FDB_PORT, ent);
+}
+
+/* The egress port set for one frame, as a port bitmap (never empty). */
+static u32 ca_ni_lan_tx_ports(struct cortina_ni_tx *tx, const u8 *da)
+{
+	u32 link = READ_ONCE(tx->lan_link);
+	int port;
+
+	/* Diagnostic knob still wins, but RANGE-CHECKED: the port set is a
+	 * bitmap now, and BIT() of an out-of-range value is 0 = "no port",
+	 * which would map an skb and attach it to no descriptor at all (a DMA +
+	 * skb leak, and the frame silently vanishes).  The DEST field is 4 bits
+	 * wide, so anything outside 0..15 could never have been stamped anyway. */
+	if (force_dest_ldpid >= 0) {
+		if (force_dest_ldpid < CA_NI_TX_DEST_LDPID_COUNT)
+			return BIT(force_dest_ldpid);
+		WARN_ONCE(1, "force_dest_ldpid=%d out of range 0..%d, ignored\n",
+			  force_dest_ldpid, CA_NI_TX_DEST_LDPID_COUNT - 1);
+	}
+	/* Fail-safe: fall back to the single-port behaviour whenever we have no
+	 * link information at all (the 1 Hz poll has not run yet, or MDIO
+	 * failed).  Never "no port" - that would silence the only IP management
+	 * channel to the board. */
+	if (lan_tx_mode == CA_NI_LAN_TX_FIXED || !link)
+		return BIT(CA_NI_TX_PORT);
+
+	if (lan_tx_mode == CA_NI_LAN_TX_LEARN &&
+	    !is_multicast_ether_addr(da)) {
+		port = ca_ni_lan_fdb_lookup(tx, da);
+		if (port >= 0 && (link & BIT(port))) {
+			tx->lan_hit++;
+			return BIT(port);
+		}
+	}
+	tx->lan_flood++;
+	return link;
+}
 
 /* fallback MAC when the DT carries none (locally administered) */
 static const u8 cortina_ni_default_mac[ETH_ALEN] = {
@@ -355,24 +507,38 @@ static void cortina_ni_tx_tm_init(struct cortina_ni *ni)
 		       CA_NI_L2TM_ES_VOQ_EN_ALL);
 }
 
-/* port 0 MAC: TX on (RX stays off until M2c), MAC auto-tracks the PHY */
+/* LAN port MACs: TX on for EVERY RJ45 (RX is armed by the link path), MAC
+ * auto-tracks the PHY.
+ *
+ * ★ Looped over all CA_NI_LAN_PORT_COUNT ports, not just CA_NI_TX_PORT: with a
+ * per-frame egress port the descriptor DEST can now name any LAN port, and the
+ * TX side of ports 0..2 was not enabled by anything.
+ * cortina_ni_rx_enable_internal_ports() loops p = 1..6, so port 0 had NO TXMAC
+ * tx_en at all, and GLB.PWR_DWN_TX was cleared only for CA_NI_TX_PORT - so a
+ * frame stamped for port 0/1/2 would have been handed to a powered-down egress
+ * MAC.
+ */
 static void cortina_ni_tx_port_mac_init(struct cortina_ni *ni)
 {
+	unsigned int p;
+
 	/* connect the port MAC to the internal quad-GPHY over GMII (0xa5c0):
 	 * int_cfg=GE_GMII, phy_mode=MAC, MAC-loopback OFF.  NOTE: the upper byte
 	 * 0xCB000000 seen on stock is READ-ONLY datapath-active STATUS (a forced
 	 * write of it does not stick), not writable config - so it only lights up
 	 * once the real GPHY<->MAC datapath gate is satisfied. */
-	ni_rmw(ni, CA_NI_PORT_STATIC_CFG(CA_NI_TX_PORT),
-	       CA_NI_PORT_STATIC_INT_CFG | CA_NI_PORT_STATIC_PHY_MODE |
-	       CA_NI_PORT_STATIC_LPBK_MODE, 0);
+	for (p = 0; p < CA_NI_LAN_PORT_COUNT; p++) {
+		ni_rmw(ni, CA_NI_PORT_STATIC_CFG(p),
+		       CA_NI_PORT_STATIC_INT_CFG | CA_NI_PORT_STATIC_PHY_MODE |
+		       CA_NI_PORT_STATIC_LPBK_MODE, 0);
 
-	ni_rmw(ni, CA_NI_PORT_GLB_CFG(CA_NI_TX_PORT),
-	       CA_NI_PORT_GLB_PWR_DWN_TX, 0);
+		ni_rmw(ni, CA_NI_PORT_GLB_CFG(p),
+		       CA_NI_PORT_GLB_PWR_DWN_TX, 0);
 
-	ni_rmw(ni, CA_NI_PORT_TXMAC_CFG(CA_NI_TX_PORT),
-	       CA_NI_PORT_TXMAC_TX_DRAIN,
-	       CA_NI_PORT_TXMAC_TX_EN | CA_NI_PORT_TXMAC_CRC_CALC_EN);
+		ni_rmw(ni, CA_NI_PORT_TXMAC_CFG(p),
+		       CA_NI_PORT_TXMAC_TX_DRAIN,
+		       CA_NI_PORT_TXMAC_TX_EN | CA_NI_PORT_TXMAC_CRC_CALC_EN);
+	}
 
 	/* MAC autosync OFF (=0), matching U-Boot's PROVEN-working datapath
 	 * (autosync=0x0 while tftp ran bidirectionally over this port).
@@ -569,6 +735,20 @@ static unsigned int cortina_ni_tx_reclaim_q(struct cortina_ni *ni,
 		if (!skb) {
 			u8 pon = q->slot[q->finished].pon;
 
+			if (q->slot[q->finished].dup) {
+				/* extra copy of a flooded eth0 frame: it shares
+				 * the mapping owned by the LAST descriptor of
+				 * the burst, so there is nothing to unmap or
+				 * free here.  The engine consumes the ring in
+				 * order, so the owner is always reclaimed after
+				 * every copy of its own burst. */
+				q->slot[q->finished].dup = 0;
+				q->finished = (q->finished + 1) %
+					      CA_NI_TX_RING_SIZE;
+				q->reclaimed++;
+				freed++;
+				continue;
+			}
 			if (!pon) {	/* must not happen: HW advanced past us */
 				netdev_err(ndev, "VP%u: hole at %u (rptr %u)\n",
 					   q->vp, q->finished, rptr);
@@ -648,8 +828,8 @@ static netdev_tx_t cortina_ni_start_xmit(struct sk_buff *skb,
 	struct cortina_ni_txq *q;
 	dma_addr_t daddr;
 	__le32 *desc;
-	u32 word1;
-	unsigned int len;
+	u32 word1, w = 0, ports;
+	unsigned int len, first, nports, port;
 
 	/* short frames: pad to the wire minimum (also covers the engine's
 	 * 34-byte DMA floor); skb freed by the helper on failure */
@@ -696,12 +876,27 @@ static netdev_tx_t cortina_ni_start_xmit(struct sk_buff *skb,
 	 */
 	q = &tx->txq[CA_NI_TX_ETH_RING];
 
+	/* Egress port set for this frame: one learned/fixed port, or a flood to
+	 * every linked RJ45.  Computed before the ring check because a flood
+	 * needs one descriptor per port.  This netdev is single-queue, so the
+	 * qdisc serialises us and the plain counter updates need no atomics -
+	 * the same assumption the fixed-ring choice above rests on. */
+	ports = ca_ni_lan_tx_ports(tx, skb->data);
+	/* An empty set must be impossible: it would map the skb below and then
+	 * attach it to no descriptor, leaking both and dropping the frame with
+	 * no counter moving.  ca_ni_lan_tx_ports() guarantees non-empty; this
+	 * keeps a future edit from reintroducing that silently. */
+	if (WARN_ONCE(!ports, "lan_tx: empty egress port set\n"))
+		ports = BIT(CA_NI_TX_PORT);
+	nports = hweight32(ports);
+
 	spin_lock(&q->lock);
 
 	/* opportunistic reclaim, then ring-full check (stock keeps 2 spare) */
-	if (cortina_ni_txq_free_desc(q) <= CA_NI_TX_RESERVE_DESC) {
+	if (cortina_ni_txq_free_desc(q) < CA_NI_TX_RESERVE_DESC + nports) {
 		cortina_ni_tx_reclaim_q(ni, q);
-		if (cortina_ni_txq_free_desc(q) <= CA_NI_TX_RESERVE_DESC) {
+		if (cortina_ni_txq_free_desc(q) <
+		    CA_NI_TX_RESERVE_DESC + nports) {
 			tx->tx_busy++;
 			netif_stop_queue(ndev);
 			mod_timer(&tx->reclaim_timer,
@@ -723,32 +918,50 @@ static netdev_tx_t cortina_ni_start_xmit(struct sk_buff *skb,
 	 * both DDR pools sit below 4 GB and the DMA mask enforces it */
 	WARN_ON_ONCE(upper_32_bits(daddr));
 
-	/* direct-TX-to-LAN descriptor: plain frame, no header-A (HP=11) */
+	/*
+	 * One direct-TX-to-LAN descriptor per egress port (plain frame, no
+	 * header-A, HP=11), ALL pointing at the SAME mapped buffer: the engine
+	 * only reads it, and it consumes the ring in order, so the LAST
+	 * descriptor of the burst owns the skb + the mapping and every earlier
+	 * one is marked `dup`.  A flood therefore costs extra descriptors only -
+	 * no copy, no allocation, and TX stats still count the frame once.
+	 */
 	word1 = CA_NI_TX_DESC1_HP1 | CA_NI_TX_DESC1_HP0 |
 		CA_NI_TX_DESC1_MODE_DIRECT |
 		FIELD_PREP(CA_NI_TX_DESC1_CHK_SEL, CA_NI_TX_CHK_AUTO) |
 		FIELD_PREP(CA_NI_TX_DESC1_LEN, len) |
-		FIELD_PREP(CA_NI_TX_DESC1_COS, CA_NI_TX_COS) |
-		FIELD_PREP(CA_NI_TX_DESC1_DEST,
-			   force_dest_ldpid >= 0 ? force_dest_ldpid : CA_NI_TX_PORT);
+		FIELD_PREP(CA_NI_TX_DESC1_COS, CA_NI_TX_COS);
 
-	desc = q->desc + q->wptr * CA_NI_TX_DESC_WORDS;
-	desc[0] = cpu_to_le32(lower_32_bits(daddr));
-	desc[1] = cpu_to_le32(word1);
+	first = q->wptr;
+	for (port = 0; ports; port++) {
+		bool last;
 
-	q->slot[q->wptr].skb = skb;
-	q->slot[q->wptr].addr = daddr;
-	q->slot[q->wptr].len = len;
-	q->wptr = (q->wptr + 1) % CA_NI_TX_RING_SIZE;
+		if (!(ports & BIT(port)))
+			continue;
+		ports &= ~BIT(port);
+		last = !ports;
+		w = word1 | FIELD_PREP(CA_NI_TX_DESC1_DEST, port);
+
+		desc = q->desc + q->wptr * CA_NI_TX_DESC_WORDS;
+		desc[0] = cpu_to_le32(lower_32_bits(daddr));
+		desc[1] = cpu_to_le32(w);
+
+		q->slot[q->wptr].skb = last ? skb : NULL;
+		q->slot[q->wptr].addr = last ? daddr : 0;
+		q->slot[q->wptr].len = last ? len : 0;
+		q->slot[q->wptr].dup = last ? 0 : 1;
+		q->wptr = (q->wptr + 1) % CA_NI_TX_RING_SIZE;
+		if (!last)
+			tx->lan_dup++;
+	}
 	q->enq++;
-	tx->last_word1 = word1;
+	tx->last_word1 = w;
 
 	if (unlikely(tx_debug && q->enq <= 4)) {
 		netdev_info(ndev,
-			    "TX vp%u idx %u len %u desc %08x %08x\n",
-			    q->vp, (q->wptr + CA_NI_TX_RING_SIZE - 1) %
-			    CA_NI_TX_RING_SIZE, len,
-			    lower_32_bits(daddr), word1);
+			    "TX vp%u idx %u len %u ndesc %u last-desc %08x %08x\n",
+			    q->vp, first, len, nports,
+			    lower_32_bits(daddr), w);
 		print_hex_dump(KERN_INFO, "TX frame: ", DUMP_PREFIX_OFFSET,
 			       16, 1, skb->data, min(len, 64u), false);
 	}
@@ -1213,11 +1426,40 @@ static int cortina_ni_tx_proc_show(struct seq_file *m, void *v)
 	struct cortina_ni_tx *tx = ni->tx;
 	int i;
 
-	seq_printf(m, "port%d glb=0x%08x txmac=0x%08x autosync=0x%08x\n",
-		   CA_NI_TX_PORT,
-		   readl(ni_base(ni) + CA_NI_PORT_GLB_CFG(CA_NI_TX_PORT)),
-		   readl(ni_base(ni) + CA_NI_PORT_TXMAC_CFG(CA_NI_TX_PORT)),
+	seq_printf(m, "autosync=0x%08x\n",
 		   readl(ni_base(ni) + CA_NI_HV_MAC_AUTOSYNC));
+	seq_printf(m, "lan_tx: mode=%d (0=fixed port%d 1=flood 2=learn) link=0x%x hit=%llu flood=%llu dup=%llu learn=%llu flush=%llu\n",
+		   lan_tx_mode, CA_NI_TX_PORT, READ_ONCE(tx->lan_link),
+		   tx->lan_hit, tx->lan_flood, tx->lan_dup, tx->lan_learn,
+		   tx->lan_flush);
+	/*
+	 * ★★ NO per-port TX PACKET counter is printed here, and that is a
+	 * MEASURED negative, not an omission.
+	 *
+	 * NI_HV_GLB_TXMIB (ACCESS 0xa174 / DATA0 0xa17c) looked like the only
+	 * per-PHYSICAL-port egress counter, with ids UC/MC/BC = 1/2/3 DERIVED
+	 * from the vendor table's TxStatsFrm65to127Oct = 0xf size-bin anchor.
+	 * Measured on 2026-07-29 (dev/x400axf/txmib_identify.py): across all 8
+	 * ACCESS port values and ids {0,1,2,3,0xf}, every cell moved by ZERO
+	 * while the driver transmitted 1164 CPU->LAN frames out the cabled port.
+	 * Some cells even read non-zero and STAYED there - a value that looks
+	 * like a counter and never moves is exactly the phantom witness this
+	 * project keeps losing days to, so it is NOT published.  Publishing it
+	 * would let the next session read tx_uc=0 on a WORKING port and chase a
+	 * datapath bug that is not there.
+	 *
+	 * What IS trustworthy, and is printed above: the driver's own software
+	 * lan_tx counters (hit/flood/dup/learn/flush) and the per-port MAC
+	 * config below.  For "did THIS socket egress", use a far-end capture.
+	 * To resurrect a hardware witness, re-derive the ids from stock (read
+	 * the same cells on the vendor image WHILE it transmits) - that is the
+	 * oracle step that was skipped.
+	 */
+	for (i = 0; i < CA_NI_LAN_PORT_COUNT; i++)
+		seq_printf(m, "port%d glb=0x%08x txmac=0x%08x\n",
+			   i,
+			   readl(ni_base(ni) + CA_NI_PORT_GLB_CFG(i)),
+			   readl(ni_base(ni) + CA_NI_PORT_TXMAC_CFG(i)));
 	seq_printf(m, "lso_ctrl=0x%08x ss_ctrl=0x%08x es_ctrl=0x%08x\n",
 		   readl(dma_base(ni) + CA_DMA_LSO_CTRL),
 		   readl(dma_base(ni) + CA_DMA_SS_CTRL),
@@ -1340,7 +1582,7 @@ int cortina_ni_tx_probe(struct cortina_ni *ni)
 				cortina_ni_tx_proc_show, ni);
 
 	WRITE_ONCE(cortina_ni_pon_tx_ni, ni);	/* open the PON TX entry */
-	dev_info(ni->dev, "M2b TX ready: %s -> port %d (direct-TX)\n",
-		 ndev->name, CA_NI_TX_PORT);
+	dev_info(ni->dev, "TX ready: %s -> LAN ports 0..%u (direct-TX, lan_tx_mode=%d)\n",
+		 ndev->name, CA_NI_LAN_PORT_COUNT - 1, lan_tx_mode);
 	return 0;
 }

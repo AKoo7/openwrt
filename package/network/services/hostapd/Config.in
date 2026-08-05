@@ -31,7 +31,7 @@ config WPA_WOLFSSL
 	select WOLFSSL_HAS_SESSION_TICKET
 	select WOLFSSL_HAS_WPAS
 
-# realtek-elnath (RTL9607F/X411AXF) builds its WiFi drivers INTO the kernel
+# realtek-elnath (RTL9607F/X400AXF) builds its WiFi drivers INTO the kernel
 # (rtl8192fe 2.4G + rtw89/8852ce 5G WiFi6), not as kmod-mac80211 packages, so
 # no kmod DEPENDS ever selects these promptless symbols - without them hostapd
 # is built with no VHT/HE and rejects the 5 GHz AP config ("unknown

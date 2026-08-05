@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * HSGQ X411AXF — Realtek RTL9607F "Elnath" GPON ONU.
+ * HSGQ X400AXF — Realtek RTL9607F "Elnath" GPON ONU.
  *
  * The RTL9607F is a Cortina-Access "Venus"-family SoC (dual Cortex-A55,
  * GICv3) that Realtek productized after acquiring Cortina Access. This is a
@@ -18,8 +18,8 @@
 /dts-v1/;
 
 / {
-	model = "HSGQ X411AXF (Realtek RTL9607F Elnath)";
-	compatible = "hsgq,x411axf", "realtek,rtl9607f";
+	model = "HSGQ X400AXF (Realtek RTL9607F Elnath)";
+	compatible = "hsgq,x400axf", "realtek,rtl9607f";
 	#address-cells = <0x02>;
 	#size-cells = <0x02>;
 	interrupt-parent = <&gic>;
@@ -451,7 +451,7 @@
 	 * GPIO would drive some other net).  They are not a gap any more: each pad is
 	 * the WiFi MAC's GPIO 8, and our rtw89 registers a led_classdev per radio for
 	 * it (drivers/net/wireless/realtek/rtw89/led.c, CONFIG_RTW89_LEDS), naming
-	 * them x411axf:green:2.4g and x411axf:green:5g to match the ten below.
+	 * them x400axf:green:2.4g and x400axf:green:5g to match the ten below.
 	 * mac80211's throughput trigger then holds each one on while its radio is up.
 	 * Do NOT add them to this node.
 	 *
@@ -482,7 +482,7 @@
 
 		/* LED_PWR_G — group 0 pin 6.  On for the whole time we are up. */
 		led-power {
-			label = "x411axf:green:power";
+			label = "x400axf:green:power";
 			gpios = <&gpio0 0x06 0x00>;
 			default-state = "on";
 		};
@@ -490,7 +490,7 @@
 		/* LED_PON — group 3 pin 4.  Driven by the panel daemon from the
 		 * GPON activation state (solid at O5, blinking while ranging). */
 		led-pon {
-			label = "x411axf:green:pon";
+			label = "x400axf:green:pon";
 			gpios = <&gpio3 0x04 0x00>;
 			default-state = "off";
 		};
@@ -498,7 +498,7 @@
 		/* LED_LOS — group 0 pin 11.  Daemon-driven: on ONLY while the
 		 * downstream optical signal is lost. */
 		led-los {
-			label = "x411axf:red:los";
+			label = "x400axf:red:los";
 			gpios = <&gpio0 0x0b 0x00>;
 			default-state = "off";
 		};
@@ -507,7 +507,7 @@
 		 * NET: internet/WAN reachability, daemon-driven from the WAN
 		 * interface state (PPPoE session up, or a WAN default route). */
 		led-net {
-			label = "x411axf:green:net";
+			label = "x400axf:green:net";
 			gpios = <&gpio3 0x0c 0x00>;
 			default-state = "off";
 		};
@@ -530,25 +530,25 @@
 		 * be reversed even though each LED does track its own port.
 		 */
 		led-lan1 {
-			label = "x411axf:green:lan1";	/* LED_EPHY0, port 0 */
+			label = "x400axf:green:lan1";	/* LED_EPHY0, port 0 */
 			gpios = <&gpio3 0x06 0x00>;
 			default-state = "off";
 		};
 
 		led-lan2 {
-			label = "x411axf:green:lan2";	/* LED_EPHY1, port 1 */
+			label = "x400axf:green:lan2";	/* LED_EPHY1, port 1 */
 			gpios = <&gpio3 0x03 0x00>;
 			default-state = "off";
 		};
 
 		led-lan3 {
-			label = "x411axf:green:lan3";	/* LED_EPHY2, port 2 */
+			label = "x400axf:green:lan3";	/* LED_EPHY2, port 2 */
 			gpios = <&gpio3 0x01 0x00>;
 			default-state = "off";
 		};
 
 		led-lan4 {
-			label = "x411axf:green:lan4";	/* LED_EPHY3, port 3 */
+			label = "x400axf:green:lan4";	/* LED_EPHY3, port 3 */
 			gpios = <&gpio3 0x07 0x00>;
 			default-state = "off";
 		};
@@ -556,7 +556,7 @@
 		/* LED_WPS_G — group 3 pin 0.  Declared so the pad is owned and
 		 * scriptable; we ship no WPS registrar, so nothing drives it. */
 		led-wps {
-			label = "x411axf:green:wps";
+			label = "x400axf:green:wps";
 			gpios = <&gpio3 0x00 0x00>;
 			default-state = "off";
 		};
@@ -564,7 +564,7 @@
 		/* LED_FXS — group 0 pin 12.  The panel has an FXS1 indicator, but
 		 * we drive no voice stack, so this is declared only. */
 		led-fxs1 {
-			label = "x411axf:green:fxs1";
+			label = "x400axf:green:fxs1";
 			gpios = <&gpio0 0x0c 0x00>;
 			default-state = "off";
 		};

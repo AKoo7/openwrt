@@ -9,7 +9,7 @@
  * backend).  Called once from the cortina-ni probe via
  * cortina_ni_flowoffload_probe().
  *
- * Facts + citations: dev/x411axf/HW_FLOW_OFFLOAD_L3FE_INIT.md and
+ * Facts + citations: dev/x400axf/HW_FLOW_OFFLOAD_L3FE_INIT.md and
  * HW_FLOW_OFFLOAD_DESIGN.md (clean-room RE of the stock ca-ne.ko register
  * sequences, cross-checked against the chip register map).  Every literal
  * below was additionally LIVE-VERIFIED against the stock firmware's armed
@@ -213,7 +213,7 @@
  *   - WAN side: the PON PDC stamps DS data-GEM frames with LDPID 0x18  *
  *     (L3_WAN); the map resolves 0x18 -> physical port 0x0a = the      *
  *     L3FE WAN ingress (stock live: PDPID_MAP[0x18]=0xA [0x19]=0xD,    *
- *     dev/x411axf/stock_golden_qm.txt).                                *
+ *     dev/x400axf/stock_golden_qm.txt).                                *
  *   - Inside the L3FE, STG0_LDPID_MAP (0x3404 = 0x03985907) selects    *
  *     LPB profile by HDR_A.ldpid: 0x07->prof0, 0x19->prof1,            *
  *     0x18->prof2; the LPB profile rewrites HDR_I.lspid to L3_WAN      *
@@ -379,7 +379,7 @@ int cortina_l3fe_engine_init(void __iomem *ne, const struct cn_l3e_tables *t)
 /*
  * Profile/tuple + mask-table classify config, tier-1 captured live from the
  * stock-armed engine (RTK_GW 5.10.226, 2026-07-18; the exact register dump is
- * in dev/x411axf/stock_l3fe_dump_full.txt).  Programming this makes the
+ * in dev/x400axf/stock_l3fe_dump_full.txt).  Programming this makes the
  * main-hash engine parse/key a routed packet exactly like stock: profiles 0-5
  * (INI/tuple/type-action) select mask-table entries 0-7 (the in-use masks;
  * 8-63 are uninitialised SRAM on stock too).  PF_KEY/TPL stay 0 -

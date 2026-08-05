@@ -1,5 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
+ * TIER: CHIP — hardware shell for exactly ONE part: registers, DMA,
+ * interrupts, board glue.  It DOES; the core DECIDES.  GPON protocol
+ * logic belongs in the core tier (drivers/net/gpon), never here.
+ * Role: RTL9602C GPON MAC shell.
+ *
+ * Canonical tier rule, the file map and the guard name live in ONE place:
+ * see "THE THREE TIERS" in gpon-common/files-6.18/drivers/net/gpon/gpon_common.h.
+ */
+/*
  * Realtek RTL9602C GPON MAC — foundation driver.
  *
  * Independent implementation from the SoC's register interface and the
@@ -4961,6 +4970,62 @@ static int gpon_proc_show(struct seq_file *s, void *v)
 /* FSM state exposed to /proc (defined with the FSM below). */
 
 /*
+ * ★★ THIS FSM ALSO EXISTS, VERBATIM, IN THE SHARED TREE — AND THAT IS
+ *    DELIBERATE, NOT A LEFTOVER. DO NOT DELETE EITHER COPY. (2026-08-05)
+ *
+ * The whole block below (the PLOAM message types, the serial-number parse, the
+ * upstream builders, the burst-overhead and equalization-delay computations,
+ * the state transitions, the downstream dispatch and the poll decisions) was
+ * carved into the hardware-decoupled common core at
+ *
+ *     target/linux/gpon-common/files-6.18/drivers/net/gpon/gpon_ploam.{h,c}
+ *
+ * which BOTH OpenWrt targets pull in through `FILES_DIR +=`, and which also
+ * compiles on x86 so the activation FSM can be driven by an adversarial OLT
+ * under libFuzzer+ASan+UBSan with no board in the loop — this project's PRIMARY
+ * correctness gate. That, plus the roadmap (the future ARM OLT and other ONU
+ * brands need this same engine), is why the layer is common. Measured honestly:
+ * it does NOT de-duplicate anything today, because Elnath has no software PLOAM
+ * FSM at all — its MAC runs O1->O5 and auto-ACKs in silicon.
+ *
+ * ★ THE CODE BELOW IS STILL THE ONE THAT RUNS. The shared copy is not yet
+ * wired: this driver has not been converted to call it, so the two are live
+ * original and offline reference respectively. Keep them in step — a fix here
+ * that is not mirrored there makes the offline gate lie about this driver.
+ *
+ * ★ WHY THE REWIRE DID NOT LAND WITH THE CARVE. Four items, each MEASURED
+ * 2026-08-05, not assumed. All four are somebody else's file, which is why the
+ * driver was left untouched rather than half-converted:
+ *
+ *   1. The core has no entry point for the two computations this driver needs
+ *      at __init, OUTSIDE any PLOAM dispatch: gpon_set_eqd(0) below and
+ *      gpon_apply_boh(false) below. In the core both are `static` (apply_boh,
+ *      set_eqd) and reachable only from gpon_ploam_ds(). Calling them from a
+ *      shell therefore does not compile, and re-implementing them here would
+ *      fork the very code being shared — which is exactly how the now-deleted
+ *      gpon_proto.c drifted.
+ *   2. gpon_ploam.o is `# gpon-pending` in the shared Makefile, not obj-y, so
+ *      the gpon_ploam_* symbols do not exist at link time.
+ *   3. This directory's Makefile carries no -I for drivers/net/gpon, so
+ *      #include "gpon_ploam.h" does not resolve from here.
+ *   4. gpon_ploam.c's sn_hex_nibble() does NOT reproduce this driver's
+ *      hex_to_bin() path, though its comment claims byte-identity: the kernel
+ *      returns -1 for a non-hex digit (0xff once stored in the u8), the core
+ *      returns 0xf. A valid high nibble with an invalid low one then yields a
+ *      DIFFERENT serial-number byte ('7','G' -> 0xff here, 0x7f there;
+ *      4660 of 65025 character pairs diverge). Adopting the core's parse would
+ *      change the identity this ONU puts on the wire for a malformed
+ *      gpon.onu_sn=, so it is a behaviour change, not code motion.
+ *
+ * Sequencing note: the refactor plan orders this move LAST (step M9) and gives
+ * it a prerequisite that is NOT code motion — the FSM below is global-based
+ * over ~11 file-scope variables while the core is object-based (struct
+ * gpon_ploam), and converting it is a shape change that must land, and be
+ * gated, on its own. X111W is off the rig, so none of it is board-verifiable
+ * today; a green offline gate gates a boot, it never proves the hardware works.
+ */
+
+/*
  * ===== G.984.3 PLOAM activation FSM (drives the ONU O1 -> O5) =====
  *
  * The MAC is a software-PLOAM design: a poll timer drains the downstream PLOAM
@@ -7435,6 +7500,12 @@ skip_bosa_init:
 	 * mask/status registers, NOT the burst overhead — removed.)
 	 */
 	gpon_wr_us_protected(GPON_GTC_US_MIN_DELAY, 0x9132);
+	/* ★ REWIRE BLOCKER 1a (see the FSM head comment): this is an __init caller
+	 * of the equalization-delay computation, with no PLOAM in flight. The
+	 * common core keeps that computation `static` inside gpon_ploam.c, reachable
+	 * only from gpon_ploam_ds(), so converting this driver to the core needs the
+	 * core to expose it first. Do not satisfy this by copying the arithmetic
+	 * back in here — that fork is what killed gpon_proto.c. */
 	gpon_set_eqd(0);			/* pre-ranging EqD = 290*128 = 0x9100 */
 
 	/*
@@ -7476,6 +7547,9 @@ skip_bosa_init:
 	 * SN burst (gpon_apply_boh in the FSM); this is just a sane state for the
 	 * window between GTC bring-up and those PLOAMs arriving.
 	 */
+	/* ★ REWIRE BLOCKER 1b (see the FSM head comment): the second __init caller
+	 * of a core computation the common layer keeps `static` (apply_boh). Same
+	 * resolution as 1a — export it from gpon_ploam.h, never re-implement it. */
 	gpon_apply_boh(false);
 
 	/*

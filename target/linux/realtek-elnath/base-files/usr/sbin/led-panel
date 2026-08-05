@@ -1,7 +1,7 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-2.0-only
 #
-# X411AXF / RTL9607F "Elnath": drive the front-panel state LEDs.
+# X400AXF / RTL9607F "Elnath": drive the front-panel state LEDs.
 #
 # WHY A SCRIPT AND NOT DRIVER CODE / A KERNEL TRIGGER
 # ---------------------------------------------------
@@ -32,7 +32,7 @@
 #
 # The remaining two panel LEDs, 2.4G and 5G, are deliberately NOT driven here.
 # They are not on SoC GPIO at all: each hangs off its WiFi chip's own LED pad, so
-# rtw89 registers them (x411axf:green:2.4g / x411axf:green:5g) and mac80211's
+# rtw89 registers them (x400axf:green:2.4g / x400axf:green:5g) and mac80211's
 # throughput trigger holds each one on while its radio is up and blinks it on
 # traffic.  That is a standard in-kernel trigger doing the whole job, so adding a
 # poll_wifi() here would only fight it - do not add one.
@@ -59,11 +59,11 @@ NIRX=/proc/net/cortina_ni_rx
 # "simplify" this back to ascending order without redoing the cable check; the
 # sibling MIPS board numbers its sockets the other way round, which is exactly
 # how the wrong assumption got here.
-LED_PON="x411axf:green:pon"
-LED_LOS="x411axf:red:los"
-LED_NET="x411axf:green:net"
+LED_PON="x400axf:green:pon"
+LED_LOS="x400axf:red:los"
+LED_NET="x400axf:green:net"
 # ordered by SWITCH PORT: port0 lights socket LAN4, port3 lights socket LAN1
-LAN_LEDS="x411axf:green:lan4 x411axf:green:lan3 x411axf:green:lan2 x411axf:green:lan1"
+LAN_LEDS="x400axf:green:lan4 x400axf:green:lan3 x400axf:green:lan2 x400axf:green:lan1"
 
 POLL="${LED_PANEL_POLL:-2}"
 

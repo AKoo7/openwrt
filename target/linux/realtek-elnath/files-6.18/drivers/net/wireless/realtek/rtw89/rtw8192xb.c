@@ -545,7 +545,7 @@ static int rtw8192xb_pwr_off_func(struct rtw89_dev *rtwdev)
 
 /* RFE type used when the efuse RFE field is unprogrammed (0xff).
  *
- * On the RTL9607F "Elnath" ONU (X411AXF) the RTW8192XBE module ships with a
+ * On the RTL9607F "Elnath" ONU (X400AXF) the RTW8192XBE module ships with a
  * blank WiFi efuse (rfe_type reads 0xff), so a fallback is needed or the
  * radio stays at power-on-reset defaults.
  *

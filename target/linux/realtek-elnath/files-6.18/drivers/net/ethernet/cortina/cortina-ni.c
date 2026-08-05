@@ -971,7 +971,7 @@ static void __maybe_unused cortina_ni_qm_reset(struct cortina_ni *ni)
 
 	if (!ni->win[CA_NI_WIN_GLB])
 		return;
-	rst = ni->win[CA_NI_WIN_GLB] + CA_NI_GLB_BLOCK_RST;
+	rst = ni->win[CA_NI_WIN_GLB] + CA_NI_GLB_BIST_CONTROL4;
 
 	/* ★ Reset ONLY NI + TQM, NOT L2FE/L2TM/L3FE.  Resetting the forwarding
 	 * blocks and NOT re-initialising them (aal_l2fe_init/aal_arb_init/
@@ -1030,20 +1030,20 @@ static int cortina_ni_probe(struct platform_device *pdev)
 		 * datapath sub-blocks (0x10000000 resting = the original bidirectional-dead fix), then
 		 * run the sequence (read fresh each iter to preserve the other bits). */
 		static const int order[] = { 0, 1, 2, 3, 5 };	/* ni,l2fe,l2tm,l3fe,tqm (SKIP 4=sdram) */
-		u32 was = readl(glb + CA_NI_GLB_DPHY_RESET);
+		u32 was = readl(glb + CA_NI_GLB_BLOCK_RESET);
 		int j;
 
-		writel(CA_NI_GLB_DPHY_RESET_VAL, glb + CA_NI_GLB_DPHY_RESET);
+		writel(CA_NI_GLB_BLOCK_RESET_VAL, glb + CA_NI_GLB_BLOCK_RESET);
 		for (j = 0; j < ARRAY_SIZE(order); j++) {
-			u32 v = readl(glb + CA_NI_GLB_DPHY_RESET);
+			u32 v = readl(glb + CA_NI_GLB_BLOCK_RESET);
 
-			writel(v | BIT(order[j]), glb + CA_NI_GLB_DPHY_RESET);	/* ASSERT one */
+			writel(v | BIT(order[j]), glb + CA_NI_GLB_BLOCK_RESET);	/* ASSERT one */
 			mdelay(1);
-			writel(v & ~BIT(order[j]), glb + CA_NI_GLB_DPHY_RESET);	/* DEASSERT it */
+			writel(v & ~BIT(order[j]), glb + CA_NI_GLB_BLOCK_RESET);	/* DEASSERT it */
 		}
 		mdelay(100);					/* final settle (stock) */
 		dev_info(dev, "ne-reset: sequential ni,l2fe,l2tm,l3fe,tqm at probe start (0x%08x -> 0x%08x)\n",
-			 was, readl(glb + CA_NI_GLB_DPHY_RESET));
+			 was, readl(glb + CA_NI_GLB_BLOCK_RESET));
 	}
 
 	/* ★ NE block reset DISABLED (storm bisect test): our L2FE showed a

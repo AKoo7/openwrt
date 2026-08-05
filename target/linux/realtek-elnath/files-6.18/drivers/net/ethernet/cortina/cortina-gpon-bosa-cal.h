@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
  * Per-board Semtech GN25L95 BOSA calibration image for the RTL9607F "Elnath"
- * X411AXF bring-up board (the stock /var/config/rtkbosa_k.bin of THIS board,
+ * X400AXF bring-up board (the stock /var/config/rtkbosa_k.bin of THIS board,
  * md5 c7ee214271d4d99b42607c263b9c2340).
  *
  * Layout (1024 bytes, consumed by cortina-gpon-bosa.c):

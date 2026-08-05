@@ -1,5 +1,5 @@
 #!/bin/sh
-# X411AXF / RTL9607F "Elnath": per-board dual-band WiFi AP defaults (M3d).
+# X400AXF / RTL9607F "Elnath": per-board dual-band WiFi AP defaults (M3d).
 #
 # Runs from uci_apply_defaults, which /etc/init.d/boot invokes right AFTER
 # `/sbin/wifi config` generated /etc/config/wireless from the detected phys
@@ -31,7 +31,30 @@
 # driver): legacy_rates=1 (CCK basic rates; without it strict phone scan
 # firmware never lists the AP) and multicast_to_unicast=1 (rtlwifi never
 # services the DTIM broadcast buffer, so a sleeping client's DHCP OFFER
-# would be buffered forever). HT20 = the luna-proven htmode.
+# would be buffered forever).
+#
+# ★★ 2.4G IS VHT40, NOT HT20 (2026-08-01). The HT20 here was carried over from
+# the realtek-luna RTL9602C board and its rtl8192fe -- a DIFFERENT chip. This
+# board's radio reports VHT capabilities on both bands (read live: `iw list`
+# shows two "VHT Capabilities" blocks), and the VENDOR firmware negotiates VHT
+# on 2.4 GHz on this very unit. Shipping HT20 therefore negotiated a WORSE
+# standard than the firmware we replace, which the suite now FAILs by rule
+# (test_wifi_parity.py: a worse standard is a regression whatever it
+# throughputs).
+#
+# ★ THE SECONDARY CHANNEL MUST SIT BELOW, and this is a LEGAL constraint, not a
+# preference. At 40 MHz the occupied span is what the regulator judges: ch11
+# with the secondary ABOVE occupies 2452-2492 MHz, and Bolivia permits only
+# 2402-2482 (read from the official wireless-regdb, not from memory). With the
+# secondary BELOW it occupies 2432-2472 and is legal. OpenWrt derives the
+# placement from the channel: on ch11 only "below" fits the band at all, which
+# is why the channel and the width may never be changed independently here --
+# re-check with `wifi_regdom.py --check <freq> 40 below` before touching either.
+#
+# ★ noscan=1: a 40 MHz AP that finds a busy 2.4 GHz neighbourhood falls back to
+# 20 MHz by the coexistence rules, which would silently undo this change on a
+# noisy site. The lab is noisy, so without it the port would keep testing as
+# HT20 and the parity case would keep failing for a reason nobody could see.
 # 5G: channel 36 (stock's live auto-channel pick; UNII-1 non-DFS in US) +
 # HE80 (the 36-48 block, no DFS channel inside the 80 MHz width). Stock runs
 # ch36 @160MHz, but 160 spans DFS 52-64; HE80 keeps us in the DFS-free block.
@@ -153,7 +176,14 @@ setup_iface() {
 		found_2g=1
 		uci -q batch <<EOF2
 set wireless.$dev.channel='$chan_2g'
-set wireless.$dev.htmode='HT20'
+# ★ HE40, not VHT40 (measured 2026-08-01). This radio has NO VHT on 2.4 GHz: its
+# hostapd conf carries no vht_capab and `iw phy` lists no VHT Capabilities on
+# Band 1, so a VHT40 htmode silently came up as HT40 -- the AP offered less than
+# it was asked for and nothing said so. Band 1 DOES list HE Iftypes, and HE is
+# the standard way to exceed HT on 2.4 GHz. The 40 MHz width keeps the secondary
+# BELOW (2432-2472); above would reach 2492 and break the 2482 edge here.
+set wireless.$dev.htmode='HE40'
+set wireless.$dev.noscan='1'
 set wireless.$dev.country='$country'
 set wireless.$dev.legacy_rates='1'
 set wireless.$dev.disabled='0'

@@ -1,7 +1,7 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-2.0-only
 #
-# X411AXF / RTL9607F "Elnath": get a WiFi radio back on the air, unattended.
+# X400AXF / RTL9607F "Elnath": get a WiFi radio back on the air, unattended.
 #
 # This unit ships with nobody watching it, so anything that can leave a radio
 # dark until a human types `wifi up` is a production defect.  There are two such

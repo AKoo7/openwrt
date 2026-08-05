@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * GN25L95 BOSA bring-up write sequence for the X411AXF board, replayed
+ * GN25L95 BOSA bring-up write sequence for the X400AXF board, replayed
  * VERBATIM from the stock rtkbosa on-wire i2c trace (684 register writes,
  * dev 0x51; per-board calibration values originate in this board's own
  * rtkbosa_k.bin cal file).  Order matters: the trace covers pages 0x00-0x06,
