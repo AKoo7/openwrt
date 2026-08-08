@@ -810,6 +810,11 @@ struct cortina_gpon {
 	u16 dt_alloc;			/* data T-CONT alloc-id (OMCI Set/Create ME 262) */
 	u16 dt_inst;			/* ..the ME instance it came on */
 	u16 dg_gem;			/* data GEM port-id (OMCI Create ME 268 attr 1) */
+	/* ★ THE INSTANCE THE GEM CAME ON.  Without it an ME 268 DELETE cannot be
+	 * matched at all: a Delete carries only the class and the instance, never
+	 * the attributes, so a snoop that stored port-id/tcont-ptr/dir but not the
+	 * instance had nothing to compare and could only ignore the message. */
+	u16 dg_inst;			/* ..the ME instance it came on */
 	u16 dg_tcont_ptr;		/* ME 268 attr 2 (diagnostic) */
 	u8 dg_dir;			/* ME 268 attr 3 direction (diagnostic) */
 	bool data_installed;
@@ -1261,6 +1266,7 @@ static int cg_pdc_map_write(struct cortina_gpon *cg, u32 idx, u32 d0, u32 d1)
 static void cg_pdc_init(struct cortina_gpon *cg)
 {
 	u32 idx, d0, d1, ctrl;
+	unsigned int dead = 0;		/* entries this pass could not write */
 
 	for (idx = 0; idx < CG_PDC_MAP_ENTRIES; idx++) {
 		if (idx < CG_OMCC_US_GEM_IDX_NUM) {
@@ -1273,8 +1279,16 @@ static void cg_pdc_init(struct cortina_gpon *cg)
 			     CG_PDC_D0_LSPID(CG_LPORT_PON);
 			d1 = CG_PDC_D1_POL_ID(idx - 8);
 		}
+		/* ★★ DO NOT ABANDON THE LIST ON ONE FAILED ENTRY (2026-08-05).
+		 * This used to `return`, and that is the worst of both worlds:
+		 * the map is left HALF written AND PDC_CTRL is never programmed
+		 * at all, so a single indirect-access timeout takes out the
+		 * whole OMCC downstream path rather than one GEM index.  Record
+		 * the failure, keep going, and let the supervisor below re-run
+		 * the whole init - a bounded RATE, never a bounded count, which
+		 * is the recovery shape this driver already uses at O5. */
 		if (cg_pdc_map_write(cg, idx, d0, d1))
-			return;
+			dead++;
 	}
 
 	ctrl = readl(cg->pon + CG_PDC_CTRL);
@@ -1284,9 +1298,18 @@ static void cg_pdc_init(struct cortina_gpon *cg)
 		(CG_LPORT_CPU_0 << CG_PDC_CTRL_HP_LDPID_SH);
 	writel(ctrl, cg->pon + CG_PDC_CTRL);
 
-	cg->pdc_ready = true;
-	dev_info(cg->dev, "PDC: OMCC DS GEMs 0-7 -> CPU_0, ctrl=0x%08x\n",
-		 readl(cg->pon + CG_PDC_CTRL));
+	/* ★ READY MEANS EVERY ENTRY LANDED, not "we got to the end".  Claiming
+	 * ready over a dead entry is what would let the supervisor stop looking
+	 * while the datapath is still short one GEM index. */
+	cg->pdc_ready = (dead == 0);
+	if (dead)
+		dev_warn(cg->dev,
+			 "PDC: %u of %u map entr%s could not be written - NOT ready, the O5 supervisor will re-run this\n",
+			 dead, (unsigned int)CG_PDC_MAP_ENTRIES,
+			 dead == 1 ? "y" : "ies");
+	else
+		dev_info(cg->dev, "PDC: OMCC DS GEMs 0-7 -> CPU_0, ctrl=0x%08x\n",
+			 readl(cg->pon + CG_PDC_CTRL));
 }
 
 /* PUC indirect-table op: kick ACCESS (go[31] + rbw[30]=write + index), poll go. */
@@ -1404,6 +1427,7 @@ static void cg_puc_init(struct cortina_gpon *cg)
 {
 	void __iomem *pon = cg->pon;
 	u32 tcont, q, v;
+	unsigned int dead = 0;		/* per-T-CONT entries this pass missed */
 
 	/* clear the PUC interrupt-enable (vendor: PUC_PONCNTL_INTENABLE = 0) */
 	writel(0, pon + CG_PUC_PONCNTL_INTEN);
@@ -1434,9 +1458,15 @@ static void cg_puc_init(struct cortina_gpon *cg)
 	 * weights (wrr=0).  Also program the back-pressure remap (queue_id<=63:
 	 * tqmvoqid = queue_id & 7) and the per-VoQ valid bit.
 	 */
+	/* ★★ DO NOT ABANDON ON ONE pvtbl FAILURE (2026-08-05).  This used to
+	 * `return`, which skipped everything after it: the HDR-A replacement,
+	 * the BTC config and the shapers.  So one indirect-access timeout on a
+	 * single T-CONT left the whole upstream admission half configured, and
+	 * nothing ever came back to finish it.  Count it, carry on, and let the
+	 * O5 supervisor re-run the init - rate-bounded, never count-bounded. */
 	for (tcont = 0; tcont < CG_PUC_TCONT_NUM; tcont++)
 		if (cg_puc_pvtbl_program(cg, tcont, tcont == 0))
-			return;
+			dead++;
 	/* the CPU high-priority OMCI inject rides the 9th queue (VoQ 127) */
 	cg_puc_voq_valid(cg, CG_PUC_9TH_QUEUE_VOQ, true);
 
@@ -1493,7 +1523,13 @@ static void cg_puc_init(struct cortina_gpon *cg)
 	v = (v & ~GENMASK(4, 0)) | 20u | BIT(26);	/* pirovhd=20, pir_en=1 */
 	writel(v, pon + CG_PUC_CTRL2);
 
-	cg->puc_ready = true;
+	/* ★ READY MEANS EVERY T-CONT LANDED - see the same note in cg_pdc_init. */
+	cg->puc_ready = (dead == 0);
+	if (dead)
+		dev_warn(cg->dev,
+			 "PUC: %u of %u pvtbl entr%s could not be programmed - NOT ready, the O5 supervisor will re-run this\n",
+			 dead, (unsigned int)CG_PUC_TCONT_NUM,
+			 dead == 1 ? "y" : "ies");
 	dev_info(cg->dev,
 		 "PUC: OMCC T-CONT0 VoQs + 9th-queue enabled, puccfg=0x%08x lnk_type=0x%04x\n",
 		 readl(pon + CG_PUC_PUCCFG),
@@ -1827,8 +1863,28 @@ static void cg_frame_var_update(struct cortina_gpon *cg)
 	u32 pre = t3 & 0xff, ranged = (t3 >> 8) & 0xff;
 	u32 us, fv;
 
-	if (!pre || !ranged)
-		return;		/* Extended_Burst_Length not received yet */
+	/* ★★ RECOMPUTE UNCONDITIONALLY, exactly as stock does on EVERY downstream
+	 * PLOAM (fixed 2026-08-05).  This used to bail out when the
+	 * Extended_Burst_Length latch read empty:
+	 *
+	 *	if (!pre || !ranged)
+	 *		return;	 // "not received yet"
+	 *
+	 * and that leaves the PREVIOUS OLT's compensation latched.  Swap the fibre
+	 * to an OLT that sends no Extended_Burst_Length (or let the GTC re-roll
+	 * clear the latch) and us.frame_var stays at the old 0x1F0 while the new
+	 * OLT expects 0x1E0: the serial number is then misaligned in EVERY ranging
+	 * window, the ONU never leaves O1, and nothing recovers it but a reboot.
+	 * A field fault that reads as "it died when the operator re-spliced us".
+	 *
+	 * No special case is needed for the empty latch, because the formula
+	 * already yields the standard-burst default there:
+	 *	pre = ranged = 0  ->  (0x200 - 0x20) & 0x1ff  =  0x1E0
+	 * which is the value stock writes after the first DS PLOAM from a
+	 * non-extended OLT.  So the fix is to let the arithmetic run.
+	 *
+	 * Pinned by frame_var_reset_test, which extracts THIS function at build
+	 * time and drove it red from 2026-07-17 until now. */
 	fv = (0x200 - ((pre + ranged + 0x20) & 0xff)) & 0x1ff;
 	us = readl(cg->mac + CG_REG_US);
 	if ((us & 0x1ff) == fv)
@@ -1999,6 +2055,35 @@ static void cg_coldstart_work(struct work_struct *work)
 		 * the OLT cannot re-solicit, so giving up after N attempts would
 		 * strand the session until a power cycle.
 		 */
+		/* ★★ AND THE SUPERVISOR CONSULTS pdc_ready / puc_ready (2026-08-05).
+		 * Before this, both flags were set once at init and read by
+		 * NOTHING but /proc: if an indirect-access timeout left the PDC
+		 * map or the PUC pvtbl incomplete, the driver knew, printed it,
+		 * and then carried the hole for the whole uptime.  A flag that
+		 * only ever describes a fault, and is never CONSULTED by the
+		 * path that could repair it, is a diagnosis nobody acts on.
+		 *
+		 * Re-running is safe here and NOT a churn risk: both inits are
+		 * idempotent table writes, this runs at the slow post-O5 rate,
+		 * and it is skipped entirely once both are ready - so a healthy
+		 * link does exactly what it did before, zero extra register
+		 * writes.
+		 *
+		 * ★ NEVER over an ARMED data path: with the data GEM installed,
+		 * re-walking the PUC pvtbl would momentarily re-write the very
+		 * VoQ admission the live upstream is using.  A half-programmed
+		 * table is a fault worth healing at the next window, not one
+		 * worth risking a working subscriber's traffic for. */
+		if ((!cg->pdc_ready || !cg->puc_ready) && !cg->data_installed) {
+			dev_warn(cg->dev,
+				 "O5 supervisor: re-running %s%s init (idempotent; datapath not yet armed)\n",
+				 cg->pdc_ready ? "" : "PDC ",
+				 cg->puc_ready ? "" : "PUC ");
+			if (!cg->pdc_ready)
+				cg_pdc_init(cg);
+			if (!cg->puc_ready)
+				cg_puc_init(cg);
+		}
 		schedule_work(&cg->isr_work);
 		schedule_delayed_work(&cg->coldstart_work,
 				      CG_O5_SUPERVISOR_SECS * HZ);
@@ -2904,7 +2989,22 @@ static void cg_rx_omci(const u8 *pdu, unsigned int len)
 				alloc = ((u16)pdu[10] << 8) | pdu[11];
 			else if (m == 4)
 				alloc = ((u16)pdu[8] << 8) | pdu[9];
-			if (alloc && alloc != 0xffff && alloc != cg->dt_alloc) {
+			/* ★★ 0xffff IS THE G.988 DEALLOCATE, NOT NOISE (2026-08-05).
+			 * The `alloc != 0xffff` filter below used to DROP it, so an
+			 * OLT that detached the T-CONT the standard way left our
+			 * shadow - and therefore the armed HW CAM - still matching an
+			 * alloc-id the OLT is now free to hand to ANOTHER subscriber.
+			 * Only a MIB-Reset cleared it.  Treat it as what it is: the
+			 * teardown half of the same message. */
+			if (alloc == 0xffff && cg->dt_alloc &&
+			    (!cg->dt_inst || inst == cg->dt_inst)) {
+				dev_info(cg->dev,
+					 "OMCI: data T-CONT me-inst 0x%04x DEALLOCATED (alloc-id 0xffff)\n",
+					 inst);
+				WRITE_ONCE(cg->dt_alloc, 0);
+				cg->data_installed = false;
+				schedule_work(&cg->isr_work);
+			} else if (alloc && alloc != 0xffff && alloc != cg->dt_alloc) {
 				WRITE_ONCE(cg->dt_alloc, alloc);
 				cg->dt_inst = inst;
 				dev_info(cg->dev,
@@ -2921,12 +3021,36 @@ static void cg_rx_omci(const u8 *pdu, unsigned int len)
 		 * broadcast CTP FIRST (gem 4095, tcont-ptr 0, dir 2) — that
 		 * one is covered by the fixed CG_MCAST_GEM_ID install, so it
 		 * must never claim the data-GEM slot (live-proven ordering). */
+		/* ★★ ME 268 DELETE (m == 6) TEARS THE DATA GEM DOWN (2026-08-05).
+		 * The snoop below is Create-only, so a Delete was merely logged and
+		 * the DS-GEM CAM stayed armed on a port-id the OLT had removed -
+		 * de-encapsulating whatever the next subscriber is given on that
+		 * GEM.  Only a MIB-Reset cleared it.  A Delete carries just the
+		 * class and the instance, which is exactly why dg_inst had to be
+		 * latched on the Create: matched here, nothing else can be.
+		 * Clearing the shadow and kicking isr_work is the same teardown
+		 * the MIB-Reset path takes, so the stale HW CAM is invalidated in
+		 * process context rather than left to burst. */
+		if (class_id == 268 && m == 6 && cg->dg_gem &&
+		    (!cg->dg_inst || inst == cg->dg_inst)) {
+			dev_info(cg->dev,
+				 "OMCI: data GEM me-inst 0x%04x DELETED (port-id %u)\n",
+				 inst, cg->dg_gem);
+			WRITE_ONCE(cg->dg_gem, 0);
+			cg->dg_inst = 0;
+			cg->dg_tcont_ptr = 0;
+			cg->dg_dir = 0;
+			cg->data_installed = false;
+			schedule_work(&cg->isr_work);
+		}
+
 		if (class_id == 268 && m == 4 && len >= 13) {
 			u16 g = ((u16)pdu[8] << 8) | pdu[9];
 
 			if (g && g != cg->omcc_gem) {
 				if (pdu[12] == 3 && g != cg->dg_gem) {
 					WRITE_ONCE(cg->dg_gem, g);
+					cg->dg_inst = inst;	/* so a Delete can match */
 					cg->dg_tcont_ptr = ((u16)pdu[10] << 8) | pdu[11];
 					cg->dg_dir = pdu[12];
 					dev_info(cg->dev,
