@@ -802,7 +802,15 @@ enum cortina_ni_win {
  * port 14, and port 15 maps to 0x23ac = instance 14 of this loop (the csel
  * in stock aal_l2_tm_es_voq_ena_set) - so i = 0..14 covers every port.
  * Stock also sets field [23:16] := 6 on instances 8/10/13 (not our egress
- * port 0) - deferred. */
+ * port 0).
+ * ★ THAT "deferred" WAS STALE - CORRECTED 2026-08-08 by a live read. On OUR
+ * running board all three instances already read 0x000600ff, i.e. [23:16] IS
+ * 6 and [7:0] IS the voq0..7 enable, identical to stock:
+ *     0x2364 (i=8) = 0x237c (i=10) = 0x23a0 (i=13) = 0x000600ff
+ * (offsets from this same formula: 0x2304 + 8*12 / 10*12 / 13*12). We do not
+ * write it, so it is the reset/bootloader default - but it is SET, and a note
+ * saying otherwise sent one investigation after a non-existent parity gap.
+ * Do not re-open it without re-reading these three offsets. */
 #define CA_NI_L2TM_ES_SCH_CFG(i)	(0x2304 + (i) * 12)  /* i = 0..14 */
 #define  CA_NI_L2TM_ES_VOQ_EN_ALL	GENMASK(7, 0)	/* voq0..7 enable */
 #define CA_NI_L2TM_ES_SCH_INSTANCES	15
@@ -1333,6 +1341,19 @@ enum cortina_ni_win {
  * completion / wptr-update latch enable) were the missing piece; the writeback never
  * fired without them.  Stock 0x6118 = 0x00000100 (per-EQ-pool refill-threshold IRQ en). */
 #define  CA_NI_QM_EPP64_INT_EN0_STOCK	0x0000FFFFu
+/* ★★ 0x6110 IS NOT ONLY AN INTERRUPT MASK, SO IT MUST NEVER BE ZEROED (fixed
+ * 2026-08-08).  The comment directly above already records the fact, measured:
+ * bits[15:8] are the WRITEBACK-COMPLETION / WPTR-UPDATE LATCH ENABLE - a
+ * functional enable for the engine that writes RX descriptors, not a mask.
+ * Masking the interrupt by writing 0 therefore also switched the descriptor
+ * writeback engine OFF, on EVERY interrupt, until the NAPI poll completed.
+ * Stock holds 0x0000FFFF steady and never masks this way.
+ * Use this value to mask: it clears ONLY the port-0 interrupt-enable byte this
+ * driver owns and LEAVES bits[15:8] set, so the writeback engine stays running
+ * while the interrupt is masked.  Still a plain write, not a RMW, so the
+ * ISR-vs-NAPI enable/disable stays race-free. */
+#define  CA_NI_QM_EPP64_INT_EN0_MASKED	(CA_NI_QM_EPP64_INT_EN0_STOCK & \
+					 ~(u32)CA_NI_QM_EPP64_INT_PORT0)
 #define CA_NI_QM_EPP64_INT_EN2		0x6118
 #define  CA_NI_QM_EPP64_INT_EN2_STOCK	0x00000100u
 

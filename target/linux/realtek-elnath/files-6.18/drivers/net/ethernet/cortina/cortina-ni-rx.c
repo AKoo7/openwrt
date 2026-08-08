@@ -637,13 +637,33 @@ static int cortina_ni_rx_push_buf(struct cortina_ni *ni, u32 eqid, u32 pa,
  * CPU port 0 owns byte 0 of INT_EN0; a set bit enables the level interrupt
  * of that voq's EPP FIFO.  We only ever use port0/voq0-7, so plain writes
  * (not RMW) keep the ISR-vs-NAPI enable/disable race-free.
+ *
+ * ★★ MASKING MUST LEAVE bits[15:8] SET - they are the descriptor WRITEBACK
+ * ENGINE enable, not part of the mask (fixed 2026-08-08; see the register
+ * header).  This used to write 0, i.e. it turned the writeback engine OFF on
+ * every interrupt until the poll completed.  Under a line-rate flood the
+ * interrupt rate is enormous, so the engine spent a large share of the time
+ * disabled, and a frame the QM admitted inside that window had its buffer
+ * consumed with NO descriptor ever written: NAPI could not see it, so it was
+ * never recycled into the pool.  That is a buffer leak proportional to the
+ * interrupt rate, and it is INVISIBLE to every drop counter in this file
+ * (push_fail, badpa, nosop, len, stale_buf all require a descriptor to have
+ * been read), which is why the pool gauges kept reading healthy.
+ *
+ * Measured consequences, both now attributed to this one write:
+ *   - transient: CPU delivery starves for a window under load and recovers
+ *     (management blackout, pool still healthy, nobuf still 0);
+ *   - permanent: the leak accumulates until the supply is empty, after which
+ *     the BM no-free-buffer-drops EVERY arriving frame (0x216c climbing 1:1
+ *     with 0x213c, RMU0 0x6900/0x6940 both 0 because nothing reaches them),
+ *     killing all wired AND PON ingress with the kernel still alive and WiFi
+ *     (separate PCIe DMA) unaffected.  Only a cold boot cleared it, because
+ *     the refill is reachable only from the NAPI poll that no longer runs.
  */
 static void cortina_ni_rx_irq_set(struct cortina_ni *ni, bool enable)
 {
-	/* ★★ build61: enable the STOCK value 0x0000FFFF (bits 0-15), NOT just 0xff (port0
-	 * byte).  bits[15:8] are the writeback-completion/wptr latch enable - without them the
-	 * EPP writeback engine never fires (0x611c bit22, wptr stuck 0). */
-	writel(enable ? CA_NI_QM_EPP64_INT_EN0_STOCK : 0,
+	writel(enable ? CA_NI_QM_EPP64_INT_EN0_STOCK
+		      : CA_NI_QM_EPP64_INT_EN0_MASKED,
 	       ni_base(ni) + CA_NI_QM_EPP64_INT_EN0);
 }
 
@@ -5494,9 +5514,10 @@ void cortina_ni_rx_stop(struct cortina_ni *ni)
 
 /* Read one NI RX MIB counter for <port> via the indirect ACCESS/DATA0 pair
  * (stock __ni_eth_port_rx_mib_get).  Bounded poll; on timeout returns ~0 so a
- * stuck access is visible rather than silently zero.  Called only from the
- * /proc reader (process context) - readl_poll_timeout may sleep there. */
-static u32 cortina_ni_rx_mib_read(struct cortina_ni *ni, u32 port, u32 cnt_id)
+ * stuck access is visible rather than silently zero.  Called from the /proc
+ * reader and from `ethtool -S`, both process context - readl_poll_timeout may
+ * sleep, so it must stay out of NAPI and out of any spinlock. */
+u32 cortina_ni_rx_mib_read(struct cortina_ni *ni, u32 port, u32 cnt_id)
 {
 	u32 val;
 
@@ -5750,6 +5771,65 @@ static const u16 cortina_ni_qmdump_offs[] = {
 	0x7020, 0x7024, 0x7028, 0x702c,
 };
 
+/* ------------------------------------------------------------------ */
+/* `ethtool -d`: the same curated snapshot, through a standard interface */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The two tables above ARE the register snapshot, and they stay here - beside
+ * the /proc reader that also prints them - so there is exactly ONE list.  A
+ * copy in the ethtool file would be a second thing to keep in sync, and this
+ * tree has already paid for a duplicated table that drifted.
+ *
+ * Word order: the curated named registers first, then the QM/L2TM block
+ * sweep.  Both are plain readl of NI-window offsets that a stock devmem sweep
+ * proved mapped - no indirect access, no latch, no side effect - so a dump is
+ * safe to take at any time and taking one cannot perturb what it measures.
+ *
+ * The order is the ABI of `ethtool -d`: appending is fine, reordering or
+ * removing is not without bumping CA_NI_REGDUMP_VERSION.
+ */
+unsigned int cortina_ni_regdump_len(void)
+{
+	return ARRAY_SIZE(cortina_ni_rx_regs) +
+	       ARRAY_SIZE(cortina_ni_qmdump_offs);
+}
+
+void cortina_ni_regdump_fill(struct cortina_ni *ni, u32 *buf)
+{
+	unsigned int i, n = 0;
+
+	if (!ni_base(ni)) {
+		memset(buf, 0, cortina_ni_regdump_len() * sizeof(*buf));
+		return;
+	}
+	for (i = 0; i < ARRAY_SIZE(cortina_ni_rx_regs); i++)
+		buf[n++] = readl(ni_base(ni) + cortina_ni_rx_regs[i].off);
+	for (i = 0; i < ARRAY_SIZE(cortina_ni_qmdump_offs); i++)
+		buf[n++] = readl(ni_base(ni) + cortina_ni_qmdump_offs[i]);
+}
+
+/* Decode key for word @i of the dump above: its name and its NI-window offset.
+ * Generated from the SAME tables as the dump, so the map cannot describe a
+ * different snapshot than the one taken.  The sweep half has no vendor name,
+ * so it is identified by its offset alone and says so. */
+void cortina_ni_regdump_entry(unsigned int i, const char **name, u32 *off)
+{
+	if (i < ARRAY_SIZE(cortina_ni_rx_regs)) {
+		*name = cortina_ni_rx_regs[i].name;
+		*off = cortina_ni_rx_regs[i].off;
+		return;
+	}
+	i -= ARRAY_SIZE(cortina_ni_rx_regs);
+	if (i < ARRAY_SIZE(cortina_ni_qmdump_offs)) {
+		*name = "qm_l2tm_sweep";
+		*off = cortina_ni_qmdump_offs[i];
+		return;
+	}
+	*name = "<out of range>";
+	*off = 0;
+}
+
 /*
  * ★ BOTH DIRECTIONS' CPU-forward witness, in ONE read.
  *
@@ -5788,18 +5868,30 @@ static int cortina_ni_rx_proc_show(struct seq_file *m, void *v)
 	struct cortina_ni_rx *rx = ni->rx;
 	u32 pa_req;
 	int i;
-	/* ★★ SINGLE-READER ACCUMULATOR for the CLEAR-ON-READ NI_HV interface counters.
-	 * These are read-and-clear (stock's own `ca-ne.ko` labels the block "NI counter
+	/* ★★ THE CLEAR-ON-READ NI_HV COUNTERS ARE NOT READ HERE ANY MORE.
+	 * They are read-and-clear (stock's own `ca-ne.ko` labels the block "NI counter
 	 * ===== (read-and-clear)"), and this ONE show() used to read each of them TWICE:
 	 * l3qm at the fwd-chain line and again at ni_hv-rx, l3fe likewise.  The first read
 	 * took the count and every later one printed a structural ~0 - a value that was
 	 * then quoted as evidence in several places in this tree.
-	 * ⇒ read each ONCE here, print the value everywhere below, and never re-read the
-	 * register inside this function.  A new caller must take these variables too.
 	 * (Fixed 2026-08-05.  The l3qm half was found by an offline verification pass; the
-	 * l3fe half was the same defect one line up, which that pass had not looked at.) */
-	u32 l3fe_rx = readl(ni_base(ni) + CA_NI_NI_L3FE_RX_PKT_CNT);
-	u32 l3qm_rx = readl(ni_base(ni) + CA_NI_NI_L3QM_RX_PKT_CNT);
+	 * l3fe half was the same defect one line up, which that pass had not looked at.)
+	 * ⇒ THE SAME DEFECT, ONE FILE WIDER: /proc/cortina_l3fe reads the same two
+	 * registers, and `ethtool -S` now publishes them too, so "read it once in this
+	 * function" was never enough - two files cat'ed a second apart steal from each
+	 * other exactly as two lines of one file did.  The ONE reader is now
+	 * cortina_ni_nihv_sample(); it folds each sample into a cumulative driver-side
+	 * total and every consumer prints THAT.  Never readl() 0xa9bc/0xa9fc/0xaa10/
+	 * 0xaa3c/0xaa7c from anywhere again.
+	 * The values printed below are therefore TOTALS SINCE BOOT, not the raw
+	 * since-last-read deltas the old lines showed - which is what a counter quoted
+	 * as evidence should have been all along. */
+	u64 nihv[CA_NI_NIHV_CNT_COUNT];
+	u64 l3fe_rx, l3qm_rx;
+
+	cortina_ni_nihv_sample(ni, nihv);
+	l3fe_rx = nihv[CA_NI_NIHV_L3FE_RX];
+	l3qm_rx = nihv[CA_NI_NIHV_L3QM_RX];
 
 	/* RX fell back to TX-only (pool never came up): rx is gone, but dump the
 	 * QM/pool registers so the failure is debuggable live */
@@ -5984,12 +6076,12 @@ static int cortina_ni_rx_proc_show(struct seq_file *m, void *v)
 		 * l3fe_rx=0 -> frame never reaches the L3 classifier (routing/demux); l3fe_rx>0 &
 		 * cls_hit=0 -> STG0/CLS not matching; cls_hit>0 & qm_rx=0 -> trap not admitted. */
 		seq_printf(m,
-			   "fwd-chain: dft_fwd[p0]=0x%08x (redir_en=%u mcgid=0x%lx) pdpid[0x10]=0x%x pdpid[0x19]=0x%x(stock 0x0d L3_LAN; NOT 0x8=QM->wire) qm_rx=%u qm_tx=%u l3fe_rx(0xa9bc)=%u l3qm_rx(0xa9fc)=%u\n",
+			   "fwd-chain: dft_fwd[p0]=0x%08x (redir_en=%u mcgid=0x%lx) pdpid[0x10]=0x%x pdpid[0x19]=0x%x(stock 0x0d L3_LAN; NOT 0x8=QM->wire) qm_rx=%u qm_tx=%u l3fe_rx(0xa9bc)=%llu l3qm_rx(0xa9fc)=%llu [totals since boot]\n",
 			   dft, !!(dft & CA_NI_PLE_DFT_REDIR_EN),
 			   FIELD_GET(CA_NI_PLE_DFT_MC_GROUP_ID, dft), pdpid, p19,
 			   readl(ni_base(ni) + CA_NI_QM_RX_CNTR),
 			   readl(ni_base(ni) + CA_NI_QM_TX_CNTR),
-			   l3fe_rx, l3qm_rx);	/* the ONE read; see the note at the top */
+			   l3fe_rx, l3qm_rx);	/* the sampled TOTAL; see the note at the top */
 	}
 	/* ★ build68: full DFT_FWD[0..15] + MC_FIB[0x10..0x1b] dump so the coordinator can
 	 * VERIFY the routing tables from /proc (our image has no devmem).  DFT_FWD read =
@@ -6445,26 +6537,30 @@ static int cortina_ni_rx_proc_show(struct seq_file *m, void *v)
 			seq_puts(m, "  (deadbeef=poison; real desc = a 0x094xxxxx PA + small len; rx_ring_hi param = which ring NAPI reads)\n");
 		}
 	}
-	/* ★★ SINGLE READER: 0xa9fc is CLEAR-ON-READ, and this one show() used to read it
-	 * TWICE - here and again in the ni_hv-rx line below.  The first read took the count
-	 * and the second was therefore a structural ~0, printed as if it were a measurement
-	 * and cited as evidence in several places (fixed 2026-08-05, verified against
-	 * stock's `ca-ne.ko`, whose own text says "NI counter ===== (read-and-clear)").
-	 * Read it ONCE into l3qm_rx and print that value in both lines.  If a third caller
-	 * ever appears, it must take this value too, never re-read the register.
-	 * ⚠ Note the other three NI_HV instances (l3fe/mce/dma) are the same kind of
-	 * counter; mce/dma are read once each today, which is why only these two bit us. */
+	/* ★★ THE NI_HV VALUES BELOW COME FROM THE ONE SAMPLE TAKEN AT THE TOP.
+	 * 0xa9fc is CLEAR-ON-READ, and this one show() used to read it TWICE - here and
+	 * again in the ni_hv-rx line below.  The first read took the count and the second
+	 * was therefore a structural ~0, printed as if it were a measurement and cited as
+	 * evidence in several places (found 2026-08-05, verified against stock's
+	 * `ca-ne.ko`, whose own text says "NI counter ===== (read-and-clear)").
+	 * ⚠ ni2qm_tx (0xaa10), mce (0xaa3c) and dma (0xaa7c) are the SAME kind of counter,
+	 * so they are taken from the same sample too - a plain readl here would now find
+	 * them already cleared by cortina_ni_nihv_sample() and print a confident zero,
+	 * which is the identical defect one register along.
+	 * miss_sop_eop (0xa9f4) and short_err (0xa9f8) are still read directly: each packs
+	 * TWO quantities in one word (hi16/lo16), so they are not accumulated and are
+	 * printed raw - read them as "since the last read of this file", never as a total. */
 	/* ★★ PROVEN-cumulative per-stage counters (RE a0668fdf) - idle-vs-ping each; the
 	 * FIRST that does not climb under ping = the death stage.  l2tm_tx already climbs
 	 * (frame leaves L2TM); ni2qm_* = frames accepted into L3QM (stage2); rmu_* = RMU0
 	 * (0x6900 operator-suspect, 0x690c=scheduled); epp_wptr = descriptors written. */
-	seq_printf(m, "datapath: bm_rx(0x213c)=%u bm_tx(0x2140)=%u | ni2qm_rx(0xa9fc)=%u miss_sop_eop(0xa9f4)=0x%08x short_err(0xa9f8)=0x%08x ni2qm_tx(0xaa10)=%u | rmu_rx(0x6900)=%u rmu_sched(0x690c)=%u | epp_wptr(0x7000)=0x%06x | drop no_buf(0x6940)=%u fe(0x6944)=%u\n",
+	seq_printf(m, "datapath: bm_rx(0x213c)=%u bm_tx(0x2140)=%u | ni2qm_rx(0xa9fc)=%llu miss_sop_eop(0xa9f4)=0x%08x short_err(0xa9f8)=0x%08x ni2qm_tx(0xaa10)=%llu | rmu_rx(0x6900)=%u rmu_sched(0x690c)=%u | epp_wptr(0x7000)=0x%06x | drop no_buf(0x6940)=%u fe(0x6944)=%u\n",
 		   readl(ni_base(ni) + CA_NI_L2TM_BM_RX_PCNT),
 		   readl(ni_base(ni) + CA_NI_L2TM_BM_TX_PCNT),
 		   l3qm_rx,
 		   readl(ni_base(ni) + CA_NI_NI_L3QM_RX_MISS_SOP_EOP),
 		   readl(ni_base(ni) + CA_NI_NI_L3QM_RX_SHORT_ERR),
-		   readl(ni_base(ni) + CA_NI_NI_L3QM_TX_PKT_CNT),
+		   nihv[CA_NI_NIHV_L3QM_TX],
 		   readl(ni_base(ni) + CA_NI_QM_RX_CNTR),
 		   readl(ni_base(ni) + CA_NI_QM_TX_CNTR),
 		   cortina_ni_rx_wptr(ni),
@@ -6486,12 +6582,12 @@ static int cortina_ni_rx_proc_show(struct seq_file *m, void *v)
 	 * stride 0x40).  bm_tx +9 but l3qm(0xa9fc)=0 -> if l3fe(0xa9bc) climbs, the frame
 	 * goes to the L3FE interface we don't drain, not L3QM; if ALL 4 stay 0, the dequeue
 	 * never reaches NI_HV = the shared BM->NI_HV handoff is the gate. */
-	/* l3fe + l3qm re-use the ONE read each, taken at the top of this function. */
-	seq_printf(m, "ni_hv-rx: l3fe(0xa9bc)=%u l3qm(0xa9fc)=%u mce(0xaa3c)=%u dma(0xaa7c)=%u\n",
+	/* all four come from the ONE sample taken at the top of this function */
+	seq_printf(m, "ni_hv-rx: l3fe(0xa9bc)=%llu l3qm(0xa9fc)=%llu mce(0xaa3c)=%llu dma(0xaa7c)=%llu [read-and-clear registers, accumulated: totals since boot]\n",
 		   l3fe_rx,
 		   l3qm_rx,
-		   readl(ni_base(ni) + CA_NI_NI_MCE_RX_PKT_CNT),
-		   readl(ni_base(ni) + CA_NI_NI_DMA_RX_PKT_CNT));
+		   nihv[CA_NI_NIHV_MCE_RX],
+		   nihv[CA_NI_NIHV_DMA_RX]);
 	/* ★★ build43: the QM/RMU0-side bisect (RE a053902d - the RIGHT counters; 0xa9fc may
 	 * be egress-direction).  no_buf climbing while rmu_rx=0 = frame reached RMU0 but EQ13
 	 * (128B CPU pool) empty = the operator's recorded wall = seed EQ13.  RE offsets shown

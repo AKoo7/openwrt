@@ -9,6 +9,8 @@
  */
 
 #include <linux/bitfield.h>
+#include <linux/build_bug.h>
+#include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
@@ -23,10 +25,12 @@
 #include <linux/platform_device.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
+#include <linux/spinlock.h>
 
 #include "cortina-ni.h"
 
-#define CA_NI_DRV_NAME	"cortina-ni"
+/* CA_NI_DRV_NAME now lives in cortina-ni.h: `ethtool -i` reports it too, so
+ * the driver name had to stop being a literal private to this file. */
 
 struct cortina_ni_window_desc {
 	u8		idx;
@@ -692,13 +696,101 @@ static void __iomem *cortina_ni_peek_base(struct cortina_ni *ni, u8 win,
 	return ni->win[win];
 }
 
-static int cortina_ni_peek_show(struct seq_file *m, void *v)
+/*
+ * ★★ THE BOUND THAT WAS MISSING: A MAPPED WINDOW IS NOT A READABLE WINDOW.
+ *
+ * The peek already refused an offset past the mapped SIZE, and that is the
+ * bound people think of - but it is not the one that takes the board down.
+ * Inside these windows are UNMAPPED HOLES, and touching one is not an error
+ * return: it is a synchronous external abort or an async SError, i.e. the box
+ * is gone and the operator has learned nothing.  Three are recorded in this
+ * tree, each paid for with a crash:
+ *   - the L3 special-packet block (SPKTP / SPB) - a write hangs the CPU;
+ *   - the L3FE HS_LIGHT tail, RE'd from the wrong chip's tree - a write
+ *     async-SErrored on the first flow install (the t=58.5 s panic);
+ *   - the per-port MAC block tail - a plain readl faults, which is why the
+ *     register dump in cortina-ni-rx.c stops at +0x6c and says "never widen".
+ * Only ONE of the three was guarded, only against writes, only for two of the
+ * four offsets, and only on the /proc path.
+ *
+ * So the refusals are DECLARED DATA, applied to every caller, and each one
+ * says which access it refuses and WHY - a bare -EPERM from a debug tool is
+ * indistinguishable from the tool being broken.
+ *
+ * @read_faults separates the two classes honestly: for the special-packet and
+ * HS_LIGHT holes what is MEASURED is that a WRITE kills the board, so reads
+ * stay allowed rather than being refused on a guess; for the per-port tail the
+ * measured fault is the READ itself.
+ */
+static const struct cortina_ni_peek_hole cortina_ni_peek_holes[] = {
+	{ CA_NI_WIN_NI, 0x333c, 0x3340, false,
+	  "L3 special-packet detect (SPKTP): unmapped on this silicon, a write hangs the CPU" },
+	{ CA_NI_WIN_NI, 0x3440, 0x3444, false,
+	  "L3 special-packet buffer (SPB): unmapped on this silicon, a write hangs the CPU" },
+	{ CA_NI_WIN_NI, 0x3dc4, 0x3dcc, false,
+	  "L3FE HS_LIGHT tail: absent on this die (the window ends at ~0x3c8c), a write async-SErrors" },
+	/*
+	 * The per-port MAC block tail, +0x74..+0x8c of each port's 0x90 stride.
+	 * MEASURED on port 0 (0xa634..0xa64c); the other ports are refused by
+	 * the stride, which is a deliberate fail-closed extension - the blocks
+	 * are identical by construction, and refusing seven words of a debug
+	 * peek costs nothing next to aborting the CPU.  Nothing in this driver
+	 * reads that range on any port.  Narrow it if it ever hides a real
+	 * register, and say which port proved it.
+	 */
+	{ CA_NI_WIN_NI, CA_NI_PORT_STATIC_CFG(0) + 0x74,
+	  CA_NI_PORT_STATIC_CFG(0) + 0x8c, true,
+	  "per-port MAC block tail: unmapped, readl faults (synchronous external abort)" },
+	{ CA_NI_WIN_NI, CA_NI_PORT_STATIC_CFG(1) + 0x74,
+	  CA_NI_PORT_STATIC_CFG(1) + 0x8c, true,
+	  "per-port MAC block tail: unmapped, readl faults (synchronous external abort)" },
+	{ CA_NI_WIN_NI, CA_NI_PORT_STATIC_CFG(2) + 0x74,
+	  CA_NI_PORT_STATIC_CFG(2) + 0x8c, true,
+	  "per-port MAC block tail: unmapped, readl faults (synchronous external abort)" },
+	{ CA_NI_WIN_NI, CA_NI_PORT_STATIC_CFG(3) + 0x74,
+	  CA_NI_PORT_STATIC_CFG(3) + 0x8c, true,
+	  "per-port MAC block tail: unmapped, readl faults (synchronous external abort)" },
+	{ CA_NI_WIN_NI, CA_NI_PORT_STATIC_CFG(4) + 0x74,
+	  CA_NI_PORT_STATIC_CFG(4) + 0x8c, true,
+	  "per-port MAC block tail: unmapped, readl faults (synchronous external abort)" },
+	{ CA_NI_WIN_NI, CA_NI_PORT_STATIC_CFG(5) + 0x74,
+	  CA_NI_PORT_STATIC_CFG(5) + 0x8c, true,
+	  "per-port MAC block tail: unmapped, readl faults (synchronous external abort)" },
+	{ CA_NI_WIN_NI, CA_NI_PORT_STATIC_CFG(6) + 0x74,
+	  CA_NI_PORT_STATIC_CFG(6) + 0x8c, true,
+	  "per-port MAC block tail: unmapped, readl faults (synchronous external abort)" },
+};
+/* The port rows above are written out one per port so each is greppable at its
+ * literal offset.  If the port count ever changes, this fails the BUILD rather
+ * than silently leaving the new port's hole open. */
+static_assert(CA_NI_PORT_COUNT == 7,
+	      "add/remove a cortina_ni_peek_holes row per NI port");
+
+bool cortina_ni_peek_access_ok(u8 win, u32 off, bool write, const char **why)
 {
-	struct cortina_ni *ni = m->private;
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(cortina_ni_peek_holes); i++) {
+		const struct cortina_ni_peek_hole *h = &cortina_ni_peek_holes[i];
+
+		if (h->win != win || off < h->first || off > h->last)
+			continue;
+		if (!write && !h->read_faults)
+			continue;	/* only the write is known to fault */
+		*why = h->why;
+		return false;
+	}
+	*why = NULL;
+	return true;
+}
+
+void cortina_ni_peek_render(struct seq_file *m, struct cortina_ni *ni)
+{
 	struct cortina_ni_peek q = ni->peek;	/* snapshot */
+	const char *name = "?";
+	const char *why;
 	void __iomem *base;
 	size_t size;
-	const char *name = "?";
 	u32 i;
 
 	for (i = 0; i < ARRAY_SIZE(cortina_ni_peek_wins); i++)
@@ -708,15 +800,17 @@ static int cortina_ni_peek_show(struct seq_file *m, void *v)
 	base = cortina_ni_peek_base(ni, q.win, &size);
 	if (!base) {
 		seq_printf(m, "%s: window unavailable\n", name);
-		return 0;
+		return;
 	}
 	if (!q.count) {
 		seq_puts(m,
-			 "usage: echo '[win] <hex_off> [count]' > /proc/cortina_ni_peek\n"
+			 "usage: echo '[win] <hex_off> [count]' > this file\n"
 			 "  win = ni|dma|glb|gphy|wrap|reo|mdio|intr|sgmii|peri (default ni)\n"
 			 "  gphy off is raw in the 1M window (port p bank = p*0x40000)\n"
-			 "  poke: echo 'poke [win] <hex_off> <hex_val>' (SPB/SPKTP holes refused)\n");
-		return 0;
+			 "  poke: echo 'poke [win] <hex_off> <hex_val>'\n"
+			 "  offsets past the mapped size, and the declared unmapped holes,\n"
+			 "  are REFUSED with the reason - see cortina_ni_peek_holes\n");
+		return;
 	}
 
 	for (i = 0; i < q.count; i++) {
@@ -727,40 +821,41 @@ static int cortina_ni_peek_show(struct seq_file *m, void *v)
 				   name, off, size);
 			break;
 		}
+		/* A refusal NAMES ITSELF and the scan CONTINUES: skipping a
+		 * hole silently would make a dump look complete when a word of
+		 * it was never taken, and aborting would make one bad word cost
+		 * the whole range. */
+		if (!cortina_ni_peek_access_ok(q.win, off, false, &why)) {
+			seq_printf(m, "%s+0x%05x = <REFUSED: %s>\n",
+				   name, off, why);
+			continue;
+		}
 		seq_printf(m, "%s+0x%05x = 0x%08x\n", name, off,
 			   readl(base + off));
 	}
-	return 0;
 }
 
-static int cortina_ni_peek_open(struct inode *inode, struct file *file)
+/*
+ * Parse and apply one peek/poke command.  @buf is modified in place and must
+ * be NUL-terminated.  Shared by the /proc node and by debugfs, so the bounds
+ * cannot be present on one path and missing on the other.
+ */
+int cortina_ni_peek_command(struct cortina_ni *ni, char *buf)
 {
-	return single_open(file, cortina_ni_peek_show, pde_data(inode));
-}
-
-static ssize_t cortina_ni_peek_write(struct file *file, const char __user *ubuf,
-				     size_t len, loff_t *ppos)
-{
-	struct cortina_ni *ni = pde_data(file_inode(file));
-	char buf[64], *p, *tok;
 	u8 win = CA_NI_WIN_NI;
+	const char *why;
+	char *p, *tok;
 	u32 off, count = 1;
 	int i;
 
-	if (len == 0 || len >= sizeof(buf))
-		return -EINVAL;
-	if (copy_from_user(buf, ubuf, len))
-		return -EFAULT;
-	buf[len] = '\0';
 	p = strim(buf);
-
 	tok = strsep(&p, " \t");
 	if (!tok || !*tok)
 		return -EINVAL;
 
 	/* 'poke' verb: WRITE a register for fast live RE iteration (a boot is
 	 * ~200s; a poke is instant).  usage:
-	 *   echo 'poke [win] <hex_off> <hex_val>' > /proc/cortina_ni_peek
+	 *   echo 'poke [win] <hex_off> <hex_val>'
 	 * The read-back is armed to the poked reg, so a follow-up cat shows it.
 	 * (project rule: dump/spy/poke stays a first-class, always-on feature.) */
 	if (!strcmp(tok, "poke")) {
@@ -784,14 +879,11 @@ static ssize_t cortina_ni_peek_write(struct file *file, const char __user *ubuf,
 			return -EINVAL;
 		if (off & 3)
 			return -EINVAL;			/* 32-bit aligned only */
-		/* crash-hole guard: the L3 special-packet block (SPKTP 0x333c/40,
-		 * SPB 0x3440/44) is UNMAPPED on RTL9607F silicon - a write there
-		 * hangs the CPU and async-SErrors the board (proven on live stock).
-		 * Refuse those four; every other 0x32xx-0x33xx reg is real.  */
-		if (win == CA_NI_WIN_NI &&
-		    (off == 0x333c || off == 0x3340 ||
-		     off == 0x3440 || off == 0x3444))
+		if (!cortina_ni_peek_access_ok(win, off, true, &why)) {
+			pr_warn("%s: peek: refusing poke of window %u +0x%05x: %s\n",
+				CA_NI_DRV_NAME, win, off, why);
 			return -EPERM;
+		}
 		base = cortina_ni_peek_base(ni, win, &size);
 		if (!base)
 			return -ENODEV;
@@ -801,7 +893,7 @@ static ssize_t cortina_ni_peek_write(struct file *file, const char __user *ubuf,
 		ni->peek.win = win;
 		ni->peek.off = off;
 		ni->peek.count = 1;
-		return len;
+		return 0;
 	}
 
 	/* optional leading window name (non-hex first token) */
@@ -827,7 +919,35 @@ static ssize_t cortina_ni_peek_write(struct file *file, const char __user *ubuf,
 	ni->peek.win = win;
 	ni->peek.off = off;
 	ni->peek.count = count;
-	return len;
+	return 0;
+}
+
+static int cortina_ni_peek_show(struct seq_file *m, void *v)
+{
+	cortina_ni_peek_render(m, m->private);
+	return 0;
+}
+
+static int cortina_ni_peek_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, cortina_ni_peek_show, pde_data(inode));
+}
+
+static ssize_t cortina_ni_peek_write(struct file *file, const char __user *ubuf,
+				     size_t len, loff_t *ppos)
+{
+	struct cortina_ni *ni = pde_data(file_inode(file));
+	char buf[64];
+	int ret;
+
+	if (len == 0 || len >= sizeof(buf))
+		return -EINVAL;
+	if (copy_from_user(buf, ubuf, len))
+		return -EFAULT;
+	buf[len] = '\0';
+
+	ret = cortina_ni_peek_command(ni, buf);
+	return ret ? ret : len;
 }
 
 static const struct proc_ops cortina_ni_peek_pops = {
@@ -933,6 +1053,119 @@ static const struct proc_ops cortina_ni_gsram_pops = {
 	.proc_write	= cortina_ni_gsram_write,
 };
 
+/* ------------------------------------------------------------------ */
+/* debugfs: the peek's supported home, and the ethtool -d decode map    */
+/* ------------------------------------------------------------------ */
+
+/*
+ * WHY debugfs and not /proc.
+ *
+ * The counters moved to `ethtool -S` because a test must be able to ask the
+ * SAME question of the vendor firmware and of ours, and a /proc node named
+ * after this driver can only ever BLOCK on stock.  The peek is the opposite
+ * case and it is worth being explicit about: it is an arbitrary-MMIO RE tool
+ * with no vendor counterpart by construction, so it is NOT a comparison
+ * instrument and no case may derive a stock-vs-ours verdict from it.  What it
+ * needs is a home that is unambiguously a debug surface, mountable or not at
+ * the integrator's choice, and that is debugfs.
+ *
+ * /proc/cortina_ni_peek and /proc/cortina_ni_gsram stay for now and are
+ * unchanged in behaviour except that they finally have the bounds; retiring
+ * them happens once this interface has been exercised on the board.
+ */
+static int cortina_ni_dbgfs_peek_show(struct seq_file *m, void *v)
+{
+	cortina_ni_peek_render(m, m->private);
+	return 0;
+}
+
+static int cortina_ni_dbgfs_peek_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, cortina_ni_dbgfs_peek_show, inode->i_private);
+}
+
+static ssize_t cortina_ni_dbgfs_peek_write(struct file *file,
+					   const char __user *ubuf,
+					   size_t len, loff_t *ppos)
+{
+	struct seq_file *m = file->private_data;
+	char buf[64];
+	int ret;
+
+	if (len == 0 || len >= sizeof(buf))
+		return -EINVAL;
+	if (copy_from_user(buf, ubuf, len))
+		return -EFAULT;
+	buf[len] = '\0';
+
+	ret = cortina_ni_peek_command(m->private, buf);
+	return ret ? ret : len;
+}
+
+static const struct file_operations cortina_ni_dbgfs_peek_fops = {
+	.owner		= THIS_MODULE,
+	.open		= cortina_ni_dbgfs_peek_open,
+	.read		= seq_read,
+	.write		= cortina_ni_dbgfs_peek_write,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+
+/*
+ * The decode key for `ethtool -d`.  That blob is a flat u32 array and no
+ * userspace tool knows how to name its words, so the map is published beside
+ * it: one line per word, index -> name -> NI-window offset, generated from the
+ * same table the dump is taken from.  Without this the register snapshot is
+ * only diffable against itself; with it, a word that differs can be named.
+ */
+static int cortina_ni_dbgfs_regmap_show(struct seq_file *m, void *v)
+{
+	unsigned int i, n = cortina_ni_regdump_len();
+
+	seq_printf(m, "# ethtool -d words: %u (u32 each, NI window)\n", n);
+	seq_puts(m, "# index name offset\n");
+	for (i = 0; i < n; i++) {
+		const char *name;
+		u32 off;
+
+		cortina_ni_regdump_entry(i, &name, &off);
+		seq_printf(m, "%u %s 0x%04x\n", i, name, off);
+	}
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(cortina_ni_dbgfs_regmap);
+
+static void cortina_ni_debugfs_release(void *data)
+{
+	debugfs_remove_recursive(data);
+}
+
+void cortina_ni_debugfs_init(struct cortina_ni *ni)
+{
+	struct dentry *d;
+
+	/* A stub when debugfs is off: debugfs_create_dir() then returns an
+	 * ERR_PTR that every later call swallows, so nothing here has to be
+	 * conditional - but an ERR_PTR must not be handed to devm as a pointer
+	 * to free. */
+	d = debugfs_create_dir(CA_NI_DRV_NAME, NULL);
+	if (IS_ERR_OR_NULL(d))
+		return;
+	ni->dbgfs = d;
+
+	/* teardown is tied to the device: this driver has no .remove, and a
+	 * dentry left behind by a module unload would collide with the next
+	 * probe's create */
+	if (devm_add_action_or_reset(ni->dev, cortina_ni_debugfs_release, d)) {
+		ni->dbgfs = NULL;
+		return;
+	}
+
+	debugfs_create_file("peek", 0644, d, ni, &cortina_ni_dbgfs_peek_fops);
+	debugfs_create_file("regdump_map", 0444, d, ni,
+			    &cortina_ni_dbgfs_regmap_fops);
+}
+
 /* Pulse one NE block reset: assert (set bit) -> 1ms -> deassert (clear bit),
  * stock ca_ni_global_reset order.  Returns the register value read back WHILE
  * asserted so a write that does not stick (e.g. a secure-only register) shows
@@ -1001,6 +1234,10 @@ static int cortina_ni_probe(struct platform_device *pdev)
 	if (!ni)
 		return -ENOMEM;
 	ni->dev = dev;
+	/* guards the ONE reader of the read-and-clear NI_HV counters; must be
+	 * live before anything can sample them (the rx/l3fe /proc nodes and
+	 * `ethtool -S` all go through it) */
+	spin_lock_init(&ni->nihv_lock);
 	platform_set_drvdata(pdev, ni);
 
 	ret = cortina_ni_map_windows(ni);
@@ -1092,6 +1329,8 @@ static int cortina_ni_probe(struct platform_device *pdev)
 	/* internal-GPHY uC SRAM reader (ours-vs-stock firmware diff) */
 	proc_create_data("cortina_ni_gsram", 0644, NULL, &cortina_ni_gsram_pops,
 			 ni);
+	/* the peek's supported home + the `ethtool -d` decode map */
+	cortina_ni_debugfs_init(ni);
 
 	dev_info(dev, "M2c probe complete\n");
 	return 0;

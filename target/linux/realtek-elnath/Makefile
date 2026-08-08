@@ -81,6 +81,23 @@ DEFAULT_PACKAGES += \
 	kmod-gpio-button-hotplug \
 	uboot-envtools \
 	iw \
+	ethtool \
 	x400axf-tools
+
+# ★ WHY `ethtool` IS IN THE IMAGE, and it is not a convenience.
+#
+# The NI driver publishes its counters and its register snapshot through the
+# standard ethtool interface (`ethtool -S`, `ethtool -d`) precisely so a test
+# can ask the SAME question of the vendor firmware and of ours - a /proc node
+# named after our own driver has no counterpart on stock, so a case reading one
+# can only ever BLOCK there and the oracle half of the comparison never exists.
+# An interface the image cannot reach is no interface at all, and busybox has
+# no ethtool applet, so the tool ships.
+#
+# The `tiny` variant is what is selected (the default): it is the ioctl-only
+# build - no libmnl, no netlink, no pretty-dump - and -S and -d are both ioctl
+# calls (ETHTOOL_GSTATS / ETHTOOL_GREGS), so nothing this port needs is in the
+# `full` variant.  That matters here: this is a <=64 MB RAM, small-NAND class
+# device and every package is weighed against the footprint rule.
 
 $(eval $(call BuildTarget))

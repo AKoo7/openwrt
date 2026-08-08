@@ -16,12 +16,87 @@
 
 #include "cortina-ni-regs.h"
 
+/* platform driver name; also what `ethtool -i` reports */
+#define CA_NI_DRV_NAME		"cortina-ni"
+
 /* peek "window" selector for the peri block (not a DT window index) */
 #define CA_NI_PEEK_PERI		0xff
 #define CA_NI_PEEK_MAX		64	/* max 32-bit words per peek */
 #define CA_NI_GSRAM_MAX		1024	/* max SRAM words per /proc/gsram dump */
 
 struct mii_bus;
+struct dentry;
+/* forward-declared HERE, before the first prototype that takes one: the full
+ * definition is further down, and a struct first named inside a parameter list
+ * is a DIFFERENT type scoped to that declaration */
+struct cortina_ni;
+struct seq_file;
+
+/*
+ * ★★ THE NI_HV COUNTER BLOCK IS READ-AND-CLEAR: IT HAS EXACTLY ONE READER.
+ *
+ * Stock's own ca-ne.ko labels this block "NI counter ===== (read-and-clear)",
+ * and it is measured: reading 0xa9fc twice inside one /proc show returned the
+ * count and then a structural 0, which was quoted as evidence in this tree for
+ * weeks.  A read-and-clear register cannot have two consumers - whoever reads
+ * it first TAKES the count and everyone after sees zero, which is a phantom
+ * that reads as a healthy "nothing arrived".
+ *
+ * So the register is read in exactly ONE place - cortina_ni_nihv_sample() -
+ * which folds each sample into a 64-bit driver-side total and hands the TOTAL
+ * to every consumer.  /proc/net/cortina_ni_rx, /proc/cortina_l3fe and
+ * `ethtool -S` all call it; none of them may readl() these offsets again.  The
+ * totals are cumulative and monotonic, which is what a statistics interface
+ * has to publish and what the raw register never was.
+ *
+ * ⚠ A caller that wants a DELTA keeps its own snapshot of the TOTAL and
+ * subtracts.  Differencing the raw register was wrong twice over: the raw read
+ * is already a delta, so `raw - prev_raw` is a delta of deltas.
+ *
+ * ⚠ The read-and-clear behaviour of this block is itself configurable (NI
+ * 0x2010 bit31 is the control, and its setting differs between the stock image
+ * and ours), so the accumulation is the FAIL-CLOSED choice: if the block were
+ * ever left cumulative instead, the totals would over-count rather than lose
+ * counts, and the over-count is visible (the total races ahead of the raw
+ * register) where a lost count is not.  Anything that changes 0x2010 must
+ * revisit this.
+ */
+enum cortina_ni_nihv_cnt {
+	CA_NI_NIHV_L3FE_RX,		/* 0xa9bc NI_HV iface +0x00 RX_PKT_CNT */
+	CA_NI_NIHV_L3QM_RX,		/* 0xa9fc NI_HV iface +0x40 RX_PKT_CNT */
+	CA_NI_NIHV_L3QM_TX,		/* 0xaa10 NI_HV L3QM TX_PKT_CNT       */
+	CA_NI_NIHV_MCE_RX,		/* 0xaa3c NI_HV iface +0x80 RX_PKT_CNT */
+	CA_NI_NIHV_DMA_RX,		/* 0xaa7c NI_HV iface +0xc0 RX_PKT_CNT */
+	CA_NI_NIHV_CNT_COUNT,
+};
+
+/*
+ * Sample every NI_HV read-and-clear counter ONCE, fold it into the driver's
+ * running totals and return those totals in @out.  The ONLY reader of these
+ * registers.  Process or softirq context; takes a spinlock, never sleeps.
+ */
+void cortina_ni_nihv_sample(struct cortina_ni *ni,
+			    u64 out[CA_NI_NIHV_CNT_COUNT]);
+
+/*
+ * The curated NI-window register snapshot, published through `ethtool -d`.
+ * The table itself lives in cortina-ni-rx.c beside the /proc reader that also
+ * prints it, so there is ONE list and it cannot drift; these two accessors are
+ * all the ethtool side needs.  _len() is in u32 words.
+ */
+unsigned int cortina_ni_regdump_len(void);
+void cortina_ni_regdump_fill(struct cortina_ni *ni, u32 *buf);
+/* name + NI-window offset of dump word @i, so the opaque `ethtool -d` blob can
+ * be decoded (surfaced as debugfs .../regdump_map). */
+void cortina_ni_regdump_entry(unsigned int i, const char **name, u32 *off);
+
+/*
+ * Read one per-port NI RX MIB counter through the indirect ACCESS/DATA pair.
+ * Returns ~0u if the GO poll never cleared, so a stuck access is visible
+ * instead of reading as a silent zero.  May sleep (bounded poll): process
+ * context only.
+ */
+u32 cortina_ni_rx_mib_read(struct cortina_ni *ni, u32 port, u32 cnt_id);
 
 /* One DMA-LSO virtual port (VP); M2b uses TXQ 0 of each CPU VP only. */
 struct cortina_ni_txq {
@@ -312,6 +387,15 @@ struct cortina_ni {
 	bool			gphy_patched[CA_NI_GPHY_COUNT];
 	struct cortina_ni_tx	*tx;
 	struct cortina_ni_rx	*rx;
+	/* NI_HV read-and-clear counter totals - see cortina_ni_nihv_sample().
+	 * The lock is what makes "one reader" true when two files are cat'ed
+	 * at the same moment: the sample and the fold are one critical section,
+	 * so a count can be taken once and only once. */
+	spinlock_t		nihv_lock;
+	u64			nihv_total[CA_NI_NIHV_CNT_COUNT];
+	/* debugfs root (the bounded arbitrary-offset peek + the ethtool -d
+	 * decode map); NULL when debugfs is not built in */
+	struct dentry		*dbgfs;
 };
 
 /*
@@ -460,6 +544,40 @@ void cortina_ni_pppoe_punt_inspect(const u8 *f, unsigned int len);
  * changes (the HW consumers - FDB/comparator/FIELD-CAM - are re-programmed
  * by cortina_ni_rx_mac_rearm, which is the only caller) */
 void cortina_ni_flowoffload_router_mac_set(const u8 *mac);
+/*
+ * The offload engine's countable quantities, for `ethtool -S`.  A SNAPSHOT
+ * taken under the offload mutex, so the whole set is self-consistent.
+ *
+ * ⚠ It reads the driver's own counters and NOTHING else.  It deliberately does
+ * NOT run the per-bucket age sweep that /proc/cortina_l3fe does: that sweep
+ * CONSUMES the engine's age re-arms, so a second consumer of it would steal
+ * hits from the 5 s sweep exactly the way a second reader of a read-and-clear
+ * register steals counts.  So l3fe_hw_hits here is the total accumulated by
+ * the sweep (and by any /proc read), never a fresh consumption of its own.
+ */
+enum cortina_ni_l3fe_stat {
+	CA_L3FE_FLOWS_RESIDENT,		/* GAUGE: entries currently in silicon */
+	CA_L3FE_DS_FLOWS_RESIDENT,	/* GAUGE: the DS subset of the above   */
+	CA_L3FE_HW_HITS,
+	CA_L3FE_US_HITS,
+	CA_L3FE_DS_HITS,
+	CA_L3FE_HITS_UNATTRIBUTED,
+	CA_L3FE_PPPOE_US_HITS,
+	CA_L3FE_PPPOE_DS_HITS,
+	CA_L3FE_FLOWS_REFUSED,
+	CA_L3FE_REFUSED_UNSUPPORTED,
+	CA_L3FE_REFUSED_TABLE_FULL,
+	CA_L3FE_REFUSED_DUPLICATE,
+	CA_L3FE_REFUSED_ERROR,
+	CA_L3FE_VLAN_WAN_REFUSED_US,
+	CA_L3FE_VLAN_WAN_REFUSED_DS,
+	CA_L3FE_VLAN_PPPOE_PROGRAMMED,
+	CA_L3FE_VLAN_PPPOE_READBACK_FAIL,
+	CA_L3FE_VLAN_PUSH_LEGS,
+	CA_L3FE_VLAN_STRIP_LEGS,
+	CA_L3FE_STAT_COUNT,
+};
+void cortina_ni_flowoffload_stats(u64 out[CA_L3FE_STAT_COUNT]);
 #else
 static inline int cortina_ni_flowoffload_probe(struct cortina_ni *ni)
 {
@@ -507,5 +625,43 @@ void cortina_ni_rx_mac_rearm(struct cortina_ni *ni);
 /* internal-GPHY SRAM firmware patch + uC resume; called at link-up (the uC is
  * only held/writable then, not at probe) */
 void cortina_ni_gphy_patch_and_resume(struct cortina_ni *ni);
+
+/*
+ * The STANDARD counter + register-snapshot interface (cortina-ni-ethtool.c):
+ * `ethtool -S <dev>` for every countable quantity and `ethtool -d <dev>` for
+ * the curated register snapshot.
+ *
+ * WHY it exists next to the /proc nodes rather than instead of them (for now):
+ * a test may not depend on a /proc node carrying one model's name, because the
+ * vendor firmware has no such node - so a case reading /proc/net/cortina_ni_rx
+ * can only ever BLOCK on stock and the oracle half of the comparison is
+ * structurally impossible.  ethtool is served by both firmwares' kernels, so
+ * the same case can run on both.  The /proc nodes stay until this interface is
+ * proven on the board; removing them is a separate step.
+ */
+extern const struct ethtool_ops cortina_ni_ethtool_ops;
+
+/*
+ * Bounded arbitrary-offset register peek/poke.  Shared by the legacy
+ * /proc/cortina_ni_peek and by debugfs .../peek so BOTH get the bounds - the
+ * hazard is a real one (an unmapped offset inside a mapped window aborts or
+ * async-SErrors the CPU), and fixing it in only one of the two readers would
+ * leave the board just as reachable through the other.
+ */
+struct cortina_ni_peek_hole {
+	u8		win;		/* CA_NI_WIN_* */
+	u32		first, last;	/* inclusive byte offsets */
+	bool		read_faults;	/* true: reads fault too, not just writes */
+	const char	*why;
+};
+/* @why receives the refusal reason; returns false when the access is refused */
+bool cortina_ni_peek_access_ok(u8 win, u32 off, bool write, const char **why);
+/* parse one "[win] <hex_off> [count]" / "poke [win] <hex_off> <hex_val>"
+ * command into @ni->peek, performing the poke when asked.  Returns 0 or a
+ * negative errno; @buf is modified in place. */
+int cortina_ni_peek_command(struct cortina_ni *ni, char *buf);
+/* render the armed peek window */
+void cortina_ni_peek_render(struct seq_file *m, struct cortina_ni *ni);
+void cortina_ni_debugfs_init(struct cortina_ni *ni);
 
 #endif /* _CORTINA_NI_H */

@@ -1570,6 +1570,11 @@ int cortina_ni_tx_probe(struct cortina_ni *ni)
 		return ret;
 
 	ndev->netdev_ops = &cortina_ni_netdev_ops;
+	/* the STANDARD counter + register-snapshot interface (cortina-ni-ethtool.c):
+	 * `ethtool -S` / `ethtool -d`.  It exists so a test can ask the same
+	 * question of the vendor firmware and of ours - the /proc nodes cannot,
+	 * because stock has no node of those names. */
+	ndev->ethtool_ops = &cortina_ni_ethtool_ops;
 	ndev->min_mtu = ETH_MIN_MTU;
 	ndev->max_mtu = ETH_DATA_LEN;	/* len field allows 2047 - keep std */
 	cortina_ni_tx_set_mac(ni, ndev);

@@ -477,6 +477,10 @@ struct cn_flow_entry;
 
 struct cn_l3e {
 	struct device	*dev;
+	/* the owning NI instance - needed for cortina_ni_nihv_sample(), which is
+	 * the ONE reader of the read-and-clear NI_HV counters this file also
+	 * reports (see the note in cortina-ni.h) */
+	struct cortina_ni *ni;
 	void __iomem	*ne_base;	/* NE register window */
 	void __iomem	*dma_base;	/* DMA/LDMA window - the DMA-AFT tables
 					 * that carry the WAN VLAN edit live
@@ -1888,11 +1892,23 @@ MODULE_PARM_DESC(hw_ds_deepq,
  * l3fe_rx during a download does NOT prove "the DS frame never entered the
  * L3FE" - only the per-direction age re-arm (ds_hits) plus the hw_ds_probe
  * ladder above can say that.  Printed raw AND as a delta since the previous
- * /proc read, so their read-vs-clear semantics do not matter.
+ * /proc read.
+ *
+ * ★★ THEY ARE NO LONGER READ HERE.  Both are READ-AND-CLEAR, and this file
+ * readl()'d them while /proc/net/cortina_ni_rx readl()'d the same two - so
+ * whichever was cat'ed first TOOK the count and the other printed a confident
+ * zero.  Two files stealing from each other is the same defect as the two
+ * lines of one file that were fixed on 2026-08-05, one scope wider, and
+ * `ethtool -S` publishing them made it three.  They now come from the ONE
+ * reader, cortina_ni_nihv_sample(), as cumulative totals.
+ *
+ * ⚠ AND THE DELTA WAS WRONG TOO, not merely fragile: the old line printed
+ * `raw - prev_raw`, but with read-and-clear the RAW READ IS ALREADY THE DELTA,
+ * so that was a delta of deltas and went NEGATIVE (printed as a huge unsigned)
+ * whenever traffic slowed between two reads.  The snapshot below is of the
+ * TOTAL, which makes the subtraction mean what the label says.
  */
-#define CN_L3E_NI_L3FE_RX_PKT_CNT	0xa9bc
-#define CN_L3E_NI_L3QM_RX_PKT_CNT	0xa9fc
-static u32 cn_l3e_ni_rx_prev[2];
+static u64 cn_l3e_ni_rx_prev[2];
 
 /*
  * ★★ L3FE GLOBAL DEBUG / MONITOR BLOCK - the engine's OWN per-stage
@@ -5516,6 +5532,55 @@ static u32 cn_l3e_proc_parse_ip(const char *s)
 	return 0;
 }
 
+/*
+ * The offload engine's countable quantities, for `ethtool -S` - see the
+ * declaration in cortina-ni.h for what this may and may not do.
+ *
+ * Lock-free on purpose.  Every value is an atomic_t or a u32 the aarch64 CPU
+ * cannot tear, so each one is individually correct; what the caller does NOT
+ * get is a mutually consistent instant across all of them, which no statistics
+ * interface promises and which is not worth blocking on the offload mutex for
+ * (that mutex is held across the whole /proc read, including hardware sweeps).
+ *
+ * ⚠ It runs NO age sweep.  /proc/cortina_l3fe deliberately does, because a
+ * single `cat` during traffic then becomes a hit witness - but that sweep
+ * CONSUMES the engine's per-entry age re-arms, so a second consumer would
+ * steal hits from the 5 s sweep the way a second reader steals a
+ * read-and-clear count.  hw/us/ds hits here are therefore the totals the sweep
+ * has accumulated, which is exactly what a monotonic statistic should be.
+ *
+ * The counters that are GAUGES (currently-resident entries, not events) are
+ * named _resident so nobody differences them into a rate.
+ */
+void cortina_ni_flowoffload_stats(u64 out[CA_L3FE_STAT_COUNT])
+{
+	struct cn_l3e *l3e = cn_l3e;
+
+	out[CA_L3FE_FLOWS_RESIDENT]	= atomic_read(&cn_flow_installed);
+	out[CA_L3FE_DS_FLOWS_RESIDENT]	= atomic_read(&cn_ds_installed);
+	out[CA_L3FE_HW_HITS]		= atomic_read(&cn_l3e_hw_hits);
+	out[CA_L3FE_US_HITS]		= atomic_read(&cn_l3e_us_hits);
+	out[CA_L3FE_DS_HITS]		= atomic_read(&cn_l3e_ds_hits);
+	out[CA_L3FE_HITS_UNATTRIBUTED]	= atomic_read(&cn_l3e_hits_unattr);
+	out[CA_L3FE_PPPOE_US_HITS]	= atomic_read(&cn_pppoe_us_hits);
+	out[CA_L3FE_PPPOE_DS_HITS]	= atomic_read(&cn_pppoe_ds_hits);
+	out[CA_L3FE_FLOWS_REFUSED]	= atomic_read(&cn_flow_refused);
+	out[CA_L3FE_REFUSED_UNSUPPORTED] = atomic_read(&cn_flow_refused_unsupp);
+	out[CA_L3FE_REFUSED_TABLE_FULL]	= atomic_read(&cn_flow_refused_full);
+	out[CA_L3FE_REFUSED_DUPLICATE]	= atomic_read(&cn_flow_refused_dup);
+	out[CA_L3FE_REFUSED_ERROR]	= atomic_read(&cn_flow_refused_err);
+	out[CA_L3FE_VLAN_WAN_REFUSED_US] = atomic_read(&cn_vlan_wan_refused_us);
+	out[CA_L3FE_VLAN_WAN_REFUSED_DS] = atomic_read(&cn_vlan_wan_refused_ds);
+	out[CA_L3FE_VLAN_PPPOE_PROGRAMMED] = atomic_read(&cn_vlan_pppoe_ok);
+	out[CA_L3FE_VLAN_PPPOE_READBACK_FAIL] =
+					atomic_read(&cn_vlan_pppoe_readback);
+	/* the DMA-AFT ledger lives in the engine instance; the refusal counters
+	 * above do not, and are counted even when the engine never armed - so
+	 * only these two are gated on it */
+	out[CA_L3FE_VLAN_PUSH_LEGS]	= l3e ? l3e->aft_push : 0;
+	out[CA_L3FE_VLAN_STRIP_LEGS]	= l3e ? l3e->aft_strip : 0;
+}
+
 static int cn_l3e_proc_show(struct seq_file *m, void *v)
 {
 	struct cn_l3e *l3e = cn_l3e;
@@ -5715,11 +5780,16 @@ static int cn_l3e_proc_show(struct seq_file *m, void *v)
 		   "★ DS OFFLOAD CANNOT WORK: set cortina_gpon.hw_l3_ds=1 (needs cortina_ni.hw_l3_fwd=1 too)" :
 		   "stage-A precondition satisfied");
 	{
-		u32 l3fe_rx = readl(l3e->ne_base + CN_L3E_NI_L3FE_RX_PKT_CNT);
-		u32 l3qm_rx = readl(l3e->ne_base + CN_L3E_NI_L3QM_RX_PKT_CNT);
+		u64 nihv[CA_NI_NIHV_CNT_COUNT];
+		u64 l3fe_rx, l3qm_rx;
+
+		/* the ONE reader; never readl() 0xa9bc/0xa9fc from here */
+		cortina_ni_nihv_sample(l3e->ni, nihv);
+		l3fe_rx = nihv[CA_NI_NIHV_L3FE_RX];
+		l3qm_rx = nihv[CA_NI_NIHV_L3QM_RX];
 
 		seq_printf(m,
-			   "ni_hv: l3fe_rx(0xa9bc)=%u delta=%u l3qm_rx(0xa9fc)=%u delta=%u  [delta = since the previous read of THIS file]\n",
+			   "ni_hv: l3fe_rx(0xa9bc)=%llu delta=%llu l3qm_rx(0xa9fc)=%llu delta=%llu  [cumulative total since boot; delta = since the previous read of THIS file]\n",
 			   l3fe_rx, l3fe_rx - cn_l3e_ni_rx_prev[0],
 			   l3qm_rx, l3qm_rx - cn_l3e_ni_rx_prev[1]);
 		seq_puts(m,
@@ -6349,6 +6419,7 @@ int cortina_ni_flowoffload_probe(struct cortina_ni *ni)
 	if (!l3e)
 		return -ENOMEM;
 	l3e->dev = ni->dev;
+	l3e->ni = ni;
 	l3e->ne_base = ne;
 	/* the DMA window is already mapped for the TX ring; the DMA-AFT VLAN
 	 * edit tables live in the same 4K page, so there is nothing to map. */
