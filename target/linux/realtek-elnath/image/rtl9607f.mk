@@ -47,10 +47,35 @@ define Device/realtek_rtl9607f_x400axf
   #     kmod-ppp kmod-pppox kmod-pppoe - PPP core + PPPoE socket/session kernel
   #       modules (their package KCONFIG brings CONFIG_PPP/PPPOE=m into the
   #       kernel build; the lean per-model config-6.18 needs no hand edit)
+  #   UPnP IGD + NAT-PMP/PCP (miniupnpd), so an application on the LAN can open
+  #   its own inbound port - games, consoles, conferencing - which is what a home
+  #   gateway is expected to do and what the suite's four upnp_igd_* cases probe.
+  #
+  #     miniupnpd-nftables - THE VARIANT IS NOT A PREFERENCE, IT MUST MATCH THE
+  #       FIREWALL. This image is fw4/nftables (CONFIG_PACKAGE_firewall4=y and
+  #       `# CONFIG_PACKAGE_firewall is not set`; nftables-json + kmod-nft-* are
+  #       in, no iptables anywhere). The two variants differ in the daemon's
+  #       COMPILED backend (--firewall=nftables vs =iptables), so the iptables
+  #       build would drive a ruleset this image does not have. It is also the
+  #       package's own DEFAULT_VARIANT and CONFLICTS with -iptables; naming it
+  #       explicitly keeps that a decision rather than an inherited default.
+  #       libmnl/libnftnl are already in the image; it adds libuuid + libcap-ng.
+  #
+  #     ★ THE WAN SURFACE AT REST IS UNCHANGED, and that is checkable rather
+  #       than asserted: the package installs three nft chains into fw4
+  #       (upnp_prerouting / upnp_forward / upnp_postrouting, in
+  #       /usr/share/nftables.d/) and they ship EMPTY, with only a jump into
+  #       each. The daemon listens on the LAN side (internal_iface) and adds no
+  #       WAN listener, so an unsolicited-inbound scan still finds nothing.
+  #       What changes is that the WAN becomes LAN-CONTROLLABLE: a LAN host can
+  #       ask for a hole. base-files/etc/uci-defaults/30-upnp-secure is what
+  #       bounds that (secure_mode, high ports only, terminal deny) and
+  #       upnp_igd_wan_exposure is what proves the daemon stays LAN-only.
   DEVICE_PACKAGES := dnsmasq firewall4 \
 	luci-base luci-mod-admin-full luci-theme-bootstrap \
 	uhttpd uhttpd-mod-ubus rpcd rpcd-mod-file \
 	wpad-basic-mbedtls wifi-scripts wireless-regdb iw \
-	ppp ppp-mod-pppoe kmod-ppp kmod-pppox kmod-pppoe
+	ppp ppp-mod-pppoe kmod-ppp kmod-pppox kmod-pppoe \
+	miniupnpd-nftables
 endef
 TARGET_DEVICES += realtek_rtl9607f_x400axf

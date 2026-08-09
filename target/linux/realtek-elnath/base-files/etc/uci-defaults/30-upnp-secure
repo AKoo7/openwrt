@@ -27,6 +27,18 @@
 #
 # NOT A REPLACEMENT FOR THE FIREWALL: this only governs what a LAN client may
 # ask for.  Unsolicited inbound is still refused by firewall4's wan zone.
+#
+# ★ THERE IS DELIBERATELY NO `uuid` LINE -- DO NOT RE-ADD ONE.
+# This file used to carry `set upnpd.config.uuid='<UUID>'`, a literal placeholder
+# that nothing in the tree ever substituted.  It is not inert: miniupnpd.init
+# regenerates the UUID only when the option is EMPTY
+#   [ -z "$uuid" ] && uuid="$(cat /proc/sys/kernel/random/uuid)"
+# and the seven-character string `<UUID>` is not empty, so the test never fires.
+# The daemon would then advertise `uuid=<UUID>` in its USN on every unit built
+# from this image: a malformed UUID, and identical fleet-wide, so two ONUs are
+# one device to any control point that keys on it.  Leaving the option UNSET is
+# what makes the init script mint a random per-unit UUID on first start and
+# persist it with `uci set` + `uci commit` -- correct and self-maintaining.
 uci -q batch <<-EOF
 	delete upnpd.config
 	set upnpd.config=upnpd
@@ -41,7 +53,6 @@ uci -q batch <<-EOF
 	set upnpd.config.internal_iface='lan'
 	set upnpd.config.port='5000'
 	set upnpd.config.upnp_lease_file='/var/run/miniupnpd.leases'
-	set upnpd.config.uuid='<UUID>'
 	delete upnpd.@perm_rule[-1]
 	delete upnpd.@perm_rule[-1]
 	delete upnpd.@perm_rule[-1]
