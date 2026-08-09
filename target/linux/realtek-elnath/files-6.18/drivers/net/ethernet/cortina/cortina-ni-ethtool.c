@@ -17,10 +17,10 @@
  * `ethtool` is served by both firmwares' kernels, so the SAME case runs on
  * both and the comparison exists.
  *
- * The /proc nodes are untouched and stay until this interface is proven on the
- * board; retiring them is a separate step.  While both exist they must not
- * fight over the read-and-clear counters - see cortina_ni_nihv_sample() below,
- * which is the single reader they all go through.
+ * The driver-named /proc nodes are GONE: this interface plus the debugfs
+ * narrative replaced them.  Nothing here competes for the read-and-clear
+ * counters any more - cortina_ni_nihv_sample() below is still the single
+ * reader, because the debugfs dump goes through it too.
  *
  * ★ AND THE ORACLE HALF IS REAL, not merely hoped for - MEASURED 2026-08-08 in
  * the vendor's own shipped module (tier 2: stock's binary, read with `strings`,
@@ -49,6 +49,7 @@
  */
 
 #include <linux/bitfield.h>
+#include <linux/build_bug.h>
 #include <linux/ethtool.h>
 #include <linux/io.h>
 #include <linux/kernel.h>
@@ -79,10 +80,11 @@ static inline void __iomem *ni_base(struct cortina_ni *ni)
  * ⚠ The two SIBLING error words at 0xa9f4 (RX_MISSING_SOP_EOP) and 0xa9f8
  * (RX_SHORT_ERR) are deliberately NOT here.  They live in the same block and
  * are very probably the same kind of counter, but each packs TWO quantities
- * into one word (hi16/lo16), so there is no single countable value to publish
- * and naming one would be naming it wrongly.  They remain a /proc-only
- * reading; splitting them needs the hi/lo semantics established on stock
- * first.
+ * into one word (hi16/lo16), so a u64 accumulator would destroy the split and
+ * a row named for one half would be a wrong name.  They are published further
+ * down AS WORDS (rx_missing_sop_eop_word / rx_short_err_word) and read
+ * directly; splitting them into named halves needs the hi/lo semantics
+ * established on stock first.
  */
 static const u32 cortina_ni_nihv_off[CA_NI_NIHV_CNT_COUNT] = {
 	[CA_NI_NIHV_L3FE_RX]	= CA_NI_NI_L3FE_RX_PKT_CNT,
@@ -132,7 +134,16 @@ enum ca_ni_stat_src {
 	CA_ST_PORT_MIB,		/* per-port RX MIB, @arg = counter id, i = port*/
 	CA_ST_DRV_FLAG,		/* a driver state bit, @arg selects which      */
 	CA_ST_L3FE,		/* index @arg into the offload snapshot        */
+	CA_ST_EPP_WRPTR,	/* EPP write pointer, masked to a ring offset  */
+	CA_ST_CB_OCC,		/* central-buffer occupancy aggregate, @arg    */
+	CA_ST_CB_PORT_FREE,	/* CB per-port free-count word, @arg = port    */
+	CA_ST_PHY_LINK,		/* per-GPHY-port PHY link, i = port            */
 };
+
+/* CA_ST_CB_OCC selectors */
+#define CA_ST_CB_TOTAL		0
+#define CA_ST_CB_MAX		1
+#define CA_ST_CB_NONZERO	2
 
 /* CA_ST_DRV_FLAG selectors */
 #define CA_ST_FLAG_RX_UP	0
@@ -292,6 +303,68 @@ static const struct ca_ni_stat_grp cortina_ni_stat_grps[] = {
 	{ "qm_drop_rx_len_err",		1, CA_ST_NI_REG, CA_NI_QM_RX_LEN_ERR_CNTR },
 	{ "qm_drop_rx_l2te",		1, CA_ST_NI_REG, CA_NI_QM_RX_L2TE_DROP_CNTR },
 
+	/* ---- engine GAUGES -----------------------------------------------
+	 * A gauge in `ethtool -S` is ordinary and other drivers publish them;
+	 * these are here rather than in `ethtool -d` for one of two structural
+	 * reasons, never convenience.  A gauge's ABSOLUTE value is the
+	 * measurement, so it is never differenced.
+	 *
+	 * qm_free_pages + qm_interrupt_source are plain readl()s and DO appear
+	 * in the -d sweep as well; they are named here because a consumer that
+	 * wants one value should not have to resolve a positional index
+	 * through a decode map and pin an ABI the driver is allowed to append
+	 * to.  Both names come from stock's own register table (tier 2):
+	 * L2TM_QM_EQ_GLB_FREECNT and QM_INT_SRC.
+	 */
+	{ "qm_free_pages",	1, CA_ST_NI_REG, CA_NI_L2TM_QM_EQ_GLB_FREECNT },
+	{ "qm_interrupt_source", 1, CA_ST_NI_REG, CA_NI_QM_INT_SRC },
+
+	/*
+	 * The CPU port's two empty-buffer pools, as the RAW PA_REQ word.
+	 * `inactive` (the buffers a pool is SHORT, healthy 0) is bits[13:0]
+	 * and `ready` is bit31, so one word carries two quantities and
+	 * publishing it under either name would be naming it wrongly - the
+	 * consumer masks out the field it wants.  The two EQ ids are adjacent
+	 * by silicon, which the assert below refuses to let drift.
+	 */
+	{ "rx_cpu_pool%u_pa_req",	2, CA_ST_NI_REG,
+	  CA_NI_QM_EQM_PA_REQ(CA_NI_RX_EQ_ID), 4 },
+
+	/*
+	 * The two packed NI_HV error words, published AS WORDS.  Each carries
+	 * two 16-bit quantities (0xa9f4 hi=missing-SOP lo=missing-EOP, 0xa9f8
+	 * hi=short lo=err), so there is no single countable value and a row
+	 * named for one half would be a wrong name.  They are READ-AND-CLEAR
+	 * in hardware and are deliberately NOT routed through
+	 * cortina_ni_nihv_sample(): a u64 accumulator cannot add two packed
+	 * halves without destroying the split.  `ethtool -S` is now their only
+	 * reader, so nothing steals from anything.
+	 */
+	{ "rx_missing_sop_eop_word",	1, CA_ST_NI_REG,
+	  CA_NI_NI_L3QM_RX_MISS_SOP_EOP },
+	{ "rx_short_err_word",		1, CA_ST_NI_REG,
+	  CA_NI_NI_L3QM_RX_SHORT_ERR },
+
+	/* ---- indirect / derived / MDIO: what -d cannot carry -------------- */
+	{ "rx_epp_wrptr_voq%u",	CA_NI_RX_VOQ_COUNT, CA_ST_EPP_WRPTR },
+	{ "cb_voq_used_pages_total",	1, CA_ST_CB_OCC, CA_ST_CB_TOTAL },
+	{ "cb_voq_used_pages_max",	1, CA_ST_CB_OCC, CA_ST_CB_MAX },
+	{ "cb_voq_nonzero_count",	1, CA_ST_CB_OCC, CA_ST_CB_NONZERO },
+	{ "cb_lan_port_free_word",	1, CA_ST_CB_PORT_FREE,
+	  CA_NI_RX_CB_PORT_LAN },
+	{ "cb_cpu_port_free_word",	1, CA_ST_CB_PORT_FREE,
+	  CA_NI_RX_CB_PORT_CPU },
+	/*
+	 * ★ PER-PORT PHY LINK - which PRINTED socket the cable is actually in.
+	 * The one question this driver cannot answer any other standard way:
+	 * it registers ONE netdev on ONE phylib PHY, so get_link and
+	 * /sys/class/net/<if>/carrier speak for that PHY alone and every other
+	 * RJ45 is invisible.  This board links on port 3, not port 0, and its
+	 * panel order is MIRRORED, so a guessed map sends a technician to the
+	 * wrong socket.  ~0ULL = the MDIO read failed, which is not "no link".
+	 */
+	{ "port%u_phy_link",	CA_NI_LAN_PORT_COUNT, CA_ST_PHY_LINK },
+
 #if IS_ENABLED(CONFIG_CORTINA_NI_FLOWOFFLOAD)
 	/* ---- L3FE flow offload ------------------------------------------
 	 * Absent from the string set when the engine is not built in, which is
@@ -326,10 +399,23 @@ static const struct ca_ni_stat_grp cortina_ni_stat_grps[] = {
  * row that mentions it. */
 struct ca_ni_stat_ctx {
 	u64	nihv[CA_NI_NIHV_CNT_COUNT];
+	/* The central-buffer scan is 128 indirect ACCESS/DATA transactions and
+	 * all three aggregates come out of ONE walk, so it is sampled once per
+	 * `ethtool -S` like the read-and-clear block above - not once per row
+	 * that mentions it. */
+	u64	cb_occ[3];
 #if IS_ENABLED(CONFIG_CORTINA_NI_FLOWOFFLOAD)
 	u64	l3fe[CA_L3FE_STAT_COUNT];
 #endif
 };
+
+/* CA_NI_RX_EQ_ID / _ID2 are the CPU port's two empty-buffer pools and the
+ * stats row above reads them as ONE two-entry family at stride 4.  They are
+ * adjacent by silicon today (5 and 6); the header records that they were once
+ * 13 and 14, so if they are ever moved apart again this must become two rows
+ * rather than silently reading the wrong register. */
+static_assert(CA_NI_RX_EQ_ID2 == CA_NI_RX_EQ_ID + 1,
+	      "rx_cpu_pool%u_pa_req reads the two pools as one stride-4 family");
 
 static u64 ca_ni_stat_value(struct cortina_ni *ni,
 			    const struct ca_ni_stat_grp *g, unsigned int i,
@@ -368,6 +454,21 @@ static u64 ca_ni_stat_value(struct cortina_ni *ni,
 	case CA_ST_L3FE:
 		return ctx->l3fe[g->arg + i];
 #endif
+	case CA_ST_EPP_WRPTR:
+		return cortina_ni_rx_epp_wrptr(ni, i);
+	case CA_ST_CB_OCC:
+		return ctx->cb_occ[g->arg];
+	case CA_ST_CB_PORT_FREE:
+		return cortina_ni_rx_cb_port_free_word(ni, g->arg);
+	case CA_ST_PHY_LINK: {
+		int up = cortina_ni_rx_phy_link(ni, i);
+
+		/* ~0ULL, not 0: "the MDIO read did not complete" and "this
+		 * socket has no cable" are different answers, and reporting
+		 * the second when the first happened is a sentence about the
+		 * device manufactured by a fault of the instrument. */
+		return up < 0 ? ~0ULL : (u64)up;
+	}
 	default:
 		return 0;
 	}
@@ -422,6 +523,9 @@ static void cortina_ni_get_ethtool_stats(struct net_device *dev,
 
 	/* ONE sample of every shared source, before the walk */
 	cortina_ni_nihv_sample(ni, ctx.nihv);
+	cortina_ni_rx_cb_occupancy(ni, &ctx.cb_occ[CA_ST_CB_TOTAL],
+				   &ctx.cb_occ[CA_ST_CB_MAX],
+				   &ctx.cb_occ[CA_ST_CB_NONZERO]);
 #if IS_ENABLED(CONFIG_CORTINA_NI_FLOWOFFLOAD)
 	cortina_ni_flowoffload_stats(ctx.l3fe);
 #endif

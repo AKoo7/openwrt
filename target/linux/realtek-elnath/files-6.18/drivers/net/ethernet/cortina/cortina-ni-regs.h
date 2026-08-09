@@ -782,6 +782,11 @@ enum cortina_ni_win {
 /* --- NI core window (idx 0): L2TM block (QM buffer manager + egress
  *     scheduler), offsets identical to CA8277B --- */
 #define CA_NI_L2TM_QM_EQ_CFG		0x2208
+/* The QM global free-page pool.  Stock's own name (tier 2, /etc/reg.txt:
+ * L2TM_L2TM_QM_EQ_GLB_FREECNT @0xf4302234).  Healthy 3632 (0x0e30); it reads 0
+ * in the recorded datapath wedge while the central buffer still holds pages -
+ * the two together ARE that fault's signature. */
+#define CA_NI_L2TM_QM_EQ_GLB_FREECNT	0x2234
 #define  CA_NI_L2TM_EQ0_BUFNUM		GENMASK(4, 0)
 #define  CA_NI_L2TM_EQ0_PRVT		GENMASK(15, 5)
 #define  CA_NI_L2TM_EQ1_BUFNUM		GENMASK(19, 16)
@@ -861,6 +866,18 @@ enum cortina_ni_win {
 #define CA_NI_L2TM_CB_VOQ_BUFCNT_DATA	0x2dc0
 #define CA_NI_L2TM_CB_PORT_FREECNT_ACCESS 0x2db4
 #define CA_NI_L2TM_CB_PORT_FREECNT_DATA	0x2db8
+/* The VOQ index space the occupancy scan walks, and where the PAGE count sits
+ * inside the returned word.  Proven arithmetic, from the recorded wedge: the
+ * scan printed q64=160956416 q72=1835008 q107=80216064 and the meta line read
+ * 2456/28/1224 pages = 3708 = 102 % of the free pool - i.e. the pages are the
+ * word's HIGH half, and indices well past 63 are real. */
+#define CA_NI_RX_CB_VOQ_ENTRIES		128
+#define CA_NI_RX_CB_VOQ_PAGES_SHIFT	16
+/* The two CB ports the driver seeds and therefore reports: the LAN-side port
+ * and the CPU port.  Named, because a bare 0 and 8 in a stats table is a board
+ * literal nobody can check. */
+#define CA_NI_RX_CB_PORT_LAN		0
+#define CA_NI_RX_CB_PORT_CPU		8
 /* ★★★ THE deep-queue POPULATE step (ca-ne.ko: aal_l3qm_init_DQ_pools_pool0 ->
  * aal_l3_te_cb_port_free_buf_cnt_set, looped over ports 0-47).  Initialises the
  * CB's per-port FREE-BUFFER count; without it the CB has 0 free deep-queue
@@ -1356,6 +1373,14 @@ enum cortina_ni_win {
 					 ~(u32)CA_NI_QM_EPP64_INT_PORT0)
 #define CA_NI_QM_EPP64_INT_EN2		0x6118
 #define  CA_NI_QM_EPP64_INT_EN2_STOCK	0x00000100u
+/* ★ NAMED FROM THE SILICON'S OWN TABLE, not from what we use it for.  Stock's
+ * /etc/reg.txt (tier 2, the shipped product's own view) calls 0x611c
+ * `QM_QM_INT_SRC` - a QM INTERRUPT-SOURCE register.  The suite watches two of
+ * its bits as a configuration-error witness (bit8 = the no-free-buffer source
+ * that fires when the RMU drops every frame, bit20), which is a use of the
+ * register, not its identity: a define called CA_NI_QM_CFG_ERR would be the
+ * misleading kind of name this project treats as a defect. */
+#define CA_NI_QM_INT_SRC		0x611c
 
 /* --- QM block: empty-buffer pool --- */
 /* push one 128-byte-aligned buffer phys addr into EQ pool <eqid> */

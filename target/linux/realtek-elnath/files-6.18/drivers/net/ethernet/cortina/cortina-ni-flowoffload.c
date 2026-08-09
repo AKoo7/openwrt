@@ -52,7 +52,6 @@
 #include <linux/ip.h>
 #include <linux/jiffies.h>
 #include <linux/mm.h>
-#include <linux/proc_fs.h>
 #include <linux/sched.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
@@ -1605,7 +1604,7 @@ static enum cn_pppoe_leg_verdict cn_pppoe_leg_check(bool pppoe_mode, bool ds_leg
 bool cortina_ni_pppoe_punt_check;
 module_param_named(pppoe_punt_check, cortina_ni_pppoe_punt_check, bool, 0644);
 MODULE_PARM_DESC(pppoe_punt_check,
-	"inspect every CPU-punted 0x8864 PPPoE session frame for self-consistency (PPPoE length vs inner IP total length, inner TCP data-offset sanity, session id) and report in /proc/cortina_l3fe pppoe_punt: - the GAP-2 (DS-mangle) witness. Default OFF; run it with hw_pppoe=0 FIRST to establish the clean baseline");
+	"inspect every CPU-punted 0x8864 PPPoE session frame for self-consistency (PPPoE length vs inner IP total length, inner TCP data-offset sanity, session id) and report in debugfs .../cortina-l3fe/state under `pppoe_punt:` - the GAP-2 (DS-mangle) witness. Default OFF; run it with hw_pppoe=0 FIRST to establish the clean baseline");
 
 static atomic_t cn_pppoe_punt_seen = ATOMIC_INIT(0);
 static atomic_t cn_pppoe_punt_ctrl = ATOMIC_INIT(0);
@@ -2283,7 +2282,8 @@ int cortina_ni_wan_pppoe_session_set(u16 session)
 	 * sid; never leave a live flow carrying a stale sid.  Cheap + rare;
 	 * the entry_by_idx scan avoids an rhashtable-walk use-after-free.
 	 * ★ Caller MUST hold cn_flow_offload_mutex.  All four in-tree callers do:
-	 * the /proc "pppoe" write (cn_l3e_proc_write takes it), cn_l3e_set_us_egress
+	 * the debugfs "pppoe" control write (cortina_ni_l3fe_debug_write takes it),
+	 * cn_l3e_set_us_egress
 	 * via cn_flow_replace, the WAN data-path teardown and the hw_pppoe 1->0 edge
 	 * (the last two take it around the call - both run in sleepable context). */
 	if (session != READ_ONCE(l3e->data_pppoe_session) &&
@@ -5581,7 +5581,17 @@ void cortina_ni_flowoffload_stats(u64 out[CA_L3FE_STAT_COUNT])
 	out[CA_L3FE_VLAN_STRIP_LEGS]	= l3e ? l3e->aft_strip : 0;
 }
 
-static int cn_l3e_proc_show(struct seq_file *m, void *v)
+/*
+ * The offload engine's own narrative.  debugfs .../cortina-l3fe/state, was
+ * /proc/cortina_l3fe.  Every COUNTER it printed (hits, refusals, the VLAN/PPPoE
+ * programming tallies, the resident-flow gauge) is an `ethtool -S` row now, so
+ * the half a test reads is on an interface stock's kernel serves too.  What is
+ * left is the FIB read-back with its READ-BACK FAILED rows, the armed
+ * descriptor latch, the per-stage ledgers and the engine's own verdicts - our
+ * engine's internals, for which stock has no counterpart under any name.
+ * NON-COMPARATIVE by construction, and no test may read it.
+ */
+int cortina_ni_l3fe_debug_show(struct seq_file *m, void *v)
 {
 	struct cn_l3e *l3e = cn_l3e;
 	unsigned long flags;
@@ -6151,13 +6161,14 @@ static int cn_l3e_proc_show(struct seq_file *m, void *v)
 	return 0;
 }
 
-static int cn_l3e_proc_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, cn_l3e_proc_show, NULL);
-}
-
-static ssize_t cn_l3e_proc_write(struct file *file, const char __user *ubuf,
-				 size_t len, loff_t *ppos)
+/*
+ * The engine's WRITE side: manual flow install/delete, the descriptor latch,
+ * the PPPoE session shadow.  A bring-up CONTROL, not a measurement - `ethtool`
+ * is read-only and stock has no counterpart by construction, so debugfs is
+ * where it belongs and a stock-vs-ours verdict may never be derived through it.
+ */
+ssize_t cortina_ni_l3fe_debug_write(struct file *file, const char __user *ubuf,
+				    size_t len, loff_t *ppos)
 {
 	struct cn_l3e *l3e = cn_l3e;
 	char buf[160], cmd[16] = {};
@@ -6392,13 +6403,6 @@ out:
 	return err ? err : len;
 }
 
-static const struct proc_ops cn_l3e_proc_ops = {
-	.proc_open	= cn_l3e_proc_open,
-	.proc_read	= seq_read,
-	.proc_lseek	= seq_lseek,
-	.proc_release	= single_release,
-	.proc_write	= cn_l3e_proc_write,
-};
 
 /* ------------------------------------------------------------------ */
 /* probe entry (called once from the cortina-ni platform probe).  Any  */
@@ -6469,8 +6473,8 @@ int cortina_ni_flowoffload_probe(struct cortina_ni *ni)
 		goto err_free_carve;
 	}
 
-	/* P3 manual-install / HW-HIT proof (coherent carve write) */
-	proc_create_data("cortina_l3fe", 0644, NULL, &cn_l3e_proc_ops, NULL);
+	/* the state dump + the manual-install control are published from
+	 * cortina_ni_debugfs_init(), which runs at the end of probe */
 
 	/* phase-1 gate evidence: read back everything the arm wrote */
 	dev_info(ni->dev,

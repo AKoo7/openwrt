@@ -98,6 +98,40 @@ void cortina_ni_regdump_entry(unsigned int i, const char **name, u32 *off);
  */
 u32 cortina_ni_rx_mib_read(struct cortina_ni *ni, u32 port, u32 cnt_id);
 
+/*
+ * The values `ethtool -d` structurally cannot carry, so they are published as
+ * `ethtool -S` rows instead.  All indirect / derived / MDIO, all process
+ * context only, all documented at their definitions in cortina-ni-rx.c.
+ */
+u32 cortina_ni_rx_epp_wrptr(struct cortina_ni *ni, unsigned int voq);
+void cortina_ni_rx_cb_occupancy(struct cortina_ni *ni, u64 *total, u64 *max,
+				u64 *nonzero);
+u32 cortina_ni_rx_cb_port_free_word(struct cortina_ni *ni, unsigned int port);
+/* -1 when the MDIO read failed: "could not ask" is not "no link". */
+int cortina_ni_rx_phy_link(struct cortina_ni *ni, unsigned int port);
+
+/*
+ * The hand-debugging narratives.  They live beside the state they print; only
+ * their PUBLICATION is central (cortina_ni_debugfs_init), so there is one place
+ * that answers "what debug surface does this driver expose".
+ *
+ * ⚠ NONE OF THESE IS A MEASUREMENT SOURCE.  Every countable value moved to
+ * `ethtool -S` and every plain register word to `ethtool -d`, both of which the
+ * VENDOR firmware's kernel serves too - which is what makes a stock-vs-ours
+ * comparison possible at all.  What is left here is prose, table read-backs and
+ * RE'd stock-expected values for a human, published through debugfs: root-only,
+ * absent when CONFIG_DEBUG_FS is off, and explicitly not a stable ABI.  A test
+ * reading it would re-create the exact defect the /proc nodes had.
+ */
+struct seq_file;
+int cortina_ni_rx_debug_show(struct seq_file *m, void *v);
+int cortina_ni_tx_debug_show(struct seq_file *m, void *v);
+#if IS_ENABLED(CONFIG_CORTINA_NI_FLOWOFFLOAD)
+int cortina_ni_l3fe_debug_show(struct seq_file *m, void *v);
+ssize_t cortina_ni_l3fe_debug_write(struct file *file, const char __user *ubuf,
+				    size_t len, loff_t *ppos);
+#endif
+
 /* One DMA-LSO virtual port (VP); M2b uses TXQ 0 of each CPU VP only. */
 struct cortina_ni_txq {
 	u8		vp;		/* DMA-LSO VP index (CPU n -> VP n+2) */

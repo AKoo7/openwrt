@@ -50,7 +50,6 @@
 #include <linux/mutex.h>
 #include <linux/netdevice.h>
 #include <linux/platform_device.h>
-#include <linux/proc_fs.h>
 #include <linux/ratelimit.h>	/* ★ TEMP DIAG rx_stack_tap - revert with it */
 #include <linux/seq_file.h>
 #include <linux/skbuff.h>
@@ -5533,6 +5532,107 @@ u32 cortina_ni_rx_mib_read(struct cortina_ni *ni, u32 port, u32 cnt_id)
 	return readl(ni_base(ni) + CA_NI_HV_RXMIB_DATA0);
 }
 
+/* ------------------------------------------------------------------ */
+/* values `ethtool -d` structurally cannot carry, published to -S       */
+/* ------------------------------------------------------------------ */
+
+/*
+ * `ethtool -d` is a flat sweep of PLAIN readl()s - that is its stated
+ * contract, and it is what makes a dump safe to take at any moment.  Three
+ * kinds of value cannot ride it and therefore get an `ethtool -S` row of their
+ * own, computed here where the access already lives:
+ *
+ *   INDIRECT   the central-buffer occupancy and per-port free-word counts are
+ *              an ACCESS-write + DATA-read pair, and 128 of them for the VOQ
+ *              scan.  Two readers racing on the ACCESS register get each
+ *              other's index - a confident wrong number, not an error - so
+ *              there must be exactly one path, and it is this one.
+ *   DERIVED    the EPP write pointer is masked to a ring byte offset before it
+ *              means anything; the raw word is a different quantity.
+ *   MDIO       per-port PHY link is a bus transaction, not a register.
+ *
+ * All are called from `ethtool -S` (process context, may sleep).
+ */
+
+/* The EPP write pointer as a RING BYTE OFFSET - the same two masks the RX poll
+ * applies, so the published value is the one the datapath acts on and not the
+ * raw register word. */
+u32 cortina_ni_rx_epp_wrptr(struct cortina_ni *ni, unsigned int voq)
+{
+	if (!ni_base(ni) || voq >= CA_NI_RX_VOQ_COUNT)
+		return 0;
+	return cortina_ni_rx_wptr_voq(ni, voq);
+}
+
+/*
+ * Central-buffer occupancy, AGGREGATED here rather than published as 128 raw
+ * rows: nobody differences a per-VOQ gauge, and three aggregates answer the
+ * question the wedge signature is built from (pages held while the free pool
+ * reads 0).  The pages are the register word's HIGH half.
+ */
+void cortina_ni_rx_cb_occupancy(struct cortina_ni *ni, u64 *total, u64 *max,
+				u64 *nonzero)
+{
+	unsigned int q;
+
+	*total = 0;
+	*max = 0;
+	*nonzero = 0;
+	if (!ni_base(ni))
+		return;
+
+	for (q = 0; q < CA_NI_RX_CB_VOQ_ENTRIES; q++) {
+		u32 c, pages;
+
+		cortina_ni_rx_ind_read(ni, CA_NI_L2TM_CB_VOQ_BUFCNT_ACCESS, q);
+		c = readl(ni_base(ni) + CA_NI_L2TM_CB_VOQ_BUFCNT_DATA);
+		if (!c)
+			continue;
+		pages = c >> CA_NI_RX_CB_VOQ_PAGES_SHIFT;
+		*total += pages;
+		if (pages > *max)
+			*max = pages;
+		(*nonzero)++;
+	}
+}
+
+/* The per-port free-buffer count register WORD, undecoded and named as a word:
+ * the packing is not proven on this silicon, so a row called "free pages"
+ * would be naming it wrongly. */
+u32 cortina_ni_rx_cb_port_free_word(struct cortina_ni *ni, unsigned int port)
+{
+	if (!ni_base(ni))
+		return 0;
+	cortina_ni_rx_ind_read(ni, CA_NI_L2TM_CB_PORT_FREECNT_ACCESS, port);
+	return readl(ni_base(ni) + CA_NI_L2TM_CB_PORT_FREECNT_DATA);
+}
+
+/*
+ * Per-GPHY-port PHY link.  ★ THIS IS THE ONE ANSWER TO "WHICH PRINTED SOCKET
+ * HAS THE CABLE", and this port has already paid for guessing it: the host
+ * links on port 3, not port 0, and the panel order is MIRRORED.  The driver
+ * registers ONE netdev bound to ONE phylib PHY, so /sys/class/net/<if>/carrier
+ * and ethtool's own get_link can only ever speak for that one - every other
+ * socket would be invisible.  Hence a per-port row.
+ *
+ * -1 when the bus read failed, so "the MDIO transaction did not complete" and
+ * "the port has no link" stay different answers; a u64 stat carries it as
+ * ~0ULL.
+ */
+int cortina_ni_rx_phy_link(struct cortina_ni *ni, unsigned int port)
+{
+	int addr, bmsr;
+
+	if (!ni->mii || port >= CA_NI_GPHY_COUNT)
+		return -1;
+	addr = CA_NI_GPHY_FIRST + port;
+	mdiobus_read(ni->mii, addr, MII_BMSR);		/* clear the latch */
+	bmsr = mdiobus_read(ni->mii, addr, MII_BMSR);
+	if (bmsr < 0)
+		return -1;
+	return !!(bmsr & BMSR_LSTATUS);
+}
+
 /*
  * Full curated NI-window register snapshot for a good-vs-bad-boot diff.
  * Every offset is < 0x10000 (inside the 64K NI window) and read with a
@@ -5862,7 +5962,30 @@ void cortina_ni_cpu_fwd_show(struct seq_file *m, struct cortina_ni *ni)
 		   rx ? rx->wan_frames : 0ULL);
 }
 
-static int cortina_ni_rx_proc_show(struct seq_file *m, void *v)
+/*
+ * The RX-side narrative dump.  ★ IT IS DEBUGFS NOW, NOT /proc (2026-08-08).
+ *
+ * It used to be /proc/net/cortina_ni_rx -- a node named after ONE driver on ONE
+ * model, which the vendor firmware has under no name.  A test reading it could
+ * therefore only ever BLOCK when run against stock, so the ORACLE half of every
+ * "compared against stock" datapath claim taken through it was structurally
+ * impossible.  Every countable VALUE moved to `ethtool -S` and the register
+ * snapshot to `ethtool -d`, both of which stock's kernel serves too.
+ *
+ * What is left here is what a HUMAN reads while debugging and no standard
+ * interface can carry: the annotated bisect narrative with its RE'd
+ * stock-expected `want ...` values, the L2FE/PDPID/MC-FIB table read-backs, the
+ * axi_reo and fbm window dumps.  Those are facts recorded nowhere else in the
+ * tree, which is exactly why this function is MOVED and not deleted - the
+ * project rule is that the spy/dump capability is never stripped; only where it
+ * is exposed changed.
+ *
+ * ⚠ AND NO TEST MAY READ IT.  That is the whole safety of allowing a
+ * driver-named debugfs directory: debugfs is root-only, absent when
+ * CONFIG_DEBUG_FS is off, frequently unmounted, and explicitly not a stable ABI.
+ * A case reading it would re-create the same defect one directory over.
+ */
+int cortina_ni_rx_debug_show(struct seq_file *m, void *v)
 {
 	struct cortina_ni *ni = m->private;
 	struct cortina_ni_rx *rx = ni->rx;
@@ -7091,8 +7214,8 @@ int cortina_ni_rx_probe(struct cortina_ni *ni)
 
 	/* Create the RX /proc NOW so the QM/pool registers are readable live even if
 	 * the pool never activates (proc_show is NULL-safe). */
-	proc_create_single_data("cortina_ni_rx", 0444, init_net.proc_net,
-				cortina_ni_rx_proc_show, ni);
+	/* the narrative dump is published from cortina_ni_debugfs_init(), which
+	 * runs at the end of probe - after this - so nothing is registered here */
 
 	/* ★ NO software populate: the cpu_eq=0 pools self-populated at the EQ_CFG_LOAD
 	 * commit (stock model - the QM built its own free-list over CFG0.phy_addr_start).

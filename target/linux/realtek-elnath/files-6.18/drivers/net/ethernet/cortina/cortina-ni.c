@@ -23,7 +23,6 @@
 #include <linux/of_reserved_mem.h>
 #include <linux/phy.h>
 #include <linux/platform_device.h>
-#include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/spinlock.h>
 
@@ -658,7 +657,7 @@ static int cortina_ni_mdio_init(struct cortina_ni *ni)
 }
 
 /* ------------------------------------------------------------------ */
-/* /proc/cortina_ni_peek: dump ARBITRARY window registers, read-only.  */
+/* the arbitrary-window register peek, read-only (debugfs .../cortina-ni/peek) */
 /* Decisive good-vs-bad-boot diff tool - every RX-subset register reads */
 /* identical on a working and a broken boot, so the deciding bit lives  */
 /* in a register the fixed spy does not print.  Bounded, plain readl,   */
@@ -922,47 +921,13 @@ int cortina_ni_peek_command(struct cortina_ni *ni, char *buf)
 	return 0;
 }
 
-static int cortina_ni_peek_show(struct seq_file *m, void *v)
-{
-	cortina_ni_peek_render(m, m->private);
-	return 0;
-}
-
-static int cortina_ni_peek_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, cortina_ni_peek_show, pde_data(inode));
-}
-
-static ssize_t cortina_ni_peek_write(struct file *file, const char __user *ubuf,
-				     size_t len, loff_t *ppos)
-{
-	struct cortina_ni *ni = pde_data(file_inode(file));
-	char buf[64];
-	int ret;
-
-	if (len == 0 || len >= sizeof(buf))
-		return -EINVAL;
-	if (copy_from_user(buf, ubuf, len))
-		return -EFAULT;
-	buf[len] = '\0';
-
-	ret = cortina_ni_peek_command(ni, buf);
-	return ret ? ret : len;
-}
-
-static const struct proc_ops cortina_ni_peek_pops = {
-	.proc_open	= cortina_ni_peek_open,
-	.proc_read	= seq_read,
-	.proc_lseek	= seq_lseek,
-	.proc_release	= single_release,
-	.proc_write	= cortina_ni_peek_write,
-};
-
 /* ------------------------------------------------------------------ */
-/* /proc/cortina_ni_gsram: read the internal-GPHY uC SRAM (0x8xxx words) */
-/* for the ours-vs-stock firmware diff, read-only.  Same access the      */
-/* operator used on stock: OCP 0xa436=addr, read OCP 0xa438=data.  The uC */
-/* is best-effort held around the dump (stock reads fine while held).     */
+/* the internal-GPHY uC SRAM reader (ours-vs-stock firmware diff),      */
+/* read-only.  Same access the operator used on stock: OCP 0xa436=addr, */
+/* read OCP 0xa438=data.  The uC is best-effort held around the dump    */
+/* (stock reads fine while held).  debugfs .../cortina-ni/gsram; it was */
+/* /proc/cortina_ni_gsram and it has no test consumer, by design - it   */
+/* is a bring-up tool for a human, not a measurement source.            */
 /* ------------------------------------------------------------------ */
 static int cortina_ni_gsram_show(struct seq_file *m, void *v)
 {
@@ -978,7 +943,8 @@ static int cortina_ni_gsram_show(struct seq_file *m, void *v)
 	}
 	if (!q.count) {
 		seq_puts(m,
-			 "usage: echo '<bank> <hex_start> <count>' > /proc/cortina_ni_gsram\n"
+			 "usage: echo '<bank> <hex_start> <count>' > "
+			 "/sys/kernel/debug/cortina-ni/gsram\n"
 			 "  bank 0..3, start = SRAM word addr (hex, e.g. 8000), count 1..1024\n");
 		return 0;
 	}
@@ -1008,13 +974,13 @@ static int cortina_ni_gsram_show(struct seq_file *m, void *v)
 
 static int cortina_ni_gsram_open(struct inode *inode, struct file *file)
 {
-	return single_open(file, cortina_ni_gsram_show, pde_data(inode));
+	return single_open(file, cortina_ni_gsram_show, inode->i_private);
 }
 
 static ssize_t cortina_ni_gsram_write(struct file *file, const char __user *ubuf,
 				      size_t len, loff_t *ppos)
 {
-	struct cortina_ni *ni = pde_data(file_inode(file));
+	struct cortina_ni *ni = ((struct seq_file *)file->private_data)->private;
 	char buf[64], *p, *tok;
 	u32 bank, start, count;
 
@@ -1045,12 +1011,13 @@ static ssize_t cortina_ni_gsram_write(struct file *file, const char __user *ubuf
 	return len;
 }
 
-static const struct proc_ops cortina_ni_gsram_pops = {
-	.proc_open	= cortina_ni_gsram_open,
-	.proc_read	= seq_read,
-	.proc_lseek	= seq_lseek,
-	.proc_release	= single_release,
-	.proc_write	= cortina_ni_gsram_write,
+static const struct file_operations cortina_ni_dbgfs_gsram_fops = {
+	.owner		= THIS_MODULE,
+	.open		= cortina_ni_gsram_open,
+	.read		= seq_read,
+	.write		= cortina_ni_gsram_write,
+	.llseek		= seq_lseek,
+	.release	= single_release,
 };
 
 /* ------------------------------------------------------------------ */
@@ -1069,9 +1036,11 @@ static const struct proc_ops cortina_ni_gsram_pops = {
  * needs is a home that is unambiguously a debug surface, mountable or not at
  * the integrator's choice, and that is debugfs.
  *
- * /proc/cortina_ni_peek and /proc/cortina_ni_gsram stay for now and are
- * unchanged in behaviour except that they finally have the bounds; retiring
- * them happens once this interface has been exercised on the board.
+ * ★ RETIRED 2026-08-08.  There are no driver-named /proc nodes left: the peek,
+ * the GPHY-SRAM reader and the rx/tx/l3fe narratives are all published here,
+ * and every countable VALUE moved to `ethtool -S` / `ethtool -d`, which the
+ * VENDOR firmware's kernel serves too - that is what makes a stock-vs-ours
+ * comparison possible at all, and it never was through a node of ours.
  */
 static int cortina_ni_dbgfs_peek_show(struct seq_file *m, void *v)
 {
@@ -1140,9 +1109,69 @@ static void cortina_ni_debugfs_release(void *data)
 	debugfs_remove_recursive(data);
 }
 
+/*
+ * The narrative dumps live in rx.c / tx.c / flowoffload.c beside the state they
+ * print; only their PUBLICATION is here, so there is one place that answers
+ * "what hand-debugging surface does this driver expose".
+ */
+static int cortina_ni_dbgfs_rx_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, cortina_ni_rx_debug_show, inode->i_private);
+}
+
+static const struct file_operations cortina_ni_dbgfs_rx_fops = {
+	.owner		= THIS_MODULE,
+	.open		= cortina_ni_dbgfs_rx_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+
+static int cortina_ni_dbgfs_tx_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, cortina_ni_tx_debug_show, inode->i_private);
+}
+
+static const struct file_operations cortina_ni_dbgfs_tx_fops = {
+	.owner		= THIS_MODULE,
+	.open		= cortina_ni_dbgfs_tx_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+
+#if IS_ENABLED(CONFIG_CORTINA_NI_FLOWOFFLOAD)
+static int cortina_ni_dbgfs_l3fe_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, cortina_ni_l3fe_debug_show, inode->i_private);
+}
+
+static const struct file_operations cortina_ni_dbgfs_l3fe_fops = {
+	.owner		= THIS_MODULE,
+	.open		= cortina_ni_dbgfs_l3fe_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+
+/* The CONTROL is its own file and 0200 (write-only) on purpose: a bring-up
+ * write is not a measurement, and a reader who lands on it by accident must not
+ * come away with something that looks like one. */
+static const struct file_operations cortina_ni_dbgfs_l3fe_ctl_fops = {
+	.owner		= THIS_MODULE,
+	.open		= cortina_ni_dbgfs_l3fe_open,
+	.write		= cortina_ni_l3fe_debug_write,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+#endif
+
 void cortina_ni_debugfs_init(struct cortina_ni *ni)
 {
 	struct dentry *d;
+#if IS_ENABLED(CONFIG_CORTINA_NI_FLOWOFFLOAD)
+	struct dentry *l;
+#endif
 
 	/* A stub when debugfs is off: debugfs_create_dir() then returns an
 	 * ERR_PTR that every later call swallows, so nothing here has to be
@@ -1164,6 +1193,26 @@ void cortina_ni_debugfs_init(struct cortina_ni *ni)
 	debugfs_create_file("peek", 0644, d, ni, &cortina_ni_dbgfs_peek_fops);
 	debugfs_create_file("regdump_map", 0444, d, ni,
 			    &cortina_ni_dbgfs_regmap_fops);
+	debugfs_create_file("gsram", 0644, d, ni, &cortina_ni_dbgfs_gsram_fops);
+	debugfs_create_file("rx_state", 0444, d, ni, &cortina_ni_dbgfs_rx_fops);
+	debugfs_create_file("tx_state", 0444, d, ni, &cortina_ni_dbgfs_tx_fops);
+
+#if IS_ENABLED(CONFIG_CORTINA_NI_FLOWOFFLOAD)
+	/* The offload engine gets its OWN directory, matching how it is declared
+	 * to the test rig: .../cortina-l3fe/{state,control}.  Two files, not one,
+	 * because a READ and a bring-up WRITE are different things and merging
+	 * them is how a control ends up looking like a measurement source. */
+	l = debugfs_create_dir("cortina-l3fe", NULL);
+	if (!IS_ERR_OR_NULL(l)) {
+		if (devm_add_action_or_reset(ni->dev,
+					     cortina_ni_debugfs_release, l))
+			return;
+		debugfs_create_file("state", 0444, l, ni,
+				    &cortina_ni_dbgfs_l3fe_fops);
+		debugfs_create_file("control", 0200, l, ni,
+				    &cortina_ni_dbgfs_l3fe_ctl_fops);
+	}
+#endif
 }
 
 /* Pulse one NE block reset: assert (set bit) -> 1ms -> deassert (clear bit),
@@ -1323,13 +1372,11 @@ static int cortina_ni_probe(struct platform_device *pdev)
 	if (ret)
 		dev_warn(dev, "L3FE flow offload disabled (%d)\n", ret);
 
-	/* arbitrary-register peek (good-vs-bad-boot diff tool) */
-	proc_create_data("cortina_ni_peek", 0644, NULL, &cortina_ni_peek_pops,
-			 ni);
-	/* internal-GPHY uC SRAM reader (ours-vs-stock firmware diff) */
-	proc_create_data("cortina_ni_gsram", 0644, NULL, &cortina_ni_gsram_pops,
-			 ni);
-	/* the peek's supported home + the `ethtool -d` decode map */
+	/* ★ EVERY hand-debugging dump this driver has, in ONE generic place.
+	 * There are no driver-named /proc nodes any more: what a TEST reads is
+	 * `ethtool -S` / `-d` (which stock's kernel serves too, so a comparison
+	 * exists at all), and what a HUMAN reads is here.  Runs last in probe so
+	 * rx/tx/l3fe are already up and every dump has something to show. */
 	cortina_ni_debugfs_init(ni);
 
 	dev_info(dev, "M2c probe complete\n");

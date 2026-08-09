@@ -36,7 +36,6 @@
 #include <linux/of.h>
 #include <linux/of_net.h>
 #include <linux/phy.h>
-#include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/skbuff.h>
 #include <net/arp.h>
@@ -1417,10 +1416,14 @@ static const struct net_device_ops cortina_ni_netdev_ops = {
 };
 
 /* ------------------------------------------------------------------ */
-/* spy/dump hook: /proc/net/cortina_ni_tx (project rule: probes stay)  */
+/* spy/dump hook (project rule: probes stay - only WHERE they are      */
+/* exposed changed).  debugfs .../cortina-ni/tx_state, was             */
+/* /proc/net/cortina_ni_tx.  Every COUNTER it printed is an            */
+/* `ethtool -S` row now; what remains is register words and ring       */
+/* pointers a human reads while debugging.  No test may read it.       */
 /* ------------------------------------------------------------------ */
 
-static int cortina_ni_tx_proc_show(struct seq_file *m, void *v)
+int cortina_ni_tx_debug_show(struct seq_file *m, void *v)
 {
 	struct cortina_ni *ni = m->private;
 	struct cortina_ni_tx *tx = ni->tx;
@@ -1583,8 +1586,7 @@ int cortina_ni_tx_probe(struct cortina_ni *ni)
 	if (ret)
 		return dev_err_probe(ni->dev, ret, "register_netdev failed\n");
 
-	proc_create_single_data("cortina_ni_tx", 0444, init_net.proc_net,
-				cortina_ni_tx_proc_show, ni);
+	/* the dump is published from cortina_ni_debugfs_init() at end of probe */
 
 	WRITE_ONCE(cortina_ni_pon_tx_ni, ni);	/* open the PON TX entry */
 	dev_info(ni->dev, "TX ready: %s -> LAN ports 0..%u (direct-TX, lan_tx_mode=%d)\n",
