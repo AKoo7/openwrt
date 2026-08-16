@@ -104,10 +104,46 @@
 	};
 
 	spi_nor: flash@14000000 {
-		/* 16 MB SPI-NOR, memory-mapped (physmap) at 0x14000000 */
+		/*
+		 * 16 MB SPI-NOR, memory-mapped (physmap) at 0x14000000.
+		 *
+		 * READ-ONLY: this describes the controller's memory-map read
+		 * window only, so map_rom binds and the MTD carries
+		 * MTD_CAP_ROM. Program and erase live behind a separate
+		 * register interface (SoC "SPI-F Gen3" PIO block) for which no
+		 * driver exists yet -- until one does, nothing on this device
+		 * can be written and the board keeps no setting across a
+		 * reboot.
+		 */
 		compatible = "mtd-rom";
 		reg = <0x14000000 0x1000000>;
 		bank-width = <2>;
+		/*
+		 * The erase block, and it is LOAD-BEARING even on a read-only
+		 * mapping. drivers/mtd/chips/map_rom.c default_erasesize()
+		 * reads this property and, ABSENT IT, falls back to map->size
+		 * -- the whole 16 MB chip as ONE erase block. The squashfs
+		 * rootfs splitter rounds up to that block against the WHOLE
+		 * DEVICE (mtdsplit_squashfs.c: mtd_roundup_to_eb(part_offset +
+		 * squashfs_len, parent_mtd)), so a 3.2 MB rootfs rounded to
+		 * 16 MB lands past the end of every partition and mtdpart.c
+		 * publishes the overlay as
+		 *     mtd: partition "rootfs_data" is out of reach -- disabled
+		 * with size 0. Measured on the X111W 2026-08-16: /proc/mtd
+		 * showed `rootfs_data` at size 0 with erasesize 0x01000000 --
+		 * the chip -- which is exactly what that code path prints.
+		 *
+		 * 64 KiB is the JEDEC NOR sector and is a CONSERVATIVE choice:
+		 * it is a valid alignment whatever the fitted part uses (a
+		 * 4 KiB-sub-sector chip is aligned by it too), and with it the
+		 * split yields a 1600 KiB rootfs_data inside the 4864 KiB
+		 * bank-0 rootfs partition. It is a declaration, not a
+		 * measurement -- this unit's flash has never been identified;
+		 * confirm with a JEDEC RDID (0x9F) once the PIO path exists,
+		 * at which point the chip reports its own block and this
+		 * property is superseded.
+		 */
+		erase-size = <0x10000>;
 		#address-cells = <1>;
 		#size-cells = <1>;
 	};
