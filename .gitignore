@@ -52,3 +52,20 @@ CLAUDE.md
 *.orig
 *.prerename
 *.prestate
+
+# ★★ NO BACKUP LIVES IN THIS FORK (CLAUDE.md, 2026-08-05). The risk is not
+# losing one -- it is PUBLISHING it: three .config.*.bak were once found tracked
+# and already pushed, one still advertising a product spelling the tree had
+# stopped using. Four more were found tracked on 2026-08-16 and moved to
+# dev/backup/2026-08-16-fork-backups/ with their paths mirrored.
+# ⚠ `*.bak` alone did NOT catch them: every one ended in a SUFFIX
+# (.bak-wifi, .bak-slub, .bak-prelockup, .luna-bak-<epoch>), so the pattern that
+# looked like protection matched none of the files it was written for.
+# And inside files-<ver>/ this is worse than untidy: that overlay COPIES
+# everything under it into the kernel build tree, so a stray backup is compiled
+# and shipped rather than merely stored.
+*.bak-*
+*-bak
+*-bak-*
+.config.*bak*
+config-*.bak*
