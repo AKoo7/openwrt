@@ -956,9 +956,31 @@ MODULE_PARM_DESC(wan_mac_offset, "WAN (gpon0) MAC = board/LAN MAC + this offset 
  *
  * ⇒ SO THE SEED IS DERIVED, NOT GUESSED. Any value in 1..30 satisfies the third
  * clause NO MATTER what the OLT has stored, so it cannot be defeated by a stale
- * lsync. 0 would satisfy the first clause but is avoided: this driver's own
- * earlier note records mds=0 wedging this OLT in a Get poll loop, and an
- * unexplained observation is not overridden by a decompilation.
+ * lsync.
+ *
+ * ★★ AND WHY NOT 0, WHICH IS WHAT STOCK REPORTS. Two independent RE passes over
+ * the vendor's own omci_app (2026-08-16) agree that stock does NOT persist this
+ * counter -- `gMibOntDataDefRow` sits in .bss with no initialiser and is
+ * explicitly zeroed in mibTable_init -- so stock answers 0 at the OLT's
+ * pre-config Get on every boot, which satisfies the gate's FIRST clause. That
+ * also refutes this driver's older claim that "stock persists its mds so rsync
+ * matches": it does not, and nothing here should rest on that sentence again.
+ *
+ * By the stock-is-the-oracle rule the seed should therefore be 0. It is 7
+ * instead, and the reason is a CONFLICT this project's rules resolve in favour
+ * of the measurement: our own note at the mds_reset0 param records mds=0 wedging
+ * THIS OLT in a Get poll loop. That observation was never explained, and it is
+ * contradicted from three directions (stock reports 0; the OLT's gate takes
+ * rsync==0 as its first provisioning clause; no persistence exists to make it
+ * otherwise) -- but a decompilation does not overrule an observation, it only
+ * makes it suspect. 7 satisfies a DIFFERENT clause of the same gate, so it is
+ * correct under both readings and touches nothing in dispute.
+ *
+ * ⇒ OWED, AND IT IS A MEASUREMENT, NOT MORE RE: boot stock on this PON port and
+ * capture what it actually answers to the pre-config ME2 Get. If it reports 0
+ * and is provisioned, the wedge note is wrong and this seed becomes 0 -- exactly
+ * matching stock. Until that capture exists, the adaptive walk below is what
+ * covers the gap, and it costs nothing when provisioning works.
  *
  * ★ WHY THE OLD VALUE FAILED, MEASURED 2026-08-16 -- the poison poisoned itself.
  * The seed was 200, chosen to "not match any plausible stored lsync". Once this
