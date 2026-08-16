@@ -938,28 +938,46 @@ static unsigned int wan_mac_offset = 3;
 module_param(wan_mac_offset, uint, 0644);
 MODULE_PARM_DESC(wan_mac_offset, "WAN (gpon0) MAC = board/LAN MAC + this offset (default 3, this model)");
 
-/* OMCI MIB-Data-Sync (ME 2 attr 1) seed. THE DS-FORWARDING GATE: the HSGQ-G008 OLT
- * (gpondev gpon_ont_cfg_process @0x67b14) installs the downstream gem flow ONLY when, at
- * gate time, rsync==lsync && rsync>30, where rsync = the ONU's reported ME2 MIB-Data-Sync
- * read ONCE pre-config (a single OMCI GET of ONU-Data before the Create/Set burst) and
- * frozen; lsync = the OLT's count of the MIB-changing ops it then applies (~42, deterministic).
- * A clean-room ONU reports mds=0 at that pre-config GET -> rsync=0 != lsync -> Match State
- * stays "Initial" and no DS is forwarded (stock persists its mds so rsync matches). Seed the
- * counter so the pre-config GET/Upload reports a value equal to the OLT's post-config lsync. */
-static unsigned int omci_mds_seed = 200;	/* MIB-Data-Sync boot seed: a POISON value that fails the OLT's
-					 * ME2 audit on purpose (must be nonzero and != any plausible stored
-					 * lsync; observed lsync land ~42-126, MDS=0 wedges this OLT in a GET
-					 * poll loop). WHY mismatch: we hold no persistent MIB, so we must
-					 * NEVER pass the audit as "in sync". On a short-outage re-admit
-					 * (warm reboot / firmware-swap; capture 2026-07-08) the OLT decides
-					 * from this audit alone - a matching value (the old seed 125) made
-					 * it skip MIB-Reset + all Creates -> no data GEM -> no WAN until a
-					 * long power-cycle. A mismatch triggers its MIB-Reset -> mds_reset0
-					 * zeroes us -> full re-provision -> per-applied-op increments
-					 * converge with the OLT's lsync -> stable (capture-proven). Fresh
-					 * sessions MIB-Reset unconditionally, so the seed is moot there. */
+/* OMCI MIB-Data-Sync (ME 2 attr 1) seed. THE PROVISIONING GATE.
+ *
+ * ★★ THE GATE IS AN *OR*, AND THIS COMMENT USED TO STATE IT BACKWARDS. Read out
+ * of the OLT's own decompiled `gpon_ont_cfg_process` (HSGQ-G008 gpondev) on
+ * 2026-08-16, the branch that reaches "start issue auth profile" -- i.e. the
+ * MIB-Reset + Create burst that gives us a data GEM -- is taken when ANY of:
+ *
+ *      rsync == 0  ||  rsync != lsync  ||  rsync < 31  ||  <ont field> == 2
+ *
+ * where rsync is the ME2 MIB-Data-Sync we report at the OLT's pre-config Get and
+ * lsync is the value the OLT holds for this ONT. So the OLT provisions when the
+ * MIB is NOT in sync -- which is the opposite of what this comment claimed
+ * ("installs the downstream gem flow ONLY when rsync==lsync && rsync>30"). The
+ * `>30` was real but its SENSE was inverted: being BELOW 31 is a REASON to
+ * provision, never a requirement to skip.
+ *
+ * ⇒ SO THE SEED IS DERIVED, NOT GUESSED. Any value in 1..30 satisfies the third
+ * clause NO MATTER what the OLT has stored, so it cannot be defeated by a stale
+ * lsync. 0 would satisfy the first clause but is avoided: this driver's own
+ * earlier note records mds=0 wedging this OLT in a Get poll loop, and an
+ * unexplained observation is not overridden by a decompilation.
+ *
+ * ★ WHY THE OLD VALUE FAILED, MEASURED 2026-08-16 -- the poison poisoned itself.
+ * The seed was 200, chosen to "not match any plausible stored lsync". Once this
+ * ONU had reported 200, the OLT stored 200 as ITS lsync for the record; from
+ * then on rsync == lsync == 200, 200 >= 31, and every clause was false, so the
+ * OLT never provisioned again. Observed on PON port 2: a healthy O5 with the
+ * OMCC up, 59 DS OMCI messages answered, EVERY ONE a Get, and never a MIB-Reset
+ * (MT 0x4f), never an Assign_Alloc-ID, never a Create (class 268) -- Match State
+ * "Initial", no data GEM, no WAN. A value chosen to be unequal became equal the
+ * moment the far end remembered it.
+ *
+ * ⇒ AND THAT IS WHY THE ADAPTIVE WALK BELOW STAYS. This seed is right for THIS
+ * OLT because we read its decision code; the walk is what makes the ONU converge
+ * on an OLT whose rule we have NOT read. A derived constant answers the OLT we
+ * know; the loop answers the ones we do not. */
+static unsigned int omci_mds_seed = 7;	/* 1..30: satisfies `rsync < 31` unconditionally, so the
+					 * OLT provisions whatever it has stored. NOT 0 -- see above. */
 module_param(omci_mds_seed, uint, 0644);
-MODULE_PARM_DESC(omci_mds_seed, "OMCI ME2 MIB-Data-Sync boot seed (poison: must NOT match the OLT's stored lsync, forces re-provision)");
+MODULE_PARM_DESC(omci_mds_seed, "OMCI ME2 MIB-Data-Sync boot seed (1..30 forces the OLT to re-provision: its gate takes rsync<31 as not-in-sync)");
 /* mds_reset0: on an on-wire MIB-Reset (MT 0x4f), zero the MIB-Data-Sync counter per G.988 (and
  * stock omci_app OMCI_ResetMib @0x41057c) instead of re-seeding 125. CAPTURE-PROVEN (2026-06-18):
  * the OLT, after IT issues MIB-Reset, recounts its lsync from 0 and re-Creates the MEs; if we keep
