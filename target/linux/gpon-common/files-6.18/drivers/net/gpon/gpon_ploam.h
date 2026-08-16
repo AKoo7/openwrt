@@ -317,7 +317,12 @@ struct gpon_ploam_ops {
 	 * flag CLEAR so the next provisioning event retries. */
 	int  (*install_omcc)(void *sh, u16 gem);
 	int  (*install_tcont)(void *sh, u8 tcont, u16 alloc);
-	void (*install_data_gem)(void *sh);
+	/* @gem is the wire GEM Port-ID the OLT assigned in its ME 268 (GEM Port
+	 * Network CTP) Create, carried here from gpon_ploam_set_data_gem_
+	 * solicited(). It is NOT a per-board constant: this lab's OLT was
+	 * measured handing out 223 to one board and 193 to another, and the OMCC
+	 * GEM beside it has always been taken from Configure_Port-ID. */
+	void (*install_data_gem)(void *sh, u16 gem);
 
 	/* --- OMCI --------------------------------------------------------- */
 	/* Report the WAN-egress (VEIP) operational state up to the OLT.
@@ -436,7 +441,17 @@ struct gpon_ploam {
 	 * the op returned would therefore change behaviour; use
 	 * gpon_ploam_set_data_installed() at exactly that point instead. */
 	bool data_installed;		/* WAN data GEM datapath installed           */
+	/* ★ THESE THREE ARE SESSION STATE, AND EVERY TEARDOWN CLEARS THEM.
+	 * They used to survive: data_tcont_installed had NO teardown clear at
+	 * all (only the OLT's Deallocate, which additionally demands the
+	 * Alloc-ID of the session that just ended), so after any re-config the
+	 * ONU refused the OLT's NEW Alloc-ID and waited for a Deallocate of an
+	 * Alloc-ID the OLT would never send again — the data T-CONT dark until
+	 * a reboot, i.e. "works after a cold boot, dies after churn". The
+	 * contract is now asserted per teardown path by
+	 * dev/rtl9607c-test/gpon_data_bind_test.c (step 19). */
 	bool data_gem_solicited;	/* OLT sent the OMCI ME268 Create -> may install */
+	u16  data_gem_port;		/* ★ the OLT's WIRE GEM Port-ID from that ME 268 */
 	bool data_tcont_installed;	/* the OLT's DATA Alloc-ID bound to the data T-CONT */
 	u16  data_alloc;		/* the OLT's data Alloc-ID                   */
 
@@ -507,8 +522,20 @@ void gpon_ploam_set_sn(struct gpon_ploam *o, const u8 sn[8]);
 
 /* The OMCI layer saw the OLT's ME 268 (GEM-CTP) Create for the WAN data GEM.
  * Until this is set the data GEM is never installed — installing ahead of the
- * OLT's own create is what made a second admit churn-lock. */
-void gpon_ploam_set_data_gem_solicited(struct gpon_ploam *o, bool solicited);
+ * OLT's own create is what made a second admit churn-lock.
+ *
+ * ★ @port_id is G.988 ME 268 attribute 1, the WIRE GEM Port-ID, and it is the
+ * value the datapath must bind: it is the OLT's to choose (measured on this lab
+ * OLT: 223 to one board, 193 to another), exactly as the OMCC's GEM Port-ID is
+ * taken from Configure_Port-ID rather than compiled in. The caller — which is
+ * the only layer that knows which ME 268 instance is the WAN one — is
+ * responsible for NOT offering the multicast GEM here.
+ *
+ * A @port_id that differs from the one currently installed re-arms the install,
+ * so a re-provisioned session lands on the OLT's new Port-ID instead of keeping
+ * the retired one on the wire. Repeating the same Port-ID is idempotent. */
+void gpon_ploam_set_data_gem_solicited(struct gpon_ploam *o, bool solicited,
+				       u16 port_id);
 
 /* The GEM layer has installed (or torn down) the WAN data GEM datapath. Called
  * from inside the install, at the point gpon-rtl9602c.c:5673 set the flag —

@@ -1006,7 +1006,17 @@ MODULE_PARM_DESC(omci_mds_seed, "OMCI ME2 MIB-Data-Sync boot seed (1..30 forces 
  * 125 our rsync = 125+N is PERMANENTLY ahead of the OLT's 0+N -> every periodic ONU-Data(ME2) audit
  * mismatches -> the OLT loops MIB-Reset/Upload/re-Create and eventually Deactivate_ONU-ID(0x05) +
  * dealloc-churn (the ~4min WAN teardown). Zeroing makes rsync==lsync after ONE resync -> stable.
- * Default on (the WAN-stability fix); gpon.mds_reset0=0 = legacy re-seed. */
+ * Default on (the WAN-stability fix); rtl9602c_eth.mds_reset0=0 = legacy re-seed.
+ * ★ THE PREFIX WAS WRONG HERE UNTIL 2026-08-16 ("gpon.mds_reset0"), and a wrong
+ * knob name fails in the reassuring direction: the boot accepts the unknown
+ * argument, the parameter keeps its default, and the operator reads the result
+ * as the behaviour of the value they think they set. There is no module named
+ * `gpon` on this board -- these knobs are built from rtl9602c_eth.o, so the
+ * prefix is `rtl9602c_eth.` (as line 491 already spells it for hw_nat), and the
+ * GPON driver's own ~60 knobs live under `gpon_rtl9602c.`. Cross-checked against
+ * the live board: /sys/module/rtl9602c_eth/parameters/ holds this file's knobs
+ * and /sys/module/gpon_rtl9602c/parameters/ holds the other file's (measured
+ * 2026-08-15, recorded in the board's config.xml MODPARAM_DRIVER_SOURCE). */
 static bool mds_reset0 = true;
 module_param(mds_reset0, bool, 0644);
 MODULE_PARM_DESC(mds_reset0, "on MIB-Reset zero ME2 MIB-Data-Sync (G.988/stock, default) vs re-seed");
@@ -1036,11 +1046,21 @@ MODULE_PARM_DESC(mds_reset0, "on MIB-Reset zero ME2 MIB-Data-Sync (G.988/stock, 
  * the ONU adapts to the OLT it is actually attached to, on any port, against any
  * stored value, with nothing to re-tune by hand.
  *
- * THE WALK: +37 each step. 37 is coprime with 256, so it visits EVERY value
- * before repeating -- an exhaustive search, not a sample -- and 0 is skipped
- * because it is the known wedging value. Rate-bounded by the OLT's own audit
- * cadence and NEVER count-capped: a recovery path that gives up is a device that
- * needs a human, which is what this project's robustness bar forbids.
+ * THE WALK: +37 each step over the range 1..255. 0 is not a reportable value at
+ * all here (it is the value this rig observed wedging the OLT in a Get poll
+ * loop), and 37 is coprime with 255, so the walk visits EVERY reportable value
+ * before repeating -- an exhaustive search, not a sample. Rate-bounded by the
+ * OLT's own audit cadence and NEVER count-capped: a recovery path that gives up
+ * is a device that needs a human, which is what this project's robustness bar
+ * forbids.
+ *
+ * ★ THE ARITHMETIC IS MODULO 255, AND THAT IS LOAD-BEARING -- MEASURED, NOT
+ * ASSUMED. This walk was first written as `mds += 37; if (!mds) mds = 1;`, whose
+ * comment claimed the same exhaustive search on the strength of 37 being coprime
+ * with 256. It is not: folding 0 onto 1 splices the +37 orbit into a CYCLE, and
+ * from mds == 1 that cycle is only 83 long (37 * 83 == 255 mod 256), so from the
+ * seed the search covered 83 of 255 values -- 32%, silently. Caught by
+ * dev/rtl9607c-test Step 4f case [d] on x86 with no board in the loop.
  *
  * IT COSTS NOTHING WHEN THINGS WORK. Every provisioning event -- a MIB-Reset, or
  * any applied Create/Set/Delete -- resets the counter, so on a healthy admission
@@ -1053,6 +1073,10 @@ static unsigned int omci_mds_adapt_reads = 12;
 module_param(omci_mds_adapt_reads, uint, 0644);
 MODULE_PARM_DESC(omci_mds_adapt_reads, "DS OMCI reads with no provisioning before the MIB-Data-Sync is advanced");
 
+/* The walk's step. Coprime with 255, so stepping modulo 255 over the reportable
+ * range 1..255 enumerates all of it before repeating. */
+#define OMCI_MDS_WALK_STEP	37
+
 /* One step of the walk, driven by the OLT's own audit traffic. */
 static void omci_mds_walk(struct rtl9602c_eth *ep)
 {
@@ -1061,9 +1085,12 @@ static void omci_mds_walk(struct rtl9602c_eth *ep)
 	if (++ep->omci_audit_reads < omci_mds_adapt_reads)
 		return;
 	ep->omci_audit_reads = 0;
-	ep->omci_mds += 37;		/* coprime with 256: visits every value */
-	if (!ep->omci_mds)		/* 0 wedges this OLT in a GET poll loop */
-		ep->omci_mds = 1;
+	/* 1..255 arithmetic: 0 is excluded from the SEARCH SPACE rather than
+	 * folded onto 1, which is what made the old form an 83-value cycle
+	 * instead of an exhaustive walk (see the note at omci_mds_adapt). An
+	 * mds of 0 on entry (only reachable straight after an OLT MIB-Reset)
+	 * steps to OMCI_MDS_WALK_STEP, staying inside the range. */
+	ep->omci_mds = (u8)(1 + ((unsigned)ep->omci_mds + OMCI_MDS_WALK_STEP - 1) % 255);
 	ep->omci_mds_tries++;
 	netdev_info(ep->ndev,
 		    "OMCI: %u reads with no MIB-Reset and no Create -- the OLT is "
@@ -1513,11 +1540,12 @@ static int rtl9602c_eth_omci_xmit_ring0(struct rtl9602c_eth *ep, const u8 *omci,
  * softirq context -> GFP_ATOMIC. Returns 0 on success.
  */
 /* ===== WAN data-GEM netdev (gpon0) — clean-room nas0-equivalent =====
- * Carries GPON WAN user data on the data GEM (GPON_DATA_GEM, internal flow GPON_DATA_FLOW).
+ * Carries GPON WAN user data on the data GEM (the OLT's gem-port-id, gpon_data_gem_port,
+ * on internal flow GPON_DATA_FLOW).
  * DS frames de-encapsulated from the data GEM arrive from switch PON port 2 and are demux'd
  * to this netdev in rtl9602c_eth_rx (src_port == RTL9602C_PON_PORT). US frames use the SAME
  * HW cpu-tag direct-TX descriptor the OMCI path uses, but tx_dst_stream_id = GPON_DATA_FLOW
- * (the US-NIC then stamps gem-id GPON_DATA_GEM via GEM_US_PORT_MAP and routes to the OMCC's
+ * (the US-NIC then stamps the OLT's gem-id via GEM_US_PORT_MAP and routes to the OMCC's
  * T-CONT 16/qid 64 grants). Carrier is held up so netifd runs DHCP; pre-install US frames are
  * dropped by the US-NIC and DHCP retries until the OLT's OMCI config installs the data GEM. */
 static netdev_tx_t rtl9602c_eth_wan_xmit(struct sk_buff *skb, struct net_device *ndev)
@@ -2567,11 +2595,13 @@ static void rtl9602c_eth_omci_input(struct rtl9602c_eth *ep, const u8 *msg,
 			    msg[0], msg[1], msg[2], class_id,
 			    (msg[6] << 8) | msg[7], len);
 
-	/* TEMP DIAG: dump the create/set body of the datapath-defining MEs so we can read
-	 * the actual gem-port-ids the OLT assigns (ME268 attr1 Port-ID = body[0..1]; the
+	/* Dump the create/set body of the datapath-defining MEs, so the identities the
+	 * OLT hands out are readable on the wire (ME268 attr1 Port-ID = body[0..1]; the
 	 * multicast GEM ME281; the GEM IWTP ME266 CTP-pointer; the T-CONT ME262 alloc-id).
-	 * gpon_install_data_gem hardcodes gem 193 — this confirms/corrects it + reveals the
-	 * multicast GEM the broadcast DHCP OFFER rides. */
+	 * Kept, not "temp": this is the standing instrumentation that makes an OLT-side
+	 * reconfiguration diagnosable, and it is what proved the data gem-port-id is the
+	 * OLT's choice (223 on one board, 193 here) rather than the constant the install
+	 * used to write. The value is now CONSUMED just below, not only printed. */
 	if (class_id == 262 || class_id == 266 || class_id == 268 ||
 	    class_id == 281 || class_id == 309 || class_id == 329) {
 		int blen = (len > 8) ? (int)(len - 8) : 0;
@@ -2585,9 +2615,18 @@ static void rtl9602c_eth_omci_input(struct rtl9602c_eth *ep, const u8 *msg,
 
 	/* Tell the gpon driver the OLT has created the WAN GEM-port-network-CTP (ME268):
 	 * it installs OUR data GEM only after this, idempotently over the OLT's gem, never
-	 * proactively (proactive install churn-locked the OLT on a 2nd+ admit). */
-	if (class_id == 268 && mt == OMCI_MT_CREATE)
-		gpon_omci_note_gem_create();
+	 * proactively (proactive install churn-locked the OLT on a 2nd+ admit).
+	 *
+	 * ★ AND HAND IT THE PORT-ID, which used to be logged above and thrown away.
+	 * G.988: a Create's contents are attribute VALUES from byte 8 with NO mask
+	 * (no result octet on a request), and ME 268 attribute 1 is the 2-byte GEM
+	 * Port-ID -- so msg[8]<<8 | msg[9]. That is the gem-id the OLT expects on the
+	 * wire; the install used to program a compile-time 193, which is simply what
+	 * a different board was given. Explicit byte math (big-endian on the wire,
+	 * little-endian hosts run this same source). A runt Create carries no
+	 * attribute at all and is ignored rather than read past. */
+	if (class_id == 268 && mt == OMCI_MT_CREATE && len >= 10)
+		gpon_omci_note_gem_create((u16)(((u16)msg[8] << 8) | msg[9]));
 
 	if (devid != 0x0a)		/* only baseline modelled */
 		return;

@@ -57,16 +57,8 @@
  *   P1  gpon_tcont_installed is never set true anywhere in the driver
  *       (declared :967, cleared :6339/:6569/:6658/:6695, read only by two log
  *       sites :6282/:6422). Both readers therefore report a constant false.
- *   P2  gpon_data_tcont_installed is cleared by NO teardown path, only by the
- *       OLT's Assign_Alloc-ID deallocate (:6453). After a Deactivate the guard
- *       at :6441 then skips the data T-CONT re-bind for the rest of the boot.
- *       Masked today: this lab's OLT is single-alloc and data rides T-CONT 16.
- *   P3  The four teardowns diverge three ways on data_gem_solicited —
- *       Deactivate clears it (deliberate), LOS keeps it (deliberate and
- *       documented: "internet doesn't come back after I reconnect the fiber"),
- *       the watchdog and the SN-reprovision path neither clear it nor say so.
- *       Written out in full below rather than factored, so the divergence is
- *       visible; converging them is a separate step with its own gate.
+ *   P2  RESOLVED here — see "THE THREE SESSION-STATE FIXES" below.
+ *   P3  RESOLVED here — see "THE THREE SESSION-STATE FIXES" below.
  *   P4  In the burst-overhead build, `boh_len` is u8 and is assigned
  *       `rep + t3 + 3`, which is computed as int and can reach 262 before the
  *       truncation — so the `> GPON_PLOAM_BOH_MAX_LEN` clamp on the next line
@@ -90,6 +82,39 @@
  *       not detected, and O6 POPUP tears down where Elnath keeps the session
  *       alive. Not changed: this target is off the rig and each is a wire
  *       behaviour change needing its own board gate.
+ *
+ * THE THREE SESSION-STATE FIXES (the old FOLLOW-UPs P2 and P3), each pinned by
+ * an adversarial-OLT case in dev/rtl9607c-test/gpon_data_bind_test.c (step 19)
+ * that was SEEN to fail on the pre-fix source, and by
+ * gpon_data_bind_policy_test.c (step 19b) over the shipping Luna driver.
+ *
+ *   1. THE DATA T-CONT LATCH SURVIVED EVERY TEARDOWN.  data_tcont_installed had
+ *      no teardown clear at all; its ONLY clear site is the OLT's explicit
+ *      Deallocate, which additionally requires `alloc == data_alloc`, i.e. the
+ *      Alloc-ID of the session that has just ended.  So a re-config that hands
+ *      out a DIFFERENT Alloc-ID was refused by the install guard, and the one
+ *      path that could have recovered was waiting for an Alloc-ID the OLT will
+ *      never send again: the WAN data T-CONT stayed dark until a reboot.  All
+ *      four teardowns now clear it, together with data_alloc, exactly as they
+ *      already cleared its three siblings.
+ *
+ *   2. data_gem_solicited NOW FOLLOWS THE IDENTITY, NOT THE PATH.  The four
+ *      teardowns diverged three ways and only two said why.  The rule that
+ *      explains all four is that the flag means "the OLT currently holds a
+ *      GEM-CTP for THIS ONU identity": an OLT Deactivate/Disable_SN
+ *      deprovisions us (CLEAR, it re-sends ME 268 on re-admit); the two
+ *      ONU-INITIATED re-ranges leave the OLT's provisioning untouched (KEEP —
+ *      clearing them is the proven "internet doesn't come back after I
+ *      reconnect the fiber"); and the serial-number reprovision makes us a
+ *      DIFFERENT ONU, so what the OLT holds is not ours (CLEAR — keeping it
+ *      installed the data GEM the moment the new identity reached O5,
+ *      proactively ahead of the new session's own ME 268, which is precisely
+ *      the second-admit churn-lock this gate exists to prevent).
+ *
+ *   3. THE DATA GEM PORT-ID IS THE OLT'S.  It arrived in ME 268 attribute 1 and
+ *      was discarded, and the install wrote a per-board constant.  It is now
+ *      carried through data_gem_port into the install op, the way the OMCC's
+ *      GEM Port-ID has always come from Configure_Port-ID.
  */
 
 #include "gpon_ploam.h"
@@ -580,15 +605,17 @@ int gpon_ploam_ds(struct gpon_ploam *o, const u8 *m, unsigned int len, u32 now_m
 			 * under OLT deactivate-churn the second and later
 			 * re-ranges SKIPPED the OMCC/T-CONT install and the ONU
 			 * never rebuilt its OMCI datapath.
-			 * This is the ONLY path that clears data_gem_solicited
-			 * (a real deprovision: the OLT will re-send its ME 268
-			 * on re-admit). See FOLLOW-UP P3, and P2 for the
-			 * data T-CONT flag that no path clears. */
+			 * The OLT DEPROVISIONED us, so it will re-send its
+			 * ME 268 on re-admit: data_gem_solicited is cleared
+			 * here (fix 2), and so is the data T-CONT binding,
+			 * whose Alloc-ID the OLT is free to change (fix 1). */
 			o->onu_id = 0xff;
 			o->omcc_installed = false;
 			o->tcont_installed = false;
 			o->data_installed = false;
 			o->data_gem_solicited = false;
+			o->data_tcont_installed = false;
+			o->data_alloc = 0;
 			o->aes_switch_time = 0xffffffff;
 			o->key_staged = false;
 			o->ops->set_hw_onu_id(o->sh, 0xff);
@@ -808,8 +835,15 @@ u32 gpon_ploam_tick(struct gpon_ploam *o)
  * (the driver starts with a placeholder SN, which the OLT auto-ranges as a
  * phantom that never matches the provisioned ONU). Drop to O1 and re-offer.
  *
- * TEARDOWN 2 of 4. Does NOT touch data_gem_solicited and does NOT re-seat the
- * serializer — see FOLLOW-UP P3.
+ * TEARDOWN 2 of 4. It does NOT re-seat the serializer (the re-range is our own
+ * doing, not a burst-quality fault), but it DOES clear data_gem_solicited: this
+ * is an IDENTITY change, so whatever ME 268 the OLT holds belongs to the serial
+ * number we have just stopped being. Keeping it made the new identity install
+ * its data GEM the moment it reached O5 — proactively, ahead of the new
+ * session's own ME 268, which is the second-admit churn-lock the solicited gate
+ * exists to prevent — and, once the Port-ID became a wire value, on the PREVIOUS
+ * identity's GEM port. The two ONU-initiated re-ranges below are the opposite
+ * case and deliberately KEEP it.
  */
 int gpon_ploam_sn_changed(struct gpon_ploam *o, u32 now_ms)
 {
@@ -822,6 +856,9 @@ int gpon_ploam_sn_changed(struct gpon_ploam *o, u32 now_ms)
 			o->omcc_installed = false;
 			o->tcont_installed = false;
 			o->data_installed = false;
+			o->data_gem_solicited = false;
+			o->data_tcont_installed = false;
+			o->data_alloc = 0;
 			o->aes_switch_time = 0xffffffff;
 			o->key_staged = false;
 			o->ops->set_hw_onu_id(o->sh, 0xff);
@@ -851,7 +888,7 @@ int gpon_ploam_poll_provision(struct gpon_ploam *o, u32 now_ms)
 
 	if (o->state == GPON_O5_OPERATION && o->cfg->data_gem_en &&
 	    o->omcc_installed && o->data_gem_solicited && !o->data_installed)
-		o->ops->install_data_gem(o->sh);
+		o->ops->install_data_gem(o->sh, o->data_gem_port);
 
 	if (o->state == GPON_O5_OPERATION && o->omcc_installed &&
 	    o->avc_sent < GPON_PLOAM_AVC_MAX && o->o5_entry_tick &&
@@ -872,8 +909,13 @@ int gpon_ploam_poll_provision(struct gpon_ploam *o, u32 now_ms)
  * WAN receive is above zero on any working or slow-leasing link, so this fires
  * only on a genuinely dead link.
  *
- * TEARDOWN 3 of 4. Does NOT touch data_gem_solicited, and unlike the LOS path
- * does not say why — FOLLOW-UP P3.
+ * TEARDOWN 3 of 4. It deliberately KEEPS data_gem_solicited, for the same
+ * reason the LOS path does: this re-range is ONU-INITIATED, the OLT never
+ * deactivated us, so it holds our OMCI/GEM provisioning across the outage and
+ * does NOT re-send its ME 268 on re-admit. Clearing the flag here would leave
+ * the data GEM waiting for a create that never arrives. The data T-CONT
+ * binding IS cleared, because the Alloc-ID is the OLT's to reissue and the
+ * install guard must not refuse the new one.
  */
 int gpon_ploam_poll_watchdog(struct gpon_ploam *o, bool wan_rx_zero, u32 now_ms)
 {
@@ -889,6 +931,8 @@ int gpon_ploam_poll_watchdog(struct gpon_ploam *o, bool wan_rx_zero, u32 now_ms)
 		o->omcc_installed = false;
 		o->tcont_installed = false;
 		o->data_installed = false;
+		o->data_tcont_installed = false;
+		o->data_alloc = 0;
 		o->aes_switch_time = 0xffffffff;
 		o->key_staged = false;
 		o->ops->set_hw_onu_id(o->sh, 0xff);
@@ -928,6 +972,11 @@ int gpon_ploam_poll_los(struct gpon_ploam *o, bool optic_los, bool sds_dark,
 				o->omcc_installed = false;
 				o->tcont_installed = false;
 				o->data_installed = false;
+				/* The Alloc-ID is the OLT's to reissue on
+				 * re-admit, so the data T-CONT binding is
+				 * session state and goes with the rest. */
+				o->data_tcont_installed = false;
+				o->data_alloc = 0;
 				/* ★2026-07-05: do NOT clear data_gem_solicited
 				 * on a fibre-LOS re-range. This re-range is
 				 * ONU-initiated: the OLT never Deactivated us,
@@ -1044,9 +1093,19 @@ void gpon_ploam_set_sn(struct gpon_ploam *o, const u8 sn[8])
 	o->sn_changed = true;
 }
 
-void gpon_ploam_set_data_gem_solicited(struct gpon_ploam *o, bool solicited)
+void gpon_ploam_set_data_gem_solicited(struct gpon_ploam *o, bool solicited,
+				       u16 port_id)
 {
 	o->data_gem_solicited = solicited;
+	if (!solicited)
+		return;
+	/* A Port-ID that MOVED re-arms the install, so the datapath follows the
+	 * OLT instead of keeping a retired GEM port on the wire. Repeating the
+	 * same one is idempotent: the install pulses the upstream-NIC classify
+	 * latch, so it must not run once per ME 268. */
+	if (o->data_installed && port_id != o->data_gem_port)
+		o->data_installed = false;
+	o->data_gem_port = port_id;
 }
 
 void gpon_ploam_set_data_installed(struct gpon_ploam *o, bool installed)

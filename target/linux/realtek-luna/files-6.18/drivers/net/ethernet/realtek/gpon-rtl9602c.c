@@ -981,7 +981,25 @@ static bool gpon_data_gem_solicited;	/* OLT has sent the OMCI GEM-CTP (ME268) Cr
 					 * unable to reconcile our gem on a 2nd+ admit and churn-lock (op=0xff
 					 * reclaim->DEACT). Stock waits for the OLT's create. Cleared on Deactivate
 					 * so each re-admit waits for the OLT's fresh ME268. Set from the eth OMCI rx. */
-static bool gpon_data_tcont_installed;	/* the OLT's DATA Alloc-ID bound to the DATA T-CONT (8) */
+static bool gpon_data_tcont_installed;	/* the OLT's DATA Alloc-ID bound to the DATA T-CONT (8).
+					 * ★ SESSION STATE: cleared by EVERY teardown, like its three
+					 * siblings above. It used to have no teardown clear at all —
+					 * only the OLT's Assign_Alloc-ID DEALLOCATE, which additionally
+					 * demands alloc == gpon_data_alloc, i.e. the Alloc-ID of the
+					 * session that just ended. A re-config handing out a DIFFERENT
+					 * Alloc-ID was then refused by the install guard below, and the
+					 * one recovery path was waiting for an Alloc-ID the OLT will
+					 * never send again: the WAN data T-CONT dark until a reboot
+					 * ("works after a cold boot, dies after churn"). Pinned by
+					 * dev/rtl9607c-test/gpon_data_bind{,_policy}_test (step 19/19b). */
+/* The WIRE GEM Port-ID the OLT assigned in its OMCI ME 268 (GEM Port Network CTP)
+ * Create, attribute 1 — set from the eth OMCI RX snoop, and what the data-GEM
+ * install actually programs. It is the OLT's to choose (measured on this lab OLT:
+ * 223 to one board, 193 to another), exactly as the OMCC's GEM Port-ID comes from
+ * Configure_Port-ID. GPON_DATA_GEM_DEFAULT is only the value held before the OLT
+ * has spoken; the install is gated on gpon_data_gem_solicited, so it is never the
+ * value that reaches the wire on a provisioned session. */
+static u16 gpon_data_gem_port = GPON_DATA_GEM_DEFAULT;
 static u16 gpon_omcc_alloc;	/* OMCC Alloc-ID override; 0 (default) = bind the LIVE ONU-ID.
 		 * ★ROOT-CAUSE FIX (2026-07-03, source + live-stock-fresh differential): the OMCC's
 		 * upstream Alloc-ID IS the ONU-ID (G.984.3 implicit default). Stock binds the GTC
@@ -4441,12 +4459,17 @@ static int gpon_proc_show(struct seq_file *s, void *v)
 		u32 los = gpon_rd(GPON_GTC_DS_LOS_CFG_STS);
 		s32 rx_cdbm = bosa_rx_power_cdbm();	/* calibrated ratiometric RX (was a linear 0x311 fit) */
 
-		seq_printf(s, "fiber:       rerange=%u last_outage=%ums | optic_los=%d sdet=%d rx=%d.%02ddBm | omcc_inst=%d DATA_GEM_inst=%d solicited=%d\n",
+		/* The two OLT-ASSIGNED identities of the WAN datapath are printed
+		 * beside their install flags: without them a "solicited=1
+		 * DATA_GEM_inst=1" line cannot tell a correct bind from a bind to
+		 * a retired Alloc-ID or to another board's gem-port. */
+		seq_printf(s, "fiber:       rerange=%u last_outage=%ums | optic_los=%d sdet=%d rx=%d.%02ddBm | omcc_inst=%d DATA_GEM_inst=%d solicited=%d gem=%u alloc=0x%x tcont_bound=%d\n",
 			   gpon_rerange_cnt, gpon_last_outage_ms,
 			   !!(los & GPON_OPTIC_LOS_SIG),
 			   !!(sw_rd(SDS_FIB_STATUS) & SDS_FIB_SDS_SDET),
 			   rx_cdbm / 100, (rx_cdbm < 0 ? -rx_cdbm : rx_cdbm) % 100,
-			   gpon_omcc_installed, gpon_data_installed, gpon_data_gem_solicited);
+			   gpon_omcc_installed, gpon_data_installed, gpon_data_gem_solicited,
+			   gpon_data_gem_port, gpon_data_alloc, gpon_data_tcont_installed);
 	}
 	seq_printf(s, "onu_id:      %u\n",
 		   (status >> GPON_ONU_ID_SHIFT) & GPON_ONU_ID_MASK);
@@ -5350,7 +5373,7 @@ static_assert(GEM_US_PORT_MAP_STRIDE == 4u,
 #define PI_PON_OMCI_CFG		0x02154		/* [6:0] OMCI SID */
 #define PI_PON_SID_Q_MAP_DS	0x0a0e4		/* packed 2b/SID: DS PBO queue */
 #define GPON_OMCC_FLOW		64		/* RTL9602C fixed OMCI flow/SID */
-/* GPON_DATA_FLOW(1) / GPON_DATA_GEM(193) — the WAN data GEM (clean-room nas0-equivalent) —
+/* GPON_DATA_FLOW(1) / the OLT's gem-port-id — the WAN data GEM (clean-room nas0-equivalent) —
  * are defined in rtl9602c_gpon_nic.h (shared with the eth driver's gpon0 TX descriptor). */
 #define GPON_OMCC_PHYS_QID	64		/* OMCC physical qid = TCONT_QUEUE_MAX(32)*(TCONT16/8)+q0 = 64
 						 * (stock physical-queue-id mapping, GPON branch:
@@ -5649,7 +5672,7 @@ static int gpon_install_omcc(u16 gem)
 }
 
 /*
- * Install the WAN data GEM (wire gem-port-id GPON_DATA_GEM=193) on internal flow
+ * Install the WAN data GEM (the OLT's wire gem-port-id, gpon_data_gem_port) on internal flow
  * GPON_DATA_FLOW(1) as a BRIDGED (non-OMCI) datapath — the clean-room nas0-equivalent.
  * v1 rides the OMCC's T-CONT 16 / qid 64 for upstream (the OLT binds only one Alloc-ID),
  * so data US uses the OMCC's already-working grants; the gem-id (193) keeps data distinct
@@ -5665,9 +5688,36 @@ static int gpon_install_omcc(u16 gem)
 /* Called from the eth OMCI RX when the OLT issues the GEM-port-network-CTP (ME268)
  * Create -- the cue that the OLT now expects (and holds its own view of) the data
  * GEM. The FSM poll installs ours only AFTER this, so we never push it proactively
- * ahead of the OLT (the 2nd-admit churn cause). Set-only; cleared on Deactivate. */
-void gpon_omci_note_gem_create(void)
+ * ahead of the OLT (the 2nd-admit churn cause). Cleared on Deactivate and on an SN
+ * reprovision (both make the OLT's GEM-CTP not ours any more); deliberately KEPT
+ * across the two ONU-initiated re-ranges, which the OLT never sees as a deprovision.
+ *
+ * @port_id is the OLT's wire gem-port-id (ME 268 attribute 1) and is what
+ * gpon_install_data_gem() programs -- it used to be logged and thrown away while
+ * the install wrote a compile-time 193, which is simply a different OLT's answer.
+ * A Port-ID that MOVED re-arms the install so the datapath follows the OLT instead
+ * of keeping a retired gem-port on the wire; repeating the same one is idempotent
+ * (the install pulses the US-NIC classify latch and must not run per ME 268). */
+void gpon_omci_note_gem_create(u16 port_id)
 {
+	port_id &= 0xfff;			/* GEM Port-ID is 12 bits (G.984.3) */
+
+	/* The OLT provisions the MULTICAST/broadcast GEM as an ME 268 Create too
+	 * (inst=1, Port-ID 0x0fff, paired with ME 281). It has its own flow and
+	 * its own DS routing here; adopting it as the UNICAST data gem would point
+	 * the WAN at the broadcast port. Refuse it, and say so once. */
+	if (port_id == GPON_MCAST_GEM) {
+		pr_info_ratelimited("rtl9602c-gpon: ME268 Create gem=%u is the multicast GEM -- not the WAN data gem\n",
+				    port_id);
+		return;
+	}
+
+	if (gpon_data_installed && port_id != gpon_data_gem_port) {
+		pr_info("rtl9602c-gpon: OLT moved the data gem-port %u -> %u; re-installing\n",
+			gpon_data_gem_port, port_id);
+		gpon_data_installed = false;
+	}
+	gpon_data_gem_port = port_id;
 	gpon_data_gem_solicited = true;
 }
 
@@ -5680,9 +5730,9 @@ int gpon_install_data_gem(void)
 	if (!gpon_omcc_installed)	/* need the OMCC GEM cfg (0x59 pass, qid 64) up first */
 		return -EAGAIN;
 
-	/* DS GEM-port CAM: gem 193 -> flow 1 (same indirect op as the OMCC CAM). */
+	/* DS GEM-port CAM: the OLT's gem -> flow 1 (same indirect op as the OMCC CAM). */
 	gpon_wr(GPON_GTC_DS_PORT_IND, DS_PORT_OP_WRITE | (GPON_DATA_FLOW & 0x7f));
-	gpon_wr(GPON_GTC_DS_PORT_WR, GPON_DATA_GEM & 0xfff);
+	gpon_wr(GPON_GTC_DS_PORT_WR, gpon_data_gem_port & 0xfff);
 	gpon_wr(GPON_GTC_DS_PORT_IND,
 		DS_PORT_OP_WRITE | (GPON_DATA_FLOW & 0x7f) | DS_PORT_OP_REQ);
 	for (i = 0; i < 1000; i++) {
@@ -5704,10 +5754,10 @@ int gpon_install_data_gem(void)
 	 * gpon0. (GEM_DS_MC_CFG 0x59 + DS-PTI from the OMCC install cover this flow too.) */
 	gpon_wr(GPON_GTC_DS_TRAFFIC_CFG + GPON_DATA_FLOW * DS_TRAFFIC_CFG_STRIDE, 0x2);
 
-	/* US GEM-port map: flow 1 -> gem 193 (the gem-id stamped on US data frames). Same
-	 * stride-4 indexing the OMCC flow-64 write uses (flow 1 -> 0x6400 + 1*4 = 0x6404). */
+	/* US GEM-port map: flow 1 -> the OLT's gem (the gem-id stamped on US data frames).
+	 * Same stride-4 indexing the OMCC flow-64 write uses (flow 1 -> 0x6400 + 1*4 = 0x6404). */
 	gpon_wr(GPON_GTC_GEM_US_PORT_MAP + GPON_DATA_FLOW * GEM_US_PORT_MAP_STRIDE,
-		GPON_DATA_GEM & 0xfff);
+		gpon_data_gem_port & 0xfff);
 
 	/* PON-IP classify: SID2QID[1]=OMCC qid 64 (ride T-CONT 16 grants — the OMCC and data
 	 * SHARE the OLT's single Alloc-ID 256, confirmed live: T-CONT 16 <- alloc 0x100), SIDVALID[1]=1,
@@ -5810,7 +5860,7 @@ int gpon_install_data_gem(void)
 	rtl9602c_ponmac_modeset_gpon();	/* keep: no-op unless ponmac_modeset=1 (reference path) */
 
 	pr_info("rtl9602c-gpon: DATA GEM installed gem=%u flow=%u qid=%u sid2qid=%u sidvalid=%u\n",
-		GPON_DATA_GEM, GPON_DATA_FLOW, GPON_OMCC_PHYS_QID,
+		gpon_data_gem_port, GPON_DATA_FLOW, GPON_OMCC_PHYS_QID,
 		pi_packed_get(PI_PON_SID2QID, GPON_DATA_FLOW, 7),
 		pi_packed_get(PI_PON_SIDVALID, GPON_DATA_FLOW, 1));
 	return 0;
@@ -6404,6 +6454,10 @@ static void gpon_fsm_handle(const u8 *m)
 			gpon_tcont_installed = false;
 			gpon_data_installed = false;	/* re-install WAN data GEM on re-config */
 			gpon_data_gem_solicited = false;	/* re-wait for the OLT's fresh ME268 before re-installing */
+			/* The OLT is free to hand out a DIFFERENT data Alloc-ID on
+			 * re-admit; releasing the bind here is what lets it. */
+			gpon_data_tcont_installed = false;
+			gpon_data_alloc = 0;
 			gpon_aes_switch_time = 0xffffffff;	/* re-arm 0x13 on next activation */
 			gpon_key_staged = false;
 			gpon_field(GPON_GTC_DS_ONU_STATUS, 15, 8, 0xff);
@@ -6633,6 +6687,18 @@ static void gpon_fsm_poll(struct timer_list *t)
 			gpon_omcc_installed = false;
 			gpon_tcont_installed = false;
 			gpon_data_installed = false;	/* re-install WAN data GEM on re-config */
+			/* ★ An SN reprovision is an IDENTITY CHANGE, so it clears
+			 * gpon_data_gem_solicited exactly like an OLT Deactivate:
+			 * whatever ME268 the OLT holds belongs to the serial number
+			 * we have just stopped being. Keeping it made the NEW identity
+			 * install its data GEM the moment it reached O5 -- proactively,
+			 * ahead of the new session's own ME268, which is the 2nd-admit
+			 * churn-lock this gate exists to prevent -- and on the PREVIOUS
+			 * identity's gem-port. This is NOT the fiber-LOS case below:
+			 * there the OLT never deactivated us and keeps our provisioning. */
+			gpon_data_gem_solicited = false;
+			gpon_data_tcont_installed = false;
+			gpon_data_alloc = 0;
 			gpon_aes_switch_time = 0xffffffff;
 			gpon_key_staged = false;
 			gpon_field(GPON_GTC_DS_ONU_STATUS, 15, 8, 0xff);
@@ -6722,6 +6788,12 @@ static void gpon_fsm_poll(struct timer_list *t)
 		gpon_omcc_installed = false;
 		gpon_tcont_installed = false;
 		gpon_data_installed = false;
+		/* The data Alloc-ID bind is session state and the OLT may reissue a
+		 * different one; gpon_data_gem_solicited is deliberately KEPT (this
+		 * re-range is ONU-initiated -- the OLT never deactivated us, so it
+		 * holds our provisioning and does not re-send its ME268). */
+		gpon_data_tcont_installed = false;
+		gpon_data_alloc = 0;
 		gpon_aes_switch_time = 0xffffffff;
 		gpon_key_staged = false;
 		gpon_field(GPON_GTC_DS_ONU_STATUS, 15, 8, 0xff);
@@ -6759,6 +6831,11 @@ static void gpon_fsm_poll(struct timer_list *t)
 				gpon_omcc_installed = false;
 				gpon_tcont_installed = false;
 				gpon_data_installed = false;
+				/* The data Alloc-ID bind IS session state: the OLT may
+				 * reissue a different Alloc-ID on re-admit and the
+				 * install guard must not refuse it. */
+				gpon_data_tcont_installed = false;
+				gpon_data_alloc = 0;
 				/* ★2026-07-05: do NOT reset gpon_data_gem_solicited on a fiber-LOS re-range.
 				 * A downstream-LOS re-range is ONU-initiated: the OLT never Deactivated us, so
 				 * it KEEPS our OMCI/GEM provisioning across the brief outage and does NOT

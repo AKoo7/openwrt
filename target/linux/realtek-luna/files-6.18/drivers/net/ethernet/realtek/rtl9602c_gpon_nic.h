@@ -54,10 +54,18 @@ void gpon_anig_optical_omci(s16 *rx_level, s16 *tx_level);
 void rtl9602c_full_sdk_datapath_init(void);
 
 /* WAN data-GEM datapath. GPON_DATA_FLOW = the internal SID/flow the gpon0 WAN netdev
- * steers US frames to (tx_dst_stream_id); GPON_DATA_GEM = the OLT-assigned wire gem-port-id.
- * Shared so the eth driver's gpon0 TX descriptor uses the same SID the GPON install programs. */
-#define GPON_DATA_FLOW	1
-#define GPON_DATA_GEM	193u
+ * steers US frames to (tx_dst_stream_id).
+ * Shared so the eth driver's gpon0 TX descriptor uses the same SID the GPON install programs.
+ *
+ * ★ THE WIRE GEM PORT-ID IS NOT A CONSTANT, AND THE OLD NAME SAID IT WAS.
+ * GPON_DATA_GEM was commented "the OLT-assigned wire gem-port-id" while being a
+ * compile-time 193, and the Port-ID the OLT really assigns (ME 268 attribute 1)
+ * was logged and discarded. Measured: this same OLT gives gem 223 to one board
+ * and 193 to this one. The live value now lives in gpon_data_gem_port, set from
+ * the ME 268 snoop; this macro is only the pre-OLT default and is named for what
+ * it is. A misleading name is a defect — renamed the day it was proven wrong. */
+#define GPON_DATA_FLOW		1
+#define GPON_DATA_GEM_DEFAULT	193u
 
 /* The OLT also provisions a MULTICAST/broadcast GEM (OMCI ME268 inst=1 Port-ID=0x0fff,
  * paired with ME281 Multicast GEM IWTP). Broadcast DS (e.g. the DHCP OFFER the server
@@ -66,13 +74,18 @@ void rtl9602c_full_sdk_datapath_init(void);
 #define GPON_MCAST_FLOW	2
 #define GPON_MCAST_GEM	0xfffu
 
-/* Install the WAN data GEM datapath (bridged, gem-id 193 on flow 1, riding the OMCC
- * T-CONT). Idempotent/one-shot; called from the eth OMCI GEM-Port-CTP (ME268) create
+/* Install the WAN data GEM datapath (bridged, the OLT's gem-id on flow 1, riding the
+ * OMCC T-CONT). Idempotent/one-shot; called from the eth OMCI GEM-Port-CTP (ME268) create
  * handler once the OMCC is up. Defined in gpon-rtl9602c.c. Returns 0 on success,
  * -EAGAIN if the OMCC isn't installed yet. */
 int gpon_install_data_gem(void);
-/* eth OMCI RX -> gpon: the OLT issued the GEM-CTP (ME268) Create; gate the data-GEM install on it. */
-void gpon_omci_note_gem_create(void);
+/* eth OMCI RX -> gpon: the OLT issued the GEM-CTP (ME268) Create. @port_id is G.988
+ * ME 268 attribute 1, the WIRE gem-port-id (a Create's contents are attribute VALUES
+ * from byte 8 with no mask, so it is msg[8]<<8 | msg[9]). It gates the data-GEM
+ * install AND supplies the gem-port-id that install programs — the OLT chooses it,
+ * we do not. The MULTICAST GEM (GPON_MCAST_GEM) arrives as an ME 268 Create too and
+ * is refused here. */
+void gpon_omci_note_gem_create(u16 port_id);
 
 /* Emit an OMCI Attribute-Value-Change reporting the HGU WAN-egress (VEIP ME329) operational,
  * so the OLT un-gates downstream user-data forwarding. The OLT never polls the data MEs after
