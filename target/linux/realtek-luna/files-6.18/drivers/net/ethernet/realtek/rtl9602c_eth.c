@@ -566,6 +566,9 @@ struct rtl9602c_eth {
 	u8		omci_sn[8];	/* G.984.3 ONU-SN (4 ASCII ID + 4 serial),
 					 * for the ONU-G Vendor-ID/Serial GET reply */
 	u8		omci_mds;	/* ONU-data (ME 2) MIB-Data-Sync counter */
+	u16		omci_audit_reads;	/* DS OMCI reads since the OLT last PROVISIONED
+					 * anything. See omci_mds_walk(). */
+	u8		omci_mds_tries;		/* how far the adaptive MDS walk has stepped */
 	u32		dbg_omci_tx;		/* US OMCI responses queued */
 	u32		dbg_omci_tx_drop;	/* dropped: ring full / alloc / map */
 	u32		dbg_omci_unhandled;	/* requests with no modelled reply */
@@ -967,6 +970,68 @@ MODULE_PARM_DESC(omci_mds_seed, "OMCI ME2 MIB-Data-Sync boot seed (poison: must 
 static bool mds_reset0 = true;
 module_param(mds_reset0, bool, 0644);
 MODULE_PARM_DESC(mds_reset0, "on MIB-Reset zero ME2 MIB-Data-Sync (G.988/stock, default) vs re-seed");
+
+/* ★★ THE MIB-DATA-SYNC SEED IS A GUESS, AND A GUESS CANNOT BE RIGHT ON EVERY OLT
+ * RECORD. omci_mds_seed exists to FAIL the OLT's ME2 audit on purpose, so the OLT
+ * issues MIB-Reset and re-provisions us (see its comment). But which values fail
+ * that audit is a property of the OLT's STORED lsync for THIS ONU on THIS PON
+ * port -- something we cannot read and the OLT never tells us. The seed was
+ * chosen against one port's observed range (~42-126) and the note above already
+ * records the two ways a wrong choice ends: a value that MATCHES makes the OLT
+ * skip MIB-Reset and every Create; mds=0 "wedges this OLT in a GET poll loop".
+ *
+ * MEASURED 2026-08-16, after this board was moved to the OLT's PON port 2: with
+ * the compiled seed 200 the OLT sent 59 DS OMCI messages, EVERY ONE a Get (ME
+ * 256/257/2/65530) on a 7-13 s loop, and NEVER a MIB-Reset (MT 0x4f), never an
+ * Assign_Alloc-ID, never a Create (class 268). `mds` stayed at exactly 200 --
+ * only a MIB-Reset or an applied Create/Set moves it -- the OLT held Match State
+ * "Initial", and the ONU had no data GEM and no WAN while sitting healthy at O5.
+ * The seed had become, on that record, the wedging value its own comment warns
+ * about.
+ *
+ * ⇒ SO WE STOP GUESSING AND CLOSE THE LOOP ON THE OUTCOME. We cannot observe
+ * lsync, but we can observe the ONE thing that matters: whether the OLT is
+ * PROVISIONING us. If it keeps reading and never provisions, the value we report
+ * is not doing its job, and we report a different one. That is the whole idea:
+ * the ONU adapts to the OLT it is actually attached to, on any port, against any
+ * stored value, with nothing to re-tune by hand.
+ *
+ * THE WALK: +37 each step. 37 is coprime with 256, so it visits EVERY value
+ * before repeating -- an exhaustive search, not a sample -- and 0 is skipped
+ * because it is the known wedging value. Rate-bounded by the OLT's own audit
+ * cadence and NEVER count-capped: a recovery path that gives up is a device that
+ * needs a human, which is what this project's robustness bar forbids.
+ *
+ * IT COSTS NOTHING WHEN THINGS WORK. Every provisioning event -- a MIB-Reset, or
+ * any applied Create/Set/Delete -- resets the counter, so on a healthy admission
+ * the walk never takes a single step and the compiled seed is used exactly as
+ * before. Set omci_mds_adapt=0 for the old fixed-seed behaviour. */
+static bool omci_mds_adapt = true;
+module_param(omci_mds_adapt, bool, 0644);
+MODULE_PARM_DESC(omci_mds_adapt, "walk the reported ME2 MIB-Data-Sync when the OLT reads but never provisions (default on)");
+static unsigned int omci_mds_adapt_reads = 12;
+module_param(omci_mds_adapt_reads, uint, 0644);
+MODULE_PARM_DESC(omci_mds_adapt_reads, "DS OMCI reads with no provisioning before the MIB-Data-Sync is advanced");
+
+/* One step of the walk, driven by the OLT's own audit traffic. */
+static void omci_mds_walk(struct rtl9602c_eth *ep)
+{
+	if (!omci_mds_adapt || !omci_mds_adapt_reads)
+		return;
+	if (++ep->omci_audit_reads < omci_mds_adapt_reads)
+		return;
+	ep->omci_audit_reads = 0;
+	ep->omci_mds += 37;		/* coprime with 256: visits every value */
+	if (!ep->omci_mds)		/* 0 wedges this OLT in a GET poll loop */
+		ep->omci_mds = 1;
+	ep->omci_mds_tries++;
+	netdev_info(ep->ndev,
+		    "OMCI: %u reads with no MIB-Reset and no Create -- the OLT is "
+		    "reading us but not provisioning. Reporting MIB-Data-Sync %u "
+		    "instead (walk step %u); its next pre-config read sees the new "
+		    "value.\n",
+		    omci_mds_adapt_reads, ep->omci_mds, ep->omci_mds_tries);
+}
 
 static void rtl9602c_wan_mac(u8 *out, const u8 *base)
 {
@@ -2507,6 +2572,15 @@ static void rtl9602c_eth_omci_input(struct rtl9602c_eth *ep, const u8 *msg,
 		 * permanently ahead -> ME2-audit mismatch loop -> Deactivate(0x05). Zero it (mds_reset0,
 		 * default) so rsync converges to the OLT's lsync after the resync. */
 		ep->omci_mds = mds_reset0 ? 0 : (u8)omci_mds_seed;
+		/* ★ THE WALK'S GOAL, REACHED. A MIB-Reset means the audit did its job
+		 * and the OLT is re-provisioning, so the search stops where it is. */
+		if (ep->omci_mds_tries)
+			netdev_info(ep->ndev,
+				    "OMCI: MIB-Reset after %u MIB-Data-Sync walk step(s) "
+				    "-- the OLT is provisioning us again\n",
+				    ep->omci_mds_tries);
+		ep->omci_audit_reads = 0;
+		ep->omci_mds_tries = 0;
 		omci_store_reset();		/* clear provisioned-ME store (OLT re-provisions) */
 		resp[8] = OMCI_RC_OK;
 		break;
@@ -2536,6 +2610,12 @@ static void rtl9602c_eth_omci_input(struct rtl9602c_eth *ep, const u8 *msg,
 		resp[8] = rtl9602c_omci_get_fill(ep, class_id, req_mask, resp);
 		pr_info("rtl9602c-omci: GET class=%u mask=%04x rmask=%02x%02x rc=%u val0=%u (mds=%u)\n",
 			class_id, req_mask, resp[9], resp[10], resp[8], resp[11], ep->omci_mds);
+		/* ★ THE ONLY CALLER OF THE WALK, and it is deliberately driven by the
+		 * OLT'S OWN AUDIT rather than by a timer: the stuck state IS a Get loop,
+		 * so the evidence that we are stuck is exactly the event that advances
+		 * the search. No timer to arm, none to cancel, and nothing runs at all
+		 * on a link the OLT is not reading. */
+		omci_mds_walk(ep);
 		break;
 	case OMCI_MT_SET:
 	case OMCI_MT_CREATE:
@@ -2567,6 +2647,10 @@ static void rtl9602c_eth_omci_input(struct rtl9602c_eth *ep, const u8 *msg,
 			ep->omci_mds = msg[10];
 		if (++ep->omci_mds == 0)		/* wrap 255 -> 1 (skip 0) */
 			ep->omci_mds = 1;
+		/* ★ Progress: the OLT is applying config, so the audit is satisfied and
+		 * the walk must not step underneath a provisioning burst. */
+		ep->omci_audit_reads = 0;
+		ep->omci_mds_tries = 0;
 		resp[8] = OMCI_RC_OK;
 		break;
 	}
