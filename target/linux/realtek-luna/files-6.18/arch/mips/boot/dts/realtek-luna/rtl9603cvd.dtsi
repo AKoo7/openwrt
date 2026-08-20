@@ -1,0 +1,267 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+/*
+ * Realtek RTL9603CVD GPON ONU SoC (MIPS interAptiv core).
+ *
+ * Clean-room device description. This file is deliberately MINIMAL: it
+ * carries only what is needed to reach a serial console and an initramfs
+ * shell. Everything else is left OUT rather than guessed -- an absent node
+ * costs a feature, a wrong node costs a boot.
+ *
+ * WHY THE FILE IS NAMED FOR THE *CVD*, NOT FOR "rtl9603c":
+ *   "RTL9603C" names two different dies. The plain part is a SUB-TYPE of
+ *   the RTL9607C die; the CVD on this board is its own die, chip id
+ *   0x96030003. Naming this file rtl9603c.dtsi would claim coverage of a
+ *   part we have never read a register from.
+ *
+ * ---------------------------------------------------------------------
+ * EVIDENCE TIERS FOR EVERYTHING IN THIS FILE
+ *
+ * The board's OWN complete U-Boot + kernel boot console was captured on
+ * 2026-08-18 (dev/lanly.log in the provisioning workspace). That console
+ * is tier 1 -- a live measurement on THIS board -- and it promoted most of
+ * this file out of the "inherited from a sibling chip" guesswork it began
+ * as. Where a line below says MEASURED it is quoting that console.
+ *
+ *   MEASURED (tier 1):
+ *     - Board: RTL9603CVD MIPS interAptiv UP:1050MHz LX:200MHz DDR2:525MHz
+ *     - chip id 0x96030003, revision 0x02 (rev B), sub-type 0x04
+ *     - CPU0 and CPU1 both "revision is: 0001a020 (MIPS interAptiv)"
+ *     - I$ 64 kB / D$ 32 kB / L2 128 kB 8-way
+ *     - THERE IS NO MIPS GIC AND NO COHERENCE MANAGER (see the intc node)
+ *     - UART0 at MMIO 0x18002000, base_baud 12327200
+ *     - SoC timer at 0x18003200 / 0x18003210 / 0x18003280, base 200 MHz
+ *     - watchdog registers at 0x18003260 / +0x64 / +0x68
+ *     - GPIO controller windows 0x1b000038 (+0x0c) and 0x18003308 (+0x54),
+ *       three banks
+ *     - clocks: OCP 1050 MHz, LX 200 MHz
+ *
+ *   CORROBORATED (tier 3, the chip's own 4.4.140 SDK -- the same kernel
+ *   version this board runs, which is what makes it tier 3 and not tier 4):
+ *     - the interrupt aggregator's register map and routing values
+ * ---------------------------------------------------------------------
+ */
+
+/ {
+	#address-cells = <1>;
+	#size-cells = <1>;
+	compatible = "realtek,rtl9603cvd";
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		/*
+		 * THE SECOND CPU IS NOT DESCRIBED, DELIBERATELY -- and the
+		 * question the earlier draft of this file left open is now
+		 * ANSWERED, which is why it stays out rather than going in.
+		 *
+		 * MEASURED: the vendor kernel prints
+		 *	MIPS CPS SMP unable to proceed without a CM
+		 * and then still reaches "Brought up 2 CPUs". So the two
+		 * logical CPUs are NOT a Coherent Processing System: there is
+		 * no Coherence Manager, and the pair is two VPEs of one
+		 * MT-ASE core (the core advertises "mt" among its ASEs).
+		 *
+		 * That needs CONFIG_MIPS_MT_SMP, which this subtarget does
+		 * not build (it is configured for the RTL9607C's CPS). Until
+		 * it does, a second cpu node describes a CPU nothing can
+		 * bring up. One CPU is correct-but-slower; a wrong second-CPU
+		 * description hangs in SMP bring-up.
+		 *
+		 * OWED at M2+: CONFIG_MIPS_MT_SMP for this chip, then cpu@1.
+		 */
+		cpu@0 {
+			device_type = "cpu";
+			compatible = "mti,interaptiv";	/* MEASURED */
+			reg = <0>;
+		};
+	};
+
+	/*
+	 * MEASURED: "[apro_clocks_init]clk_data.clk_num=2, ocp=1050000000,
+	 * lx=200000000", and the SoC timer independently reports
+	 * "rtktimer: base freq=200000000".
+	 */
+	lx_clk: lx-clk {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <200000000>;
+	};
+
+	/*
+	 * MEASURED: the 8250 driver on the vendor kernel reports
+	 * "base_baud = 12327200" for this port, and 12327200 x 16 =
+	 * 197235200. This is the UART reference, not the LX bus clock.
+	 */
+	uart_clk: uart-clk {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <197235200>;
+	};
+
+	/*
+	 * The CP0 interrupt controller: architectural on every MIPS core.
+	 */
+	cpuintc: interrupt-controller {
+		#address-cells = <0>;
+		#interrupt-cells = <1>;
+		interrupt-controller;
+		compatible = "mti,cpu-interrupt-controller";
+	};
+
+	/*
+	 * SoC interrupt aggregator.
+	 *
+	 * ★ THIS NODE REPLACES A "mti,gic" THAT WAS WRONG. The first draft
+	 * of this file inherited a MIPS GIC at 0x1fbc0000 from the RTL9607C
+	 * description. This board's own kernel prints, in this order:
+	 *
+	 *	GIC isn't present!
+	 *	rtl9603cvd_gisr_init: gisr_translate_d2c = ...
+	 *
+	 * i.e. it probes for a GIC, does not find one, and falls back to
+	 * this aggregator. A GIC node here would have cost a boot to learn
+	 * something already written down: early printk would appear and the
+	 * console would never become interactive, because the UART's
+	 * interrupt would have nowhere to arrive from.
+	 *
+	 * Input numbering is the NATIVE aggregator bit, so UART0 is 49 and
+	 * the system timer is 43 -- the same numbers the RTL9602C device
+	 * tree in this directory uses for the same two peripherals, which
+	 * is a third independent check on the map. See irq-rtl9603cvd.c for
+	 * the full input table and the routing evidence.
+	 *
+	 * The three parents are the CP0 lines the loaded routing targets:
+	 * word-0 inputs on IRQ 3, word-1 inputs on IRQ 4, the system timer
+	 * on IRQ 7. The dispatch scans both status words whichever line
+	 * woke it, so an extra parent is harmless and a missing one loses
+	 * interrupts silently.
+	 */
+	intc: interrupt-controller@18003000 {
+		compatible = "realtek,rtl9603cvd-intc";
+		reg = <0x18003000 0x80>;	/* two per-CPU blocks, stride 0x40 */
+		interrupt-controller;
+		#interrupt-cells = <1>;
+		interrupt-parent = <&cpuintc>;
+		interrupts = <3>, <4>, <7>;
+	};
+
+	/*
+	 * SoC timer channel TC0 drives the system tick.
+	 *
+	 * MEASURED: the vendor kernel maps 0x18003200 and 0x18003210 as
+	 * clockevents and 0x18003280 as its clocksource, at a 200 MHz base.
+	 * We need only TC0; the window covers TC0 and TC1.
+	 *
+	 * The driver is the family one already in this target
+	 * (timer-rtl9602c.c). It is reached through the fallback compatible
+	 * rather than by editing that driver's match table, so nothing
+	 * about the RTL9602C build changes. Its register layout
+	 * (DATA/CNT/CTRL/INT at +0x00/+0x04/+0x08/+0x0c) and its 200 MHz
+	 * input both hold here.
+	 *
+	 * NOTE the CP0 count/compare clockevent is NOT built for this
+	 * target (no CONFIG_CEVT_R4K), which is what leaves CP0 IRQ 7 free
+	 * for the aggregator to deliver TC0 on.
+	 */
+	timer@18003200 {
+		compatible = "realtek,rtl9603cvd-timer", "realtek,rtl9602c-timer";
+		reg = <0x18003200 0x20>;
+		clocks = <&lx_clk>;
+		interrupt-parent = <&intc>;
+		interrupts = <43>;		/* TC0 */
+	};
+
+	/*
+	 * 16550 console UART.
+	 *
+	 * MEASURED, base and reference both: "18002000.serial: ttyS0 at
+	 * MMIO 0x18002000 (irq = 46, base_baud = 12327200) is a 16550A".
+	 * reg-shift 2 and reg-io-width 1 are inherited from the family and
+	 * are the one inherited fact with a track record -- the same
+	 * arrangement holds on the RTL9602C (a different CPU core) and on
+	 * the RTL9607C.
+	 *
+	 * The baud is not from here: 115200 is DECLARED by the operator for
+	 * this bench and is set in the board .dts chosen/stdout-path.
+	 */
+	uart0: serial@18002000 {
+		compatible = "ns16550a";
+		reg = <0x18002000 0x100>;
+		reg-shift = <2>;
+		reg-io-width = <1>;
+		clocks = <&uart_clk>;
+		interrupt-parent = <&intc>;
+		interrupts = <49>;		/* UART0 */
+		status = "okay";
+	};
+
+	/*
+	 * SoC watchdog, at the top of the timer block.
+	 *
+	 * MEASURED -- the vendor kernel dumps its own three registers by
+	 * address on this board:
+	 *	BSP_WDTCNTRR(0xb8003260)  BSP_WDTINTRR(0xb8003264)
+	 *	BSP_WDTCTRLR(0xb8003268)
+	 * (0xb800xxxx is the uncached alias of physical 0x1800xxxx.) The
+	 * family driver already in this target binds on the generic
+	 * compatible, so no driver change is needed.
+	 *
+	 * ★ DISABLED ON PURPOSE, and it matches stock. The same dump reads
+	 * "WDT_E=0, (1-enable, 0-disable)": the vendor firmware does NOT arm
+	 * this watchdog at boot. Arming it here would make our first boot
+	 * strictly less forgiving than the firmware we are replacing -- a
+	 * bring-up kernel that stops before userspace would reset instead of
+	 * sitting at the console where it can be read.
+	 *
+	 * ENABLE at M6 (soak/robustness), together with the LED and reboot
+	 * work, not before.
+	 */
+	watchdog@18003260 {
+		compatible = "realtek,rtl9603cvd-wdt", "realtek,rtl960x-wdt";
+		reg = <0x18003260 0xc>;
+		clocks = <&lx_clk>;
+		timeout-sec = <30>;
+		status = "disabled";
+	};
+
+	/*
+	 * ---------------------------------------------------------------
+	 * DELIBERATELY ABSENT. None is needed to reach a console, and a
+	 * wrong one is a wedged boot. Each now carries whatever the boot
+	 * console DID measure, so the M2/M3 work starts from a fact instead
+	 * of a search:
+	 *
+	 *   gpio               - MEASURED bases: the vendor driver maps
+	 *       0x1b000038 (+0x0c, data/direction) and 0x18003308 (+0x54,
+	 *       per-bank interrupt/config) and sets up THREE banks. That is
+	 *       the same pair the RTL9607C description uses. What is still
+	 *       unknown is the part that matters for this board: NINE LED
+	 *       labels are DECLARED (PWR LOS PON GE FE3 FE2 FE1 NC Wifi)
+	 *       and not one GPIO number or polarity is known, and the
+	 *       vendor blinks them from a software kthread. A wrong gpio
+	 *       number drives an unknown pin on a live board.
+	 *   ethernet / switch  - the aggregator input for the switch core
+	 *       is 8 and for GMAC0 is 26/27 (see irq-rtl9603cvd.c). The
+	 *       vendor's datapath is built INTO its kernel, not a module,
+	 *       so there is no .ko to read; RE targets the vmlinux in k0.
+	 *       The four printed sockets appear as QinQ eth0.<N>.0 devices,
+	 *       which is not the shape the RTL9602C NIC driver produces.
+	 *   PCIe / WiFi        - MEASURED: the radio is PCIe-attached,
+	 *       PCI id 10ec:818c, claimed on stock by the vendor rtl8192cd
+	 *       driver, chip_version 0x100c. Aggregator input 16. Note the
+	 *       rtl9607x subtarget builds with CONFIG_PCI off on purpose,
+	 *       so a PCIe node would be inert today anyway.
+	 *   GPON / PON-MAC / SerDes / BOSA - aggregator inputs 24 (PON NIC)
+	 *       and 25 (PON NIC downstream). The two GPON drivers in this
+	 *       tree gate on the ROOT compatible being exactly
+	 *       "realtek,rtl9607c"; teaching them "realtek,rtl9603cvd" is
+	 *       driver work for M4, NOT something to paper over by lying in
+	 *       the board's compatible string.
+	 *   usb                - aggregator input 14. Not needed.
+	 *   soft_ipc / ipc-shm - 9607C board facts. The 9607C's ipc-shm
+	 *       window sits at 0x10000000, which is ABOVE all of this
+	 *       board's measured RAM.
+	 * ---------------------------------------------------------------
+	 */
+};

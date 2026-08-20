@@ -1,0 +1,223 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+/*
+ * LANLY G24W GPON ONU -- Realtek RTL9603CVD.
+ *
+ * Bring-up scaffold (M1): serial console + initramfs, run from RAM. No
+ * Ethernet, no WiFi, no GPON, no LEDs and no flash are claimed yet -- see
+ * the "DELIBERATELY ABSENT" block in rtl9603cvd.dtsi for why each is out.
+ *
+ * Clean-room: board description from observed hardware only.
+ *
+ * WHAT IS MEASURED HERE (tier 1, from the running vendor 4.4.140 kernel,
+ * captured 2026-08-19):
+ *   - MemTotal: 84140 kB
+ *   - the seven-partition flash table below, from the board's own /proc/mtd
+ *     (sizes and erasesize are read; the OFFSETS are derived -- see the
+ *     flash node)
+ *   - four printed Ethernet sockets, 3x100 + 1x1000, presented as QinQ
+ *     eth0.<N>.0 devices bridged into br0
+ *   - one 2.4 GHz radio
+ *
+ * WHAT THE VENDOR KERNEL SAYS ABOUT ITSELF, and why we do NOT copy it:
+ *   /proc/cpuinfo reports `machine : rtk,9607c`. That is strong evidence
+ *   the vendor ships this board with the RTL9607C board description, and
+ *   it is why rtl9603cvd.dtsi is allowed to inherit the 9607C register
+ *   bases as a starting point. It is NOT a reason to put
+ *   "realtek,rtl9607c" in this board's compatible list: the GPON drivers
+ *   in this tree select their PON-MAC table off exactly that string, so
+ *   claiming it would make them probe happily against the wrong chip's
+ *   analog bring-up. The board says what it is; the drivers get taught.
+ */
+
+/dts-v1/;
+
+#include "rtl9603cvd.dtsi"
+
+/ {
+	model = "LANLY G24W (RTL9603CVD)";
+	compatible = "lanly,g24w", "realtek,rtl9603cvd";
+
+	aliases {
+		serial0 = &uart0;
+	};
+
+	chosen {
+		/*
+		 * 115200 is DECLARED by the operator for this bench (and is
+		 * range-checked in the rig's bench table); it is not derived
+		 * from anything in the firmware. `earlycon` with no argument
+		 * resolves through stdout-path above, so it costs nothing and
+		 * is the only thing that will print if the GIC or the timer
+		 * base turns out to be wrong.
+		 */
+		stdout-path = "serial0:115200n8";
+		bootargs = "console=ttyS0,115200 earlycon ignore_loglevel keep_bootcon";
+	};
+
+	/*
+	 * RAM -- 128 MiB DDR2, with TWO HARDWARE HOLES the port must respect.
+	 *
+	 * MEASURED (tier 1, this board's own boot console). U-Boot calibrates
+	 * the part and reports its true size; the vendor kernel then carves
+	 * two packet-buffer-offload windows out of it before handing the rest
+	 * to Linux, and prints the resulting map:
+	 *
+	 *   AK: DRAM size=0x8000000                             <- 128 MiB
+	 *   DEBUG_MEM_AUTO: mem_size=0x08000000, bankcnt=0x08,
+	 *                   banksize=0x01000000
+	 *   DEBUG_MEM_AUTO: LUNA_PBO_DL_DRAM_OFFSET = 0x06c00000,
+	 *                   SIZE_BARRIER = 0x00400000            <- 4 MiB hole
+	 *   DEBUG_MEM_AUTO: LUNA_PBO_UL_DRAM_OFFSET = 0x07f00000,
+	 *                   SIZE_BARRIER = 0x00100000            <- 1 MiB hole
+	 *   Determined physical RAM map:
+	 *     memory: 06c00000 @ 00000000 (usable)
+	 *     memory: 00f00000 @ 07000000 (usable)
+	 *
+	 * so the physical layout is:
+	 *
+	 *   0x00000000 - 0x06bfffff   108 MiB  usable
+	 *   0x06c00000 - 0x06ffffff     4 MiB  PBO DOWNLINK  -- hardware DMA
+	 *   0x07000000 - 0x07efffff    15 MiB  usable
+	 *   0x07f00000 - 0x07ffffff     1 MiB  PBO UPLINK    -- hardware DMA
+	 *
+	 * THE TWO RANGES BELOW ARE THE TWO USABLE ONES, VERBATIM. This is
+	 * exactly the map the vendor kernel runs on, which is what makes it
+	 * safe: every byte claimed is a byte a working kernel has been using
+	 * on this silicon, and neither hole is handed to the allocator.
+	 *
+	 * WHY NOT ONE FLAT SPAN: a single 128 MiB memory node would hand the
+	 * kernel the DRAM the PON hardware DMAs into. It would also boot
+	 * fine right up until the PON is brought up in M4, which is the worst
+	 * possible time to discover it.
+	 *
+	 * WHY NOT THE EARLIER 80 MiB: that value predated this console and
+	 * was chosen to stop safely below the first hole. It is not wrong,
+	 * it is just not the board -- it throws away 43 MiB and describes a
+	 * memory map no measurement ever produced.
+	 *
+	 * The "MemTotal: 84140 kB" the running vendor kernel reports is NOT
+	 * the fitted size and must not be used as one: it is what survived
+	 * that kernel's own reservations (it prints "42004K reserved").
+	 */
+	memory@0 {
+		device_type = "memory";
+		reg = <0x00000000 0x06c00000>,	/* 108 MiB below the PBO DL hole */
+		      <0x07000000 0x00f00000>;	/*  15 MiB between the two holes */
+	};
+
+	/*
+	 * 16 MB flash.
+	 *
+	 * *** status = "disabled" ON PURPOSE. READ THIS BEFORE ENABLING. ***
+	 *
+	 * The PARTITION TABLE below is MEASURED (the board's own /proc/mtd)
+	 * and is the single most valuable fact in this file, so it is
+	 * recorded here rather than thrown away. The CONTROLLER is not:
+	 *
+	 *   UNKNOWN: the flash base and the access method on this SoC.
+	 *     0x14000000 with a memory-mapped read window is the RTL9602C's
+	 *     arrangement; the RTL9607C description declares no flash node at
+	 *     all, so there is nothing to corroborate it with. `mtd-rom` also
+	 *     means READ-ONLY by construction -- program/erase live behind a
+	 *     separate PIO register block with no driver in this tree.
+	 *
+	 *   WHY DISABLED RATHER THAN OMITTED: bring-up is run-from-RAM and
+	 *     needs no flash whatsoever, while a WRONG base is actively
+	 *     destructive -- the kernel would map 16 MB of nothing, publish
+	 *     garbage partitions, and (if `linux,rootfs` were set) hand
+	 *     ROOT_DEV a garbage device and panic at mount. Disabled, the
+	 *     node is inert: nothing probes it, the measurement is preserved,
+	 *     and turning it on later is a one-word change.
+	 *
+	 *   NOTE there is deliberately NO `linux,rootfs` on r0 yet. Adding it
+	 *     is part of the same later step, not this one.
+	 *
+	 * ENABLE IT ONLY AFTER establishing the base and confirming the
+	 * offsets, with:
+	 *   for d in /sys/class/mtd/mtd[0-9]*; do \
+	 *       echo "$d off=$(cat $d/offset) size=$(cat $d/size) \
+	 *             erase=$(cat $d/erasesize) name=$(cat $d/name)"; done
+	 *   ls -l /sys/bus/spi/devices/  (then read <dev>/modalias under it)
+	 *   cat /proc/iomem
+	 */
+	spi_nor: flash@14000000 {
+		compatible = "mtd-rom";
+		reg = <0x14000000 0x1000000>;	/* base UNVERIFIED -- see above */
+		bank-width = <2>;
+		status = "disabled";
+
+		/*
+		 * MEASURED, and DIFFERENT from the X111W's declaration: this
+		 * board's /proc/mtd reports erasesize 0x1000 (4 KiB) on every
+		 * partition. It is load-bearing even on a read-only mapping --
+		 * map_rom falls back to the WHOLE CHIP as one erase block when
+		 * this property is absent, which makes the squashfs splitter
+		 * round a rootfs past the end of every partition and publish
+		 * rootfs_data at size 0.
+		 */
+		erase-size = <0x1000>;
+
+		/*
+		 * ★ NO #address-cells/#size-cells HERE. With `fixed-partitions`
+		 * the cells belong to the `partitions` node -- each partition
+		 * child carries its own `reg` against THOSE. Declaring them on
+		 * the flash node too is what `dtc` flags as
+		 * `avoid_unnecessary_addr_size`: this node has no child with a
+		 * `reg` of its own and no `ranges`, so the pair described a
+		 * child address space that does not exist.
+		 */
+		partitions {
+			compatible = "fixed-partitions";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			/*
+			 * SIZES and NAMES are MEASURED from /proc/mtd.
+			 *
+			 * OFFSETS are DERIVED, not read: /proc/mtd publishes
+			 * size and erasesize only, never offset. The derivation
+			 * assumes the listing is ascending and contiguous from
+			 * 0. What supports it: the seven sizes sum to EXACTLY
+			 * 0x1000000 with zero slack, and every resulting
+			 * boundary is 4 KiB-aligned -- a layout with real gaps
+			 * could only reproduce that by coincidence. What would
+			 * PROVE it: /sys/class/mtd/mtdN/offset (command above).
+			 *
+			 * SINGLE BANK: there is no k1/r1 here, unlike the
+			 * X111W. Whatever fallback scheme this product uses, it
+			 * is not a second kernel/rootfs pair, and `framework1`
+			 * sits ABOVE r0 -- an overlay appended after the rootfs
+			 * would collide with it.
+			 */
+			partition@0 {
+				label = "boot";
+				reg = <0x000000 0x040000>;	/* 256K */
+				read-only;
+			};
+			partition@40000 {
+				label = "env";
+				reg = <0x040000 0x002000>;	/* 8K -- U-Boot env */
+			};
+			partition@42000 {
+				label = "env2";
+				reg = <0x042000 0x002000>;	/* 8K -- U-Boot env backup */
+			};
+			partition@44000 {
+				label = "config";
+				reg = <0x044000 0x040000>;	/* 256K */
+			};
+			partition@84000 {
+				label = "k0";
+				reg = <0x084000 0x334000>;	/* 3280K kernel */
+			};
+			partition@3b8000 {
+				label = "r0";
+				reg = <0x3b8000 0xaa0000>;	/* 10880K rootfs */
+			};
+			partition@e58000 {
+				label = "framework1";
+				reg = <0xe58000 0x1a8000>;	/* 1696K */
+			};
+		};
+	};
+};
