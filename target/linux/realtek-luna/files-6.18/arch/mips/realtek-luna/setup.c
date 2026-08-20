@@ -44,6 +44,13 @@
  * BSP_WDTCTRLR @0x18003268: [31] enable, [30:29] clk-scale (0=2^25 .. 3=2^28
  * LX clocks/unit), [26:22] phase-1 timeout (5b), [19:15] phase-2 timeout (5b),
  * [1:0] reset-mode (0=full chip, 1=CPU+IPSec, 2=S/W). Kick reg @0x18003260.
+ *
+ * ★ THE SAME BLOCK IS ALSO DRIVEN BY drivers/watchdog/rtl960x_wdt.c, which is
+ * what serves /dev/watchdog.  This path stays where it is -- it is the proven
+ * one, it is what _machine_restart needs, and it must work with no driver bound
+ * -- but that means one piece of hardware is described in two files.  The
+ * offline case dev/rtl9607c-test/luna_wdt_test asserts that the two agree, so a
+ * shift fixed in one place cannot silently rot in the other.
  */
 #define LUNA_WDT_CTRL		((void __iomem *)CKSEG1ADDR(0x18003268))
 #define LUNA_WDT_E		BIT(31)		/* watchdog enable          */

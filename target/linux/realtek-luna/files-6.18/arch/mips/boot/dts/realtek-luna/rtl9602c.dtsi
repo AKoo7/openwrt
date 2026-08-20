@@ -91,6 +91,45 @@
 		interrupt-parent = <&intc>;
 		interrupts = <43>;
 	};
+
+	watchdog@18003260 {
+		/*
+		 * The SoC watchdog, at the top of the same TC block (TC_BASE +
+		 * 0x60): WDT_CNT at +0x00 (bit 31 = kick), WDT_INTR at +0x04,
+		 * WDT_CTRL at +0x08 (bit 31 enable, [30:29] tick scale,
+		 * [26:22] phase-1 timeout, [19:15] phase-2 timeout, [1:0]
+		 * reset mode).  It does not overlap the timer window above,
+		 * which ends at +0x1f.
+		 *
+		 * The block is family-wide, not chip-specific -- the vendor
+		 * BSP declares it once for every Luna part -- hence the
+		 * generic compatible the driver actually binds on, with the
+		 * chip name in front so a future chip-specific quirk has
+		 * somewhere to go.
+		 *
+		 * The counter is scaled from the LX bus clock, so the window
+		 * the driver can express follows &lx_clk: at 200 MHz one tick
+		 * is 1.342 s at the coarsest scale and the ceiling is 42 s.
+		 * That rate is not a fresh assumption -- the same &lx_clk
+		 * drives the SoC timer above, which is this kernel's system
+		 * tick, so a wrong LX frequency would already show up as a
+		 * board that cannot keep time.
+		 *
+		 * 30 s is a working default, not a measurement: it is well
+		 * inside that ceiling, and it is what procd asks for anyway
+		 * once it opens /dev/watchdog, feeding at half the window.
+		 *
+		 * NOTE the arch restart path in arch/mips/realtek-luna/setup.c
+		 * drives these same registers through a fixed KSEG1 address.
+		 * That is deliberate and predates this node; the driver maps
+		 * the window non-exclusively so both can coexist.
+		 */
+		compatible = "realtek,rtl9602c-wdt", "realtek,rtl960x-wdt";
+		reg = <0x18003260 0xc>;
+		clocks = <&lx_clk>;
+		timeout-sec = <30>;
+	};
+
 	nic: ethernet@18012000 {
 		/* re8686-class GMAC0; base confirmed on silicon (IDR0-5 hold the
 		 * U-Boot MAC). INTC input 26 = GMAC0 TX/RX completion (matches live

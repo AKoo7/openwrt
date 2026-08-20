@@ -667,10 +667,46 @@ CONFIG_UBIFS_FS_ZSTD=y
 # RTL9607F dev: /dev/mem for live register spy/poke (project keeps dump-the-protocol tooling first-class)
 CONFIG_DEVMEM=y
 
-# --- Software self-recovery net (no HW-watchdog dependency) ---------------- #
+# --- HARDWARE watchdog ------------------------------------------------------ #
+# cortina,wdt @0xf432902c -- drivers/watchdog/cortina-wdt.c, wired in the DTS.
+# This is the ONLY thing that recovers a hard lockup: every software detector
+# below is driven by a kernel timer and a kernel thread, so a CPU spinning with
+# interrupts off, a dead clocksource or a wedged panic path stops the detector
+# and the box with it.  The two nets are complementary, not redundant -- the
+# software half catches a hung task or a crashed service while the kernel is
+# still healthy, which the hardware half (fed from userspace) never will.
+#
+# HANDLE_BOOT_ENABLED: if a bootloader ever hands over an already-running
+# watchdog, the core keeps it fed until userspace opens /dev/watchdog, instead
+# of the board resetting part-way through a ~200 s boot forever.  The driver
+# additionally REPROGRAMS an adopted watchdog to its own window rather than
+# inheriting a countdown already part-way through, because the core derives its
+# keepalive from that window and would otherwise feed it too slowly.
+# ★ MEASURED on this board 2026-08-10, on BOTH reset paths and not just the
+# easy one: PER_WDT is found STOPPED at kernel entry after a power cycle AND
+# after a warm `reboot` (PSCI SYSTEM_RESET) -- at the U-Boot prompt it reads
+# CTRL=0 with a count that does not move, identically in both cases.  So an
+# armed window cannot reach into the next boot on this SoC, which is why the
+# driver deliberately does NOT ask for CONFIG_WATCHDOG_STOP_ON_REBOOT: staying
+# armed costs nothing here and covers a shutdown that hangs.  The driver prints
+# which state it found on every boot rather than assuming.
+# SYSFS: exposes timeout/timeleft/state/identity/bootstatus as standard
+# interfaces, so the test suite reads them the same way on any board.  The
+# vendor firmware ships without it (a per-vendor tool is the only route there).
+CONFIG_WATCHDOG=y
+CONFIG_WATCHDOG_CORE=y
+CONFIG_WATCHDOG_SYSFS=y
+CONFIG_WATCHDOG_HANDLE_BOOT_ENABLED=y
+# CONFIG_WATCHDOG_NOWAYOUT is not set
+CONFIG_CORTINA_WDT=y
+# The kernel's own no-hardware fallback is deliberately OFF: it is a software
+# timer, so it recovers nothing the detectors below do not already cover, and a
+# /dev/watchdog served by it would look exactly like the real one.
+# CONFIG_SOFT_WATCHDOG is not set
+
+# --- Software self-recovery net (complements the hardware watchdog above) --- #
 # An unattended GPON ONU ships online for months; a SILENT kernel hang/lockup
-# must reboot the box on its own (there is no operator to power-cycle it, and
-# no HW watchdog driver wired yet -- cortina,wdt @0xf432902c is a follow-up).
+# must reboot the box on its own (there is no operator to power-cycle it).
 # Enable the two software detectors and make each PANIC, reusing the inherited
 # panic->reboot path (generic: CONFIG_PANIC_TIMEOUT=1, CONFIG_PANIC_ON_OOPS=y).
 # Dependencies are generic defaults: CONFIG_DEBUG_KERNEL=y, CONFIG_BUG=y,
