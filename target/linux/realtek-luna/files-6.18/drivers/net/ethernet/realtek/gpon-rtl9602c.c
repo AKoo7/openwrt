@@ -443,6 +443,7 @@ static void __iomem *ponip_base;
  * factory value takes effect on the next ranging cycle; the FSM re-reads the
  * parsed serial each time it sends its Serial_Number_ONU upstream. */
 static void gpon_parse_sn(const char *s);	/* defined below; re-parses onu_sn */
+static bool gpon_sn_differs(const char *s);	/* defined below; parsed-byte compare */
 static char *onu_sn = "XPON39013867";	/* TEST-ONLY default = this board's SN, so the FSM
 					 * ranges with the real SN immediately (no placeholder
 					 * phantom / re-range that races OLT discovery). For
@@ -455,13 +456,33 @@ static int onu_sn_set(const char *val, const struct kernel_param *kp)
 	int ret = param_set_charp(val, kp);
 
 	if (!ret) {
-		gpon_parse_sn(onu_sn);
 		/* The driver loads with the placeholder SN and begins ranging
 		 * immediately; the real per-board SN is provisioned slightly later
 		 * via this /sys param (userspace) or the cmdline. Flag a re-range so
 		 * the OLT sees the correct Serial_Number and authorises the
-		 * provisioned ONU instead of auto-ranging the placeholder phantom. */
-		gpon_sn_changed = true;
+		 * provisioned ONU instead of auto-ranging the placeholder phantom.
+		 *
+		 * ... BUT ONLY IF THE SERIAL ACTUALLY MOVED.  This used to flag a
+		 * re-range on EVERY write, including a write of the value already in
+		 * force, and `onu_sn` compiles in with this board's real serial -- so
+		 * the provisioning service writing the SAME serial dropped a HEALTHY
+		 * O5 back to O1 and re-ranged, once per boot, for nothing.  MEASURED
+		 * on the X111W 2026-08-20 (tier 1, the board's own console):
+		 *     [ 8.056] ONU state O4 -> O5
+		 *     [ 9.656] ONU state O5 -> O1
+		 *     [ 9.656] SN reprovisioned (58504f4e39013867) -> re-ranging
+		 *     [16.060] re-range #1 -> O5 (outage ~6404 ms)
+		 * 58504f4e39013867 is "XPON39013867" -- the serial it already held.
+		 * That is a ~6.4 s outage and one extra ranging cycle per boot, and
+		 * on a SPLITTER it is churn charged to every ONU sharing the port,
+		 * which this project's OLT rules exist to avoid.  A re-range is a
+		 * response to an IDENTITY CHANGE, so compare the PARSED BYTES (not
+		 * the string: case and zero-padding differ without the identity
+		 * differing).  An unchanged write now re-parses and returns quietly. */
+		if (gpon_sn_differs(onu_sn)) {
+			gpon_parse_sn(onu_sn);
+			gpon_sn_changed = true;
+		}
 	}
 	return ret;
 }
@@ -5085,12 +5106,15 @@ static int gpon_proc_show(struct seq_file *s, void *v)
 #define PLM_US_QUEUE_NOMSG		0x7	/* US_PLOAM_IND[10:8] HW auto-No_message slot */
 
 /* Parse "XPON12345678" -> {'X','P','O','N',0x12,0x34,0x56,0x78}. */
-static void gpon_parse_sn(const char *s)
+/* Decode "AAAAhhhhhhhh" into the 8-byte G.984.3 ONU-SN.  Split out of
+ * gpon_parse_sn() so gpon_sn_differs() compares through the SAME decoder --
+ * a second copy would drift and make an identity change look like a no-op. */
+static void gpon_parse_sn_into(u8 *out, const char *s)
 {
 	int i;
 
 	for (i = 0; i < 4 && s[i]; i++)
-		gpon_sn_bytes[i] = s[i];
+		out[i] = s[i];
 	for (i = 0; i < 4; i++) {
 		u8 hi = 0, lo = 0;
 
@@ -5098,8 +5122,28 @@ static void gpon_parse_sn(const char *s)
 			hi = hex_to_bin(s[4 + 2 * i]);
 		if (s[4 + 2 * i + 1])
 			lo = hex_to_bin(s[4 + 2 * i + 1]);
-		gpon_sn_bytes[4 + i] = (hi << 4) | lo;
+		out[4 + i] = (hi << 4) | lo;
 	}
+}
+
+static void gpon_parse_sn(const char *s)
+{
+	gpon_parse_sn_into(gpon_sn_bytes, s);
+}
+
+/* True when `s` decodes to a DIFFERENT ONU-SN than the one in force.  The
+ * caller uses this to decide whether a write is an identity change (re-range)
+ * or a rewrite of the same serial (do nothing). */
+static bool gpon_sn_differs(const char *s)
+{
+	u8 want[8];
+
+	/* Match gpon_parse_sn_into()'s "leave untouched what the string does not
+	 * supply" behaviour: seed from the serial in force, so a SHORT string
+	 * compares as equal exactly when it leaves every byte alone. */
+	memcpy(want, gpon_sn_bytes, sizeof(want));
+	gpon_parse_sn_into(want, s);
+	return memcmp(want, gpon_sn_bytes, sizeof(want)) != 0;
 }
 
 /* Read the 13-byte downstream PLOAM message (2 bytes per 32-bit word). */
