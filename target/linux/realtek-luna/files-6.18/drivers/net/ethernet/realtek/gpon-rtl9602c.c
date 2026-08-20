@@ -494,6 +494,34 @@ module_param_cb(onu_sn, &onu_sn_ops, &onu_sn, 0644);
 MODULE_PARM_DESC(onu_sn, "ONU serial number (G.984.3 ONU-SN): 4 ASCII ID chars + 8 hex digits");
 /* Diagnostic: skip BOSA cold-init so that, on a warm boot where the BOSA is
  * already in a working state, the SoC datapath/FSM runs on top of it. */
+/* Park every UNUSED GTC alloc-CAM entry at the reserved Alloc-ID 0xFFF at
+ * Assign_ONU-ID, so the content-addressable search can only resolve a BWmap
+ * grant to a T-CONT we actually configured.
+ *
+ * WHY (measured 2026-08-20, X111W on PON 2/1, tier 1 + tier 3): the OLT held us
+ * at `Offline fail ... LOAi` with the OMCC up, DS OMCI arriving and answered,
+ * and NO data GEM.  A BWmap capture decoded with the vendor's own field layout
+ * (dump_bwm, tcont[4:0] at word0) resolved the OLT's grants to T-CONT 14 and
+ * T-CONT 9 -- while `us_sched: tcont_en=0x00010001` says the driver configured
+ * only T-CONT 16 (and 0).  T-CONT 16 emitted nothing (`idle16=0/0`) while eight
+ * pages sat undrained in its queue (`sidpage64: used=8`, a live occupancy gauge
+ * per dal_rtl9602c_flowctrl.c).  The OMCC GEM and the PLOAM Acknowledge ride
+ * that SAME allocation, so a grant that never resolves to T-CONT 16 silences
+ * both at once -- which is exactly LOAi plus an OLT that re-Gets forever.
+ *
+ * This driver already knew the failure mode: see the omcc_alt_bind comment at
+ * the Assign_ONU-ID site ("makes the GTC alloc-CAM resolve a BWMAP grant to the
+ * EMPTY T-CONT 1 ... the OLT grants once then stops"), and
+ * gpon_alloc_cam_clear_others() was written for it -- and never called.
+ *
+ * ⚠ NOT PROVEN TO BE THE ROOT CAUSE.  Three captured frames are a sample, not a
+ * census, and the capture window's freshness is unestablished (the /proc arm
+ * skips the vendor's CAP_CLR + settle).  Default ON because an unwritten CAM
+ * entry matching a grant is wrong in every reading; set 0 for a one-boot A/B. */
+static bool alloc_cam_park = true;
+module_param(alloc_cam_park, bool, 0644);
+MODULE_PARM_DESC(alloc_cam_park, "park unused GTC alloc-CAM entries at 0xFFF so grants cannot resolve to an unconfigured T-CONT");
+
 static bool skip_bosa;
 module_param(skip_bosa, bool, 0444);
 MODULE_PARM_DESC(skip_bosa, "leave external BOSA as-is (warm-boot bisection)");
@@ -4419,9 +4447,24 @@ static u32 gpon_alloc_cam_read(u8 tcont)
  * correct CAM[16]=0 bind still not drain. Parking the others at 0xFFF makes the
  * ONU-ID entry the unique match. Bounded poll; runs once per (re-)activation. Any real
  * data T-CONT is re-bound afterwards by gpon_install_data_gem, so this is safe. */
-static void __maybe_unused gpon_alloc_cam_clear_others(u8 keep)
+static void gpon_alloc_cam_clear_others(u8 keep)
 {
 	u8 t;
+
+	/* Report what each entry HELD before it is parked. This is the confirming
+	 * measurement for the BWmap decode above: an entry that already matches a
+	 * granted Alloc-ID is a grant this ONU was answering on the wrong T-CONT.
+	 * One line, once per activation, so it cannot flood the console. */
+	for (t = 0; t < 32; t++) {
+		u32 rb;
+
+		if (t == keep)
+			continue;
+		rb = gpon_alloc_cam_read(t);
+		if (rb & BIT(16))		/* hit: this entry would match a grant */
+			pr_info("rtl9602c-gpon: alloc-CAM[%u] held alloc=0x%x (hit) -> parking at 0xfff\n",
+				t, rb & 0xfff);
+	}
 
 	for (t = 0; t < 32; t++) {
 		int i;
@@ -6421,6 +6464,14 @@ static void gpon_fsm_handle(const u8 *m)
 			/* The OMCC US alloc IS the live ONU-ID (G.984.3 default; stock
 			 * gpon_dev_tcont_physical_add(obj, onuid)). Override only for A/B. */
 			tcont16_alloc = gpon_omcc_alloc ? gpon_omcc_alloc : gpon_fsm_onu_id;
+			/* Park the unused CAM entries FIRST, so the entry we are about
+			 * to write is the only one that can match this Alloc-ID. Done
+			 * before the bind, never after: parking afterwards would race a
+			 * grant that arrives in between. Any real data T-CONT is bound
+			 * later by the Assign_Alloc-ID handler, which re-writes its own
+			 * entry, so this cannot strand the data path. */
+			if (alloc_cam_park)
+				gpon_alloc_cam_clear_others(GPON_OMCC_TCONT);
 			gpon_install_tcont(GPON_OMCC_TCONT, tcont16_alloc);
 			{
 				u32 rb = gpon_alloc_cam_read(GPON_OMCC_TCONT);
