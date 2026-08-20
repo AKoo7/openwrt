@@ -70,6 +70,7 @@ rtw89_8852bte-objs := rtw8852bte.o
 obj-$(CONFIG_RTW89_8852C) += rtw89_8852c.o
 rtw89_8852c-objs := rtw8852c.o \
 		    rtw8852c_table.o \
+		    rtw8852c_rfe53_gain.o \
 		    rtw8852c_rfk.o \
 		    rtw8852c_rfk_table.o
 

@@ -4379,6 +4379,226 @@ static const u32 rtw8852c_rfe53_efem_rf[][2] = {
 /* eFEM TSSI/RFE BB config captured live from stock at full TX power, with the
  * TSSI DE fields ([21:12] of 0x5828..0x5860 / 0x7828..0x7860) raised to 0x2a0
  * (see comment above).  0x5804/0x5808 (pwr-ref codeword) left to set_txpwr().
+ *
+ * ★★★ THESE VALUES ARE THE SHIPPED BASELINE AND THEY CARRY A KNOWN, MEASURED
+ * DEFECT (investigated 2026-08-14, NOT yet fixed -- read this before changing them).
+ *
+ * THE DEFECT: 5 GHz receives the uplink at a fraction of what it should. Measured on
+ * this bench, one client a metre away, 5 repeats per point: 5 GHz upstream 1678 pps
+ * (595 us per 1400 B frame) against 2.4 GHz's 10664 and the vendor firmware's 16.9 us.
+ * The AP reports that client at -88 dBm while the untouched 2.4 GHz radio reports the
+ * SAME client at -13 dBm -- and the client transmits at 3.0 dBm on both. It is NOT an
+ * aggregation fault: a Block-Ack agreement exists and the mean received MPDU is
+ * ~5.4 kB of A-MSDU.
+ *
+ * THE LEVER IS **R_RFE_INV0** (0x5890 / 0x7890), PROVEN BY A/B/A OVER FOUR IMAGES
+ * with every other word held constant. It trades the two directions against each
+ * other and no setting of it satisfies both:
+ *
+ *   INV0 = 0x00000c80 / 0x00000006 (this table)   5g up   1678-2705 pps   client
+ *                                                 sees this AP at -11 dBm  <- TX OK,
+ *                                                 RX BROKEN
+ *   INV0 = 0 (cleared)                            5g up  36411-36593 pps   client
+ *                                                 sees this AP at -61 dBm  <- RX
+ *                                                 FIXED (21x), TX ~43 dB DOWN
+ *
+ * -61 dBm is 43 dB below what 30 dBm implies at one metre, while the untouched
+ * 2.4 GHz radio agrees with its own free-space prediction to 2.3 dB -- so the client
+ * and the geometry are sound and the loss is ours. Restoring PAPE and TRSW from the
+ * capture did NOT recover it, which is what isolates the lever to the polarity word.
+ *
+ * ⇒ ★★ THAT SUSPICION WAS SETTLED BY RE ON 2026-08-14, AND **THESE TWO VALUES ARE
+ * RIGHT**. The vendor module was disassembled (full note + the re-runnable extractor:
+ * dev/RE-RFE-INV0-8852C.md, dev/re-tools/rfe_pad_map_8852c.py --self-check). For
+ * rfe_type 53 the vendor driver leaves EXACTLY 0x00000c80 / 0x00000006 in these two
+ * registers -- bit for bit, both paths. So the A/B/A found a real LEVER, not a wrong
+ * value, and no subset of the inversion bits is the fix. Do NOT spend another build
+ * sweeping them.
+ *
+ * The bits, from halrf_set_gpio_8852c() (R_RFE_INV0 bit N inverts RFE pad N; the pad
+ * source nibbles in 0x5880/0x5884/0x7880 below decode to the same map, and so does the
+ * live stock capture):
+ *   path A: pad 6 PAPE inv=0 . pad 7 LNAON inv=1 . pad 10 TRSW inv=1 . pad 11 inv=1
+ *   path B: pad 3 PAPE inv=0 . pad 2 LNAON inv=1 . pad  1 TRSW inv=1
+ * Pad 11 is a STATIC line (source 7 = manual/idle) that the vendor drives for every
+ * rfe_type > 50. What it is wired to on this board is NOT established.
+ *
+ * ⇒ ★★ SUPERSEDED 2026-08-14: THE PAD-11 MUX IS **DONE**, AND ALL SEVEN PADS ARE
+ * ROUTED. This paragraph used to read "rtw8852c_rfe53_pinmux() routes pads 1,2,3,6,7,10
+ * and MISSES pad 11". That was true when it was written and is FALSE now -- pad 11 was
+ * added the same day, in the very write this text sits next to. Left as a correction
+ * rather than deleted, because the stale sentence had already sent one session back to
+ * re-chase a closed lead.
+ *
+ * VERIFIED IN THE BUILT BINARY, not in the source (aarch64-openwrt-linux-musl-objdump -d
+ * on build_dir/.../rtw89/rtw8852c.o): the pinmux is inlined TWICE and both copies emit
+ * the identical pair --
+ *     0x2D0 <- (orig & 0x00ff000f) | 0x88008880   nibbles 1,2,3,6,7 = 8
+ *     0x2D4 <- (orig & 0xffff00ff) | 0x00008800   nibbles 2,3 (GPIO 10,11) = 8
+ * i.e. pads 1,2,3,6,7,10,11 all carry func 8 (WL_RFE). Nothing is left unrouted, and
+ * the vendor's PIN_LIST_GPIO<N>_8852C tables name no eighth RFE pad for rfe_type 53.
+ *
+ * ⇒ SO THE PAD MUX IS NO LONGER A CANDIDATE FOR THE 5 GHz RECEIVE DEFICIT. The open
+ * lead moved to the RX GAIN PROGRAM -- see RE-RFE53-BB-GAIN-8852C.md: cfg_type 4 of the
+ * bb-gain table is the eFEM-only gain data, the vendor implements all six of its
+ * sub-types, and mainline rtw89 implements NONE of them (phy.c `case 4:` falls straight
+ * through to a warning for exactly rfe_type >= 50, which is us).
+ *
+ * (The earlier note that etc/conf/rtl8852ce/RFE53/PHY_REG.txt carries neither address
+ * is correct and was checked properly this time -- a grep over EVERY file under
+ * etc/conf finds no 5890/7890, with 5880/5894 as the positive control. It is simply
+ * not where these registers come from: the DRIVER writes them at runtime through a
+ * computed address, cr_base|0x90, which is also why searching the module for the
+ * literal 0x5890 finds only the DPK code.)
+ *
+ * ⚠ SEPARATE AND STILL OPEN: the AP-reported RSSI (-88 dBm) did NOT move even when
+ * throughput improved 21x, so the RSSI REPORTING path is a DIFFERENT defect --
+ * rtw8852c_table.c's bb-gain table has no rfe-53 branch and falls through to the
+ * internal-FEM constants, and 144 cfg_type-4 RX-AGC entries are dropped at boot with
+ * "unknown cfg type: 4" (phy.c has no case-4 body). Do not fold the two together.
+ *
+ * ★ The measurements above are re-runnable, and the FEM words are read back and
+ * diffed against the vendor's program by:
+ *     python3 ONU-test-case/wifi_agg_probe.py --LABEL="<name>" --fem-regs
+ *     python3 ONU-test-case/wifi_agg_probe.py --LABEL="<name>" --cycles=5
+ *
+ * ---- the original note on where these values came from ----
+ * ★★ THE FEM/PAD-CONTROL WORDS ARE **NOT** FROM THAT CAPTURE ANY MORE (2026-08-14).
+ * They now carry the vendor's OWN board program for this rfe_type, read out of the
+ * shipped product at
+ *   etc/conf/rtl8852ce/RFE53/PHY_REG.txt
+ * which the vendor firmware loads at runtime instead of compiling in.  That file is
+ * unconditional (no if/else blocks) and the per-FEM subdirectories under RFE53 are
+ * ~2 kB OVERLAYS that touch only the TX-TSSI registers of this same page, so these
+ * values hold whichever FEM part is fitted.
+ *
+ * WHY THE CAPTURE WAS THE WRONG SOURCE **FOR THESE** WORDS, measured: taking it at
+ * full TX is right for the TSSI DE fields and gives no information about the RECEIVE
+ * state of the FEM control lines.  The result was a 5 GHz radio that transmits
+ * correctly and is deaf: our AP reported the SAME client at -87 dBm on 5 GHz and
+ * -13 dBm on 2.4 GHz, one metre away, with the client transmitting at 3.0 dBm on
+ * both -- while the client heard our 5 GHz AP at -11 dBm, BETTER than the 2.4 GHz
+ * one.  Reciprocity puts the AP's expected reception at about -38 dBm.  The AP also
+ * decoded HE-MCS 5 at 80 MHz while reporting -86 dBm, which is impossible and is a
+ * self-contained proof that the reported figure was wrong.
+ *
+ * ★★ EACH WORD COMES FROM THE SOURCE THAT ACTUALLY WITNESSED IT, and getting that
+ * split wrong is the whole story of this table.  A tier-2 source is authoritative
+ * for what it OBSERVED, not for everything printed near it:
+ *
+ *   RECEIVE / pad configuration  -> THE VENDOR FILE.  The capture was taken at full
+ *     TX and therefore saw nothing about the receive state of these lines.
+ *   TRANSMIT keying              -> THE FULL-TX CAPTURE.  The vendor file is a
+ *     static description and was never taken with the PA keyed.
+ *
+ * MEASURED, and it is why the split is spelled out rather than assumed.  Taking ALL
+ * ten words from the vendor file fixed receive spectacularly and cost transmit:
+ * upstream went 1739 -> 36593 pps (5 cycles, 21x, airtime 299.8 -> 27.3 us against
+ * stock's 16.9) while the client's view of THIS AP fell from -11 dBm to -61 dBm at
+ * one metre -- about 43 dB below what 30 dBm implies in free space.  Invisible on a
+ * bench and fatal to range in a house.  The suspect was PAPE, the external PA
+ * enable, moved from the capture's 0x04 to the file's 0x08.
+ *
+ * WHAT EACH WORD IS AND WHERE IT COMES FROM (the rest of the run --
+ * 0x5870/0x5874/0x5878/0x587c and 0x5888/0x588c -- already agreed with the vendor
+ * and is untouched):
+ *   0x5868 / 0x7868  R_P0_TRSW  the T/R switch truth table built by
+ *                    rtw8852c_bb_gpio_trsw() -- TX-KEYING BY FUNCTION, so it keeps
+ *                    the CAPTURE's 0xa9a90002 (the vendor file's 0xa9550000 was
+ *                    tried and is part of what cost the transmit power)
+ *   0x5880 / 0x7880  R_RFE_SEL0_BASE   VENDOR 0x76543210 -- pad routing
+ *   0x5884 / 0x7884  R_RFE_SEL32_BASE  VENDOR 0xfedcba98 -- pad routing
+ *   0x5894 / 0x7894  R_P0_RFM          0x010a0604, and RE confirmed every byte
+ *                    (2026-08-14) -- this word is the vendor's own runtime value:
+ *                      byte0 PAPE  = 0x04  (external PA enable = TX)
+ *                      byte1 TRSW  = 0x06  (T/R switch         = TX keying)
+ *                      byte2 LNAON = 0x0a  (external LNA       = RX)
+ *                      byte3       = 0x01
+ *                    ⚠ THE PREVIOUS TEXT HERE WAS WRONG ON THE LAST TWO BYTES and is
+ *                    kept as a warning: it said "LNAON = 0x00 VENDOR" and "byte3 = 0x00
+ *                    VENDOR ... no API path produces it", both read off the STATIC file
+ *                    (0x5894 = 0x00000008) which the driver OVERWRITES at runtime.
+ *                    halbb_gpio_setting_init_8852c() writes LNAON out=0x0a for
+ *                    rfe_type {53,54,63,64} (0x08 for all others), and byte3 bit0 has
+ *                    its own writer -- set_reg(0x5894, 0x01000000, 1) -- which is
+ *                    precisely why the rfm helper cannot produce it. A static vendor
+ *                    file is authoritative for what it CONTAINS, never for the resting
+ *                    state of a register the driver programs afterwards.
+ *   0x5890 / 0x7890  R_RFE_INV0        CAPTURE 0x00000c80 / 0x00000006 -- see below
+ *
+ * 0x5880/0x5884 are a nibble-wide IDENTITY pad map that continues the byte-wide one
+ * at 0x5870..0x587c; the pre-fix values broke that ramp at exactly those two words.
+ * R_P0_RFM splits by BYTE into PAPE / TRSW / LNAON (rtw8852c_bb_gpio_rfm() shifts an
+ * 8-bit layout by masks {0, 8, 16} indexed by enum rtw8852c_rfe_src); the pre-fix
+ * word drove LNAON -- the EXTERNAL LNA control, i.e. the receive-only field -- to
+ * 0x0a where the vendor drives 0x00.
+ *
+ * ★★ 0x5890 / 0x7890 (R_RFE_INV0, per-pad polarity inversion) KEEP THE CAPTURE'S
+ * VALUES, and the reasoning that briefly removed them is recorded here because it
+ * was WRONG in an instructive way.
+ *
+ * They were deleted on 2026-08-14 on the grounds that "the vendor's program never
+ * writes them, so the right value is the baseband default".  That was concluded from
+ * ONE file -- PHY_REG.txt -- and a file's silence is not proof of absence: the vendor
+ * driver or another conf file may perfectly well program the register.  It is the
+ * same error this tree warns about everywhere else (an absence is only a finding when
+ * someone actually looked), committed while quoting the rule.
+ *
+ * MEASURED, and it is what brought them back: with the inversion removed the 5 GHz
+ * transmit collapsed.  At one metre the client saw this AP at -61 dBm where free
+ * space predicts -17.6 for the configured 30 dBm, while the untouched 2.4 GHz radio
+ * agreed with its own prediction to 2.3 dB -- so the instrument and the geometry were
+ * sound and the loss was ours.  Restoring PAPE and TRSW did NOT recover it, which
+ * leaves pad POLARITY as the only remaining mechanism that loses transmit while
+ * leaving receive intact: if the PA-enable pad needs inverted sense on this board,
+ * clearing the inversion simply never keys the PA.
+ *
+ * ⚠ WHAT IS AND IS NOT ESTABLISHED.  What the bench can show is that THIS BOARD NEEDS
+ * THE INVERSION.  Whether the VENDOR writes this register, and with what value,
+ * remains OPEN: `rtk_wifi6.ko` contains the little-endian words 0x5890 and 0x7890 (14
+ * and 8 occurrences), but a byte pattern in a 13 MB binary is not a write, and no
+ * vendor conf file carries either address.  Settling it means disassembling that
+ * module around those addresses -- not another boot.
+ *
+ * ⇒ ★★ DONE 2026-08-14, AND THE OPEN HALF IS CLOSED: the vendor WRITES THE SAME BITS.
+ * It does so per pad through a COMPUTED address (cr_base|0x90) in
+ * halbb_gpio_setting_8852c(), driven from halrf_set_gpio_8852c()'s rfe_type-53 case --
+ * which is why no conf file carries the address and why the literal-word count in the
+ * module was meaningless evidence in both directions.  Around (E)DPK the same register
+ * is forced transiently and RESTORED (both addresses are in the EDPK backup list), so
+ * the calibration never changes the resting value.
+ *
+ * ⚠ BOTH OF THE ITEMS THAT USED TO BE LISTED HERE AS OPEN ARE NOW CLOSED, 2026-08-14,
+ * by disassembling the vendor's OWN rfe_type-53 path instead of reading its static
+ * files.  The text is replaced rather than annotated because a stale "STRONGEST
+ * REMAINING CANDIDATE" line sent a whole investigation after a lead that does not
+ * exist.  The writer is halrf_set_gpio_8852c() (rfe_type read from the halrf struct,
+ * the same byte halbb_gpio_setting_init_8852c() reads), NOT halbb_gpio_setting_all_8852c()
+ * -- that one switches on {0x33,0x34,0x3f,0x40} = {51,52,63,64} and has no case for 53,
+ * which is why an earlier reading concluded the vendor programs nothing here.
+ *
+ *   - PAD 11 IS ROUTED BY THE VENDOR, and ours already matches.  halrf_set_gpio_8852c()
+ *     takes a separate `rfe_type > 50` arm that does gpio_setting(pad 11, path A, inv 1,
+ *     src 7) followed by mac_set_gpio_func(func 0x13, gpio 11).  So the vendor's rfe-53
+ *     program is SEVEN pads: 1,2,3,6,7 and 10 from the {53,54,63,64} arm, plus 11 from
+ *     the >50 arm.  Every one of our values reproduces it: SEL pad6->0 pad7->3 pad10->4
+ *     (path A), pad1->4 pad2->3 pad3->0 (path B), pad11->7; INV0 bits 7,10,11 set and 6
+ *     clear (0x00000c80), bits 1,2 set and 3 clear (0x00000006).  The LNAON polarity in
+ *     particular is the vendor's own: its {51,52} arm uses inv 0 and its {53,54,63,64}
+ *     arm uses inv 1, and 53 takes the latter.
+ *   - 0x5868 / 0x7868 R_P0_TRSW: the static file's 0xa9550000 is OVERWRITTEN at runtime,
+ *     exactly like 0x5894 was.  halbb_gpio_setting_init_8852c() issues the same three
+ *     masked writes mainline does (bit1 set, bit2 clear, bits5-7 clear) and then eight
+ *     halbb_gpio_trsw_table_8852c() calls per path whose arguments are identical to
+ *     rtw8852c_bb_gpio_init()'s, which packs to 0xa9a9 in [15:0].  Our 0xa9a90002 IS the
+ *     vendor's runtime value; the file is not.
+ *
+ * ⇒ THE eFEM CONTROL BLOCK IS NO LONGER A CANDIDATE for the 5 GHz receive deficit.  It
+ * matches the vendor word for word at rfe_type 53.  Look at the BB GAIN program instead
+ * (cfg_type 4 is discarded by rtw89_phy_config_bb_gain_ax() for rfe_type >= 50, and we
+ * load the generic table where the vendor loads RFE53/<FEM>/PHY_REG_GAIN.txt), and at
+ * _rx_dck()'s retry_limit -- halrf_rx_dck_8852c() verifies and RE-RUNS the cal for
+ * rfe_type > 49, which is us, where ours forces the recover-clamp on the first pass.
  */
 static const struct rtw89_reg2_def rtw8852c_rfe53_efem_bb[] = {
 	{0x033c, 0x1f000054}, {0x0340, 0x00000000},

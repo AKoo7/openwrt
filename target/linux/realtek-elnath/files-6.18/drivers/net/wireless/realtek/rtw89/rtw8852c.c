@@ -11,6 +11,7 @@
 #include "phy.h"
 #include "reg.h"
 #include "rtw8852c.h"
+#include "rtw8852c_rfe53_gain.h"
 #include "rtw8852c_rfk.h"
 #include "rtw8852c_table.h"
 #include "sar.h"
@@ -409,6 +410,12 @@ static int rtw8852c_pwr_off_func(struct rtw89_dev *rtwdev)
  * parameters (live-verified on this board), and 53 is a native headline in
  * rtw89's 8852C BB/radio tables.  Fall back to it instead of leaving the
  * radio unconfigured.
+ */
+/* Numerically equal to RTW8852C_RFE_TYPE_EFEM, and deliberately a SEPARATE
+ * name: this one answers "what do we assume when the efuse says nothing",
+ * the other answers "which rfe_type means this external-FEM layout".  They
+ * agree on this board because the unit ships blank AND is an eFEM board; they
+ * are not the same question, so do not collapse them.
  */
 #define RTW8852C_RFE_TYPE_BLANK_EFUSE	53
 
@@ -1875,13 +1882,35 @@ static void rtw8852c_set_channel_help(struct rtw89_dev *rtwdev, bool enter,
  */
 static void rtw8852c_rfe53_pinmux(struct rtw89_dev *rtwdev)
 {
-	if (rtwdev->efuse.rfe_type != 53)
+	if (rtwdev->efuse.rfe_type != RTW8852C_RFE_TYPE_EFEM)
 		return;
 
-	/* GPIO 1,2,3,6,7 -> WL_RFE (nibble 0x8) in R_AX_GPIO0_7_FUNC_SEL */
-	rtw89_write32_mask(rtwdev, R_AX_GPIO0_7_FUNC_SEL, 0xff00fff0, 0x88008880);
-	/* GPIO 10 -> WL_RFE in R_AX_GPIO8_15_FUNC_SEL */
-	rtw89_write32_mask(rtwdev, R_AX_GPIO8_15_FUNC_SEL, 0x00000f00, 0x00000800);
+	/* ★ rtw89_write32_mask() SHIFTS its data by __ffs(mask), so `data` is the
+	 * value measured from the mask's own LSB -- NOT a pre-positioned word.
+	 * Passing a pre-positioned word silently writes the WRONG nibbles: the
+	 * previous 0x88008880 here became 0x80008800 on the pad register, and
+	 * 0x00000800 for GPIO 10 shifted clean out of its own mask and wrote 0.
+	 * MEASURED on this board before the fix (ONU-test-case/rfe_pinmux_read.py):
+	 * 0x2D0 = 0x80FF880F, 0x2D4 = 0x222200FF, i.e. only GPIO 2/3/7 were ever
+	 * routed and TRSW was unrouted on BOTH paths.
+	 *
+	 * GPIO 1,2,3,6,7 -> WL_RFE (nibble 0x8) in R_AX_GPIO0_7_FUNC_SEL.
+	 * mask 0xff00fff0 -> shift 4, so 0x08800888 lands nibbles 1,2,3,6,7 = 8.
+	 */
+	rtw89_write32_mask(rtwdev, R_AX_GPIO0_7_FUNC_SEL, 0xff00fff0, 0x08800888);
+	/* GPIO 10 (TRSW path A) and GPIO 11 -> WL_RFE in R_AX_GPIO8_15_FUNC_SEL.
+	 * mask 0x0000ff00 -> shift 8, so 0x88 lands nibbles 2,3 = 8.  The mask
+	 * deliberately stops below GPIO 8 (the LED) and GPIO 9 (rfkill), which own
+	 * the other two nibbles of this register.
+	 *
+	 * GPIO 11's BB half was already programmed (R_RFE_INV0 bit 11 set,
+	 * src = 7 "manual/idle") while its pin half was missing.  The vendor muxes
+	 * it for every rfe_type > 50: halrf_set_gpio_8852c() calls
+	 * rtw_hal_mac_set_gpio_func(0x13, 11), and PIN_LIST_GPIO11_8852C gives
+	 * func 0x13 = reg 0x2D5 value 0x80 mask 0xF0.  What the board hangs on
+	 * pad 11 is NOT established.
+	 */
+	rtw89_write32_mask(rtwdev, R_AX_GPIO8_15_FUNC_SEL, 0x0000ff00, 0x00000088);
 }
 
 static void rtw8852c_rfk_init(struct rtw89_dev *rtwdev)
@@ -2972,11 +3001,84 @@ static const struct wiphy_wowlan_support rtw_wowlan_stub_8852c = {
 };
 #endif
 
+/* Overlay this board's external-front-end RECEIVE gain program on top of the
+ * one rtw89 just parsed out of its compiled-in table.
+ *
+ * WHY THIS IS NEEDED AT ALL.  rtw89 chooses a bb-gain program from the efuse
+ * rfe_type and nothing else.  The 8852C gain table is the one table in the
+ * chip's set that carries NO rfe-53 branch -- its only headlines are rfe 51 and
+ * rfe-don't-care, so rtw89_phy_sel_headline() lands on case 4 (don't care) and
+ * we load that arm.  That arm happens to hold this board's values, so for 2.4
+ * and 5 GHz our program already equals the vendor's BASE file, byte for byte.
+ *
+ * But the vendor does not stop at the base file.  It loads a SECOND gain file
+ * chosen by the fitted front-end module and lets it win:
+ *     etc/conf/rtl8852ce/RFE53/PHY_REG_GAIN.txt            (base)
+ *     etc/conf/rtl8852ce/RFE53/KCT8531HE/PHY_REG_GAIN.txt  (this FEM)
+ * There is no FEM-package concept anywhere in rtw89, so we never see the
+ * second file and we end up running the INTERNAL-FEM gain constants on a board
+ * that has an external LNA in front of its receiver.  The overlay moves the
+ * 5 GHz LNA constants by roughly 14-18 dB in 5G_LOW and 8-9 dB in 5G_MID/HIGH.
+ *
+ * These constants are not cosmetic and they are not a status line:
+ * rtw8852c_set_gain_error() writes every one of them into BB registers on each
+ * channel set, and the DIG/AGC loop picks an LNA index from lna_gain[].  A gain
+ * table that under-states the front end is an AGC that mis-estimates its own
+ * input -- which costs RECEIVE only, because nothing on the transmit path
+ * consults it.
+ *
+ * Applied through the driver's own bb-gain parser rather than decoded here, so
+ * there is exactly one implementation of the (type/path/band/cfg_type) encoding
+ * and this cannot drift away from it.
+ */
+void rtw8852c_apply_rfe53_fem_gain(struct rtw89_dev *rtwdev)
+{
+	const struct rtw89_chip_info *chip = rtwdev->chip;
+	unsigned int i;
+
+	/* The efuse rfe_type is the only discriminator available: it cannot tell
+	 * one FEM package from another, so a future rfe-53 board with a
+	 * different module would need its own table.  Note that a BLANK efuse is
+	 * already forced to 53 above, which is correct for this unit and is the
+	 * same assumption the pad pinmux makes.
+	 */
+	if (rtwdev->efuse.rfe_type != RTW8852C_RFE_TYPE_EFEM)
+		return;
+
+	if (!chip->phy_def || !chip->phy_def->config_bb_gain)
+		return;
+
+	for (i = 0; i < rtw8852c_rfe53_fem_gain_num; i++)
+		chip->phy_def->config_bb_gain(rtwdev,
+					      &rtw8852c_rfe53_fem_gain[i],
+					      RF_PATH_A, NULL);
+
+	/* Announce it: this line is the on-device witness that the overlay was
+	 * actually applied on the image that produced a given measurement.  A
+	 * silent apply is indistinguishable from a build that never had it.
+	 */
+	rtw89_info(rtwdev, "8852c: applied %u eFEM RX gain entries (rfe %d)\n",
+		   rtw8852c_rfe53_fem_gain_num, rtwdev->efuse.rfe_type);
+}
+
+static void rtw8852c_bb_postinit(struct rtw89_dev *rtwdev,
+				 enum rtw89_phy_idx phy_idx)
+{
+	/* The bb-gain values live in one per-device struct, not in per-PHY
+	 * registers, so applying them once is right even when DBCC calls this
+	 * for both PHYs.
+	 */
+	if (phy_idx != RTW89_PHY_0)
+		return;
+
+	rtw8852c_apply_rfe53_fem_gain(rtwdev);
+}
+
 static const struct rtw89_chip_ops rtw8852c_chip_ops = {
 	.enable_bb_rf		= rtw8852c_mac_enable_bb_rf,
 	.disable_bb_rf		= rtw8852c_mac_disable_bb_rf,
 	.bb_preinit		= NULL,
-	.bb_postinit		= NULL,
+	.bb_postinit		= rtw8852c_bb_postinit,
 	.bb_reset		= rtw8852c_bb_reset,
 	.bb_sethw		= rtw8852c_bb_sethw,
 	.read_rf		= rtw89_phy_read_rf_v1,
