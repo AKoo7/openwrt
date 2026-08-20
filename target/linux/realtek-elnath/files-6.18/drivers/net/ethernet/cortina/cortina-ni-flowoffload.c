@@ -1560,6 +1560,69 @@ static enum cn_pppoe_leg_verdict cn_pppoe_leg_check(bool pppoe_mode, bool ds_leg
 }
 
 /*
+ * "is this device on the LAN side of the router?" - a bridge port, or the
+ * bridge itself.  ONE spelling, used twice and mirrored: on the INGRESS device
+ * to decide which leg a rule is, and on a US leg's EGRESS device to decide
+ * whether its redirect really is the WAN.  This board's physical LAN ports are
+ * VLAN uppers (eth0.2..eth0.5, one HW VLAN per RJ45) and answer yes.
+ */
+static bool cn_dev_is_lan_side(const struct net_device *dev)
+{
+	return dev && (netif_is_any_bridge_port(dev) ||
+		       netif_is_bridge_master(dev));
+}
+
+/*
+ * ★★ THE DISARM HALF OF GAP-3 - a PURE predicate (functional core: no MMIO, no
+ * state), the exact mirror of the arm.
+ *
+ * The armed shadow (l3e->data_pppoe_session) is set LAZILY, by the first
+ * offloaded US flow carrying a FLOW_ACTION_PPPOE_PUSH - nothing else arms it.
+ * It used to be cleared by only three events: the WAN data path going away
+ * (cortina_ni_gpon_data_path_set(gem_id = 0)), the hw_pppoe 1->0 edge, and the
+ * manual `pppoe 0` control write.  NONE of them happens when the WAN is simply
+ * reconfigured from PPPoE back to IPoE with the PON link left up - which is an
+ * ordinary service change, not an exotic case.  The shadow then outlives its
+ * session, cn_pppoe_leg_check() reads {no rule sid, a shadow} as NO_PUSH, and
+ * EVERY upstream flow is refused for the rest of the boot.  Nothing breaks:
+ * the WAN keeps working, on the CPU, which is why it survived so long.
+ *
+ * ★ MEASURED on this board, 2026-08-09, driving dhcp -> pppoe -> dhcp:
+ * upstream 954.9 Mbps at 3.0 % CPU before the transition, 581.7 Mbps with one
+ * core at 99.5 % after, 4 runs of 4.  The driver's own ledger on that boot read
+ * `us_refused = 672` with `ds_refused = 0` and `unsupp = 672` - so the PPPoE US
+ * gate accounted for the WHOLE unsupported-refusal count, to the unit.  The
+ * downstream leg was never refused (cn_pppoe_leg_check returns OK for it), and
+ * downstream indeed stayed accelerated: the collapse is upstream-only, which is
+ * the second, independent prediction this mechanism makes.
+ *
+ * The disarm is therefore driven by the same evidence as the arm, and that
+ * evidence is authoritative: nf_flow_table builds the US rule from the ACTUAL
+ * forward path (pppoe_fill_forward_path), so a rule whose egress IS the WAN and
+ * which carries no session id is the kernel stating that this WAN no longer has
+ * one.  A live PPPoE WAN cannot produce that rule shape - if it could, the same
+ * absent sid could never have armed the shadow in the first place.
+ *
+ * @ds_leg        the reply leg never carries a push, so it can say NOTHING
+ *                about the WAN's encapsulation - only the US leg is evidence.
+ * @egress_is_lan the redirect device is LAN-side, so this leg's egress is not
+ *                the WAN and its lack of a session means nothing about it.
+ * @rule_sid      the session THIS rule carries (its own PPPOE_PUSH, or the one
+ *                resolved off a tagged WAN chain).  Non-zero = still PPPoE.
+ * @armed_sid     the shadow.  Zero = there is nothing to disarm.
+ *
+ * ⚠ One deliberate consequence: an operator who armed the shadow by hand for a
+ * manual install (`pppoe <sid>`) has it disarmed by the next auto US flow.  That
+ * is the better of the two behaviours - the alternative is the manual arm
+ * silently costing the whole box its upstream offload, which is this very bug.
+ */
+static bool cn_pppoe_shadow_stale(bool ds_leg, bool egress_is_lan,
+				  u16 rule_sid, u16 armed_sid)
+{
+	return !ds_leg && !egress_is_lan && armed_sid && !rule_sid;
+}
+
+/*
  * ★★ GAP-2 INSTRUMENT - the DS PPPoE punt integrity check.
  *
  * The 2026-07-20 regression was observed as "DS frames of the offloaded 5-tuple
@@ -2324,7 +2387,12 @@ EXPORT_SYMBOL_GPL(cortina_ni_wan_pppoe_session_set);
  * behind, and a stale sid then refuses every later flow on this WAN (the
  * "shadow armed but the rule carries no push" branch in cn_flow_replace) -
  * i.e. a PPPoE experiment silently cost the IPoE path its HW offload until the
- * next reboot.  Turning it ON arms nothing: the L3-IF entry is programmed
+ * next reboot.  ★ That is the SAME defect cn_pppoe_shadow_stale() now covers in
+ * general - a plain PPPoE->IPoE WAN change, with the mode left ON, went the
+ * whole boot on the CPU - so this edge is no longer the only rescue; it stays
+ * because turning the mode off must take its HW state with it immediately,
+ * rather than waiting for the next offered flow.  Turning it ON arms nothing:
+ * the L3-IF entry is programmed
  * lazily from the first offered flow's live sid, so no HW state can be armed
  * against a session that does not exist.
  */
@@ -4083,8 +4151,7 @@ static int cn_flow_replace(struct flow_cls_offload *f, struct net_device *dev)
 		flow_rule_match_meta(rule, &m);
 		idev = dev_get_by_index(dev_net(dev), m.key->ingress_ifindex);
 		if (idev) {
-			lan_ingress = netif_is_any_bridge_port(idev) ||
-				      netif_is_bridge_master(idev);
+			lan_ingress = cn_dev_is_lan_side(idev);
 			/* ★ The DS leg's WAN side is its INGRESS device, so this
 			 * is the only point where the DS half of the VLAN-WAN
 			 * refusal can be decided - and it is decided HERE, while
@@ -4377,8 +4444,32 @@ static int cn_flow_replace(struct flow_cls_offload *f, struct net_device *dev)
 	 * cn_l3e_set_us_egress never falls back to it, so a stale sid can cost HW
 	 * offload but can never put a wrong header on the wire (GAP-3).  The
 	 * shadow is cleared on WAN data-path teardown, on the hw_pppoe 1->0 edge,
-	 * and by `echo 'pppoe 0' > /proc/cortina_l3fe`.
+	 * by `echo 'pppoe 0' > /proc/cortina_l3fe`, and - since the shadow must
+	 * not depend on any of those happening - by the disarm directly below.
 	 */
+	/*
+	 * ★ DISARM a shadow whose session this WAN no longer has, BEFORE the gate
+	 * reads it.  See cn_pppoe_shadow_stale() for the mechanism and for the
+	 * board measurement that pinned it (a PPPoE->IPoE WAN change with the PON
+	 * link up left every upstream flow refused for the rest of the boot).
+	 *
+	 * Cost: at most ONE call per transition - the next rule sees a zero shadow
+	 * and the predicate is false - so the steady state is a single predicate
+	 * evaluation per offered flow.  Runs under cn_flow_offload_mutex like every
+	 * other caller of cortina_ni_wan_pppoe_session_set(), which also clears the
+	 * HW L3-IF word and flushes the flows still pointing at it, so no installed
+	 * entry is left referring to an encapsulation the WAN has stopped using.
+	 * The flush cannot touch THIS flow (not installed yet) nor its reply leg
+	 * (nf_flow_table offers ORIGINAL before REPLY), and this flow then passes
+	 * the gate as plain IPoE - so the transition costs no flow at all.
+	 */
+	if (cn_pppoe_shadow_stale(ds_leg, cn_dev_is_lan_side(odev), pppoe_sid,
+				  READ_ONCE(cn_l3e->data_pppoe_session))) {
+		pr_info("cortina-l3fe: WAN egress %s offers no PPPoE session while %#x is armed - the session is gone, disarming (a stale shadow refuses every upstream flow)\n",
+			netdev_name(odev),
+			READ_ONCE(cn_l3e->data_pppoe_session));
+		cortina_ni_wan_pppoe_session_set(0);
+	}
 	/* ★ On a tagged PPPoE WAN the SHADOW is not armed - nothing arms it,
 	 * because the arming path is cn_l3e_set_us_egress() and no rule carried a
 	 * sid.  The chain-resolved session stands in as the ARMED value (never as

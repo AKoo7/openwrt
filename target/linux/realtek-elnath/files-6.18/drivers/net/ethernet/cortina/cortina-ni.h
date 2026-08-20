@@ -495,6 +495,22 @@ void cortina_ni_lan_tx_learn(struct cortina_ni *ni, const u8 *sa, u32 lspid);
 void cortina_ni_lan_tx_link_set(struct cortina_ni *ni, u32 link);
 
 /*
+ * Front-panel per-RJ45 link lamps (cortina-ni-leds.c), the second consumer of
+ * that same 1 Hz PHY-link bitmap.
+ *
+ *  - _probe():    publish one LED trigger per switch PORT.  Software only; it
+ *                 touches no hardware and cannot fail the probe.
+ *  - _link_set(): one tick, @link bit p = port p is up.  Takes no `ni`: there
+ *                 is one NI switch per SoC and the triggers are module-global.
+ *
+ * WHICH printed socket a port lights is NOT expressed here - the device tree
+ * binds each lamp to a port trigger by name, because that map is a property of
+ * the board and this board's silkscreen is mirrored.
+ */
+void cortina_ni_leds_probe(struct cortina_ni *ni);
+void cortina_ni_leds_link_set(u32 link);
+
+/*
  * Program a static L2FE FDB entry {mac -> ldpid} and return its 13-bit entry
  * index (= the L3FE forward action mac_da_idx / aal-77c egr_lutidx), or -1.
  * Used by the flow-offload next-hop path to resolve the egress DMAC by

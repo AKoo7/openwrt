@@ -5302,6 +5302,17 @@ static void cortina_ni_rx_recovery_work(struct work_struct *work)
 				link |= BIT(p);
 		}
 		cortina_ni_lan_tx_link_set(ni, link);
+
+		/*
+		 * ★ Same bitmap, one more consumer: the front-panel link lamps.
+		 * Deliberately the LAST thing in the tick, and by construction
+		 * unable to sleep, block or fail - it is a void call that ends
+		 * in a GPIO store and takes no lock this function holds - so it
+		 * can neither delay nor break the GPHY bring-up above.
+		 * cortina-ni-leds.c documents why that holds, and why the
+		 * netdev trigger cannot do this job on a one-netdev switch.
+		 */
+		cortina_ni_leds_link_set(link);
 	}
 
 	schedule_delayed_work(&rx->recovery_work, HZ);

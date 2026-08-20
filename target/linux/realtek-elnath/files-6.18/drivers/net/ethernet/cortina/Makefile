@@ -23,7 +23,8 @@ ccflags-y += -I$(srctree)/drivers/net/gpon
 
 obj-$(CONFIG_GEMINI_ETHERNET) += gemini.o
 obj-$(CONFIG_CORTINA_NI) += cortina_ni.o
-cortina_ni-y := cortina-ni.o cortina-ni-tx.o cortina-ni-rx.o cortina-ni-ethtool.o
+cortina_ni-y := cortina-ni.o cortina-ni-tx.o cortina-ni-rx.o cortina-ni-ethtool.o \
+	cortina-ni-leds.o
 # L3FE main-hash flow engine (nf_flow_table HW offload backend)
 cortina_ni-$(CONFIG_CORTINA_NI_FLOWOFFLOAD) += cortina-ni-flowoffload.o \
 	cortina-l3fe.o cortina-l3fe-aging.o

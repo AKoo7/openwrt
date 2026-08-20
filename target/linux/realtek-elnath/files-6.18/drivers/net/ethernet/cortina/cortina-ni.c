@@ -1289,6 +1289,15 @@ static int cortina_ni_probe(struct platform_device *pdev)
 	spin_lock_init(&ni->nihv_lock);
 	platform_set_drvdata(pdev, ni);
 
+	/*
+	 * Front-panel per-RJ45 link lamps: publish the per-port LED triggers
+	 * before any of the bring-up below.  Early on purpose - an LED that is
+	 * already registered binds immediately, and no early `return ret` on the
+	 * way down can skip it.  Software only: it touches no hardware, returns
+	 * void, and cannot fail the probe (cortina-ni-leds.c).
+	 */
+	cortina_ni_leds_probe(ni);
+
 	ret = cortina_ni_map_windows(ni);
 	if (ret)
 		return ret;
