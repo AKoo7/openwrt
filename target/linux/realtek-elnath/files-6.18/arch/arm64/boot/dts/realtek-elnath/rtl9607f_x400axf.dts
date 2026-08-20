@@ -131,6 +131,53 @@
 	};
 
 	/*
+	 * The G3 APB peripheral clock. Named after the silicon's own name for
+	 * it rather than after the first consumer that needed it: it feeds the
+	 * whole peripheral block, and calling it "uart" would send the next
+	 * reader looking for a serial dependency the watchdog does not have.
+	 */
+	apb_clk: g3-apb-pclk {
+		compatible = "fixed-clock";
+		#clock-cells = <0x00>;
+		clock-frequency = <125000000>;	/* 125 MHz APB */
+	};
+
+	/*
+	 * Hardware watchdog (PER_WDT). Three register windows, all taken from
+	 * this board's own live device tree:
+	 *
+	 *   0  0xf432902c  the 12-register PER_WDT block
+	 *   1  0xf43200c8  GLOBAL_GLOBAL_CONFIG -- the SoC reset enables that
+	 *                  turn an expired counter into an actual reset. They
+	 *                  are outside the block, which is why the driver takes
+	 *                  a second window; the word also holds power-down bits
+	 *                  for other subsystems, so it is read-modify-written.
+	 *   2  0xf43203c8  GLOBAL_DDR_RESET_MODE. Declared to keep the binding
+	 *                  faithful to the vendor's; NOT consumed -- this part
+	 *                  resets DDR cold and the register reads 0 on a working
+	 *                  device, so there is nothing for us to set.
+	 *
+	 * delay-reset is in 16 kHz cycles: 134 -> 8.4 ms between the expiry
+	 * event and the reset, matching what the vendor firmware programs.
+	 *
+	 * The expiry INTERRUPT is deliberately not described. It is routed
+	 * through a peripheral interrupt controller this port has no driver
+	 * for, and it is optional in the binding: it only carries a
+	 * notification for boards that want the timeout WITHOUT a reset. With
+	 * reset-on-timeout the hardware restarts the SoC by itself.
+	 */
+	watchdog@f432902c {
+		compatible = "cortina,wdt";
+		reg = <0x00 0xf432902c 0x00 0x30>,
+		      <0x00 0xf43200c8 0x00 0x04>,
+		      <0x00 0xf43203c8 0x00 0x04>;
+		clocks = <&apb_clk>;
+		reset-on-timeout;
+		delay-reset = <0x86>;	/* 134 */
+		status = "okay";
+	};
+
+	/*
 	 * Cortina NI (network engine) — the RTL9607F Ethernet packet engine.
 	 * 22 register windows read BY POSITIONAL INDEX (null placeholder slots
 	 * keep their position). resets=/pinctrl-0/nvmem-cells are deliberately
@@ -514,42 +561,110 @@
 
 		/*
 		 * LED_EPHY0..3 — the four RJ45 link LEDs, group 3 pins 6/3/1/7.
-		 * Stock binds them to its per-port netdevs eth0.2/.3/.4/.5, i.e.
-		 * NI switch ports 0/1/2/3 in order (three independent sources in
-		 * the stock firmware agree: its switch node's per-port
-		 * netdev-name, its board_init.sh netdev-trigger wiring, and its
-		 * disabled hardware port-LED node).
 		 *
-		 * ★ We cannot use the netdev trigger for these: our clean-room NI
+		 * ★★ TWO SEPARATE FACTS LIVE IN THESE FOUR NODES, and only the
+		 * second one was ever in doubt.  Keeping them apart is what makes
+		 * the block reviewable, so read them as two:
+		 *
+		 * (1) WHICH SWITCH PORT each lamp tracks — PROVEN, and unchanged
+		 *     by this revision.  Re-verified 2026-08-12 against the stock
+		 *     firmware, including a fresh `dtc -I dtb` of the raw blob
+		 *     (mtd6_ubi_DTB0.bin) to confirm the decompiled copy on disk
+		 *     is faithful.  FOUR independent places in that firmware
+		 *     agree, and they are worth naming because this is the half
+		 *     that must never be "simplified":
+		 *       · its rtk_gpio_led node — LED_EPHY0..3 =
+		 *         <&bank3 6/3/1/7>, flags 0 (active high);
+		 *       · etc/scripts/board_init.sh + set_lan_disable.sh —
+		 *         LED_EPHY0..3 device_name = eth0.2/.3/.4/.5;
+		 *       · its switchdev node — port@N id=N netdev-name
+		 *         eth0.(N+2), phy-handle phy(N+1);
+		 *       · its disabled hardware port-LED block — led@N
+		 *         port=<N> device_name="eth0.(N+2)".
+		 *     So:
+		 *         pin 6 = EPHY0 = port 0     pin 1 = EPHY2 = port 2
+		 *         pin 3 = EPHY1 = port 1     pin 7 = EPHY3 = port 3
+		 *     Every node below keeps its own pin<->port pairing; that
+		 *     pairing is the part nobody may change without new evidence.
+		 *
+		 * (2) WHICH PRINTED SOCKET each lamp sits beside — this is what
+		 *     was WRONG here, and the previous revision of this comment
+		 *     predicted it in as many words ("the lanN NAME may be
+		 *     reversed").  It is now settled: the operator's cable check
+		 *     (2026-07-26, re-confirmed 2026-07-29, one socket at a time,
+		 *     reading which port reported link) measured the panel as
+		 *     MIRRORED —
+		 *         LAN1 = port 3      LAN3 = port 1
+		 *         LAN2 = port 2      LAN4 = port 0
+		 *     and a shipped product lights the lamp beside the socket it
+		 *     is reporting on, so the lamp beside printed LAN1 is the one
+		 *     tracking port 3 = LED_EPHY3 = pin 7.  The labels below have
+		 *     been moved onto the right pins accordingly.  The previous
+		 *     revision named the lamp beside socket LAN4 "lan1", i.e. it
+		 *     lit the far end of the panel from the cable.
+		 *
+		 *     ⚠ AND (2) CANNOT BE SETTLED FROM SOFTWARE — searched
+		 *     2026-08-12 across the whole stock DTS, /etc (incl. every
+		 *     script), the web UI and bin/lib/usr: the vendor firmware
+		 *     asserts NOTHING anywhere about the silkscreen.  What it
+		 *     does contain runs the OTHER way — set_lan_disable.sh
+		 *     comments its PHY writes "#LAN0"→port 0 … "#LAN3"→port 3,
+		 *     and the web UI's common.js legend reads "bit0 - LAN 1",
+		 *     i.e. the vendor's SOFTWARE numbers the sockets ascending
+		 *     with the port index.  That is not a refutation — a case
+		 *     silkscreen is a mechanical fact the firmware never states,
+		 *     and the operator's cable check is a live measurement on
+		 *     THIS unit, which outranks a vendor script comment — but it
+		 *     does mean the only instrument that can close this question
+		 *     is an eye on the panel, which is what the check below is.
+		 *
+		 * ★ We cannot use the netdev trigger here: our clean-room NI
 		 * driver registers ONE netdev (eth0) for the whole switch, not a
-		 * per-port subdevice, so there is no netdev to bind per RJ45.  The
-		 * panel daemon drives them from the per-port PHY link state the
-		 * driver already exports instead.  LEDn <-> port n is proven; only
-		 * which silkscreened RJ45 is port 0 is not (the sibling MIPS board
-		 * numbers its sockets the other way round), so the lanN NAME may
-		 * be reversed even though each LED does track its own port.
+		 * per-port subdevice, so there is no netdev to bind per RJ45 and
+		 * all four would report the CPU port.  cortina_ni therefore
+		 * publishes one trigger per SWITCH PORT, driven from the per-port
+		 * PHY link it already polls at 1 Hz (cortina-ni-leds.c), and the
+		 * linux,default-trigger lines below ARE the panel map, expressed
+		 * as data: a board wired the other way round changes these four
+		 * strings and no code.  Difference from stock, stated plainly:
+		 * these show LINK only; stock's trigger did link+tx+rx, so its
+		 * lamps also blinked on traffic.
+		 *
+		 * ⚠ FALSIFIABLE, AND SETTLED BY EYE IN ONE GLANCE: with the cable
+		 * in the socket printed LAN1, the lamp that lights must be the
+		 * one printed LAN1.  If the lamp beside LAN4 lights instead, then
+		 * fact (2) is wrong for this board — the vendor mirrored its own
+		 * panel — and the repair is to swap the gpios= lines among these
+		 * four nodes, keeping each label WITH its linux,default-trigger.
+		 * Do NOT instead edit the trigger strings: that would light the
+		 * correct lamp again while putting the sysfs NAME back out of
+		 * agreement with the socket, which is the defect being fixed.
 		 */
 		led-lan1 {
-			label = "x400axf:green:lan1";	/* LED_EPHY0, port 0 */
-			gpios = <&gpio3 0x06 0x00>;
+			label = "x400axf:green:lan1";	/* LED_EPHY3, pin 7 */
+			gpios = <&gpio3 0x07 0x00>;
+			linux,default-trigger = "cortina-ni-port3-link";
 			default-state = "off";
 		};
 
 		led-lan2 {
-			label = "x400axf:green:lan2";	/* LED_EPHY1, port 1 */
-			gpios = <&gpio3 0x03 0x00>;
+			label = "x400axf:green:lan2";	/* LED_EPHY2, pin 1 */
+			gpios = <&gpio3 0x01 0x00>;
+			linux,default-trigger = "cortina-ni-port2-link";
 			default-state = "off";
 		};
 
 		led-lan3 {
-			label = "x400axf:green:lan3";	/* LED_EPHY2, port 2 */
-			gpios = <&gpio3 0x01 0x00>;
+			label = "x400axf:green:lan3";	/* LED_EPHY1, pin 3 */
+			gpios = <&gpio3 0x03 0x00>;
+			linux,default-trigger = "cortina-ni-port1-link";
 			default-state = "off";
 		};
 
 		led-lan4 {
-			label = "x400axf:green:lan4";	/* LED_EPHY3, port 3 */
-			gpios = <&gpio3 0x07 0x00>;
+			label = "x400axf:green:lan4";	/* LED_EPHY0, pin 6 */
+			gpios = <&gpio3 0x06 0x00>;
+			linux,default-trigger = "cortina-ni-port0-link";
 			default-state = "off";
 		};
 

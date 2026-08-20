@@ -71,11 +71,34 @@ define Device/realtek_rtl9607f_x400axf
   #       ask for a hole. base-files/etc/uci-defaults/30-upnp-secure is what
   #       bounds that (secure_mode, high ports only, terminal deny) and
   #       upnp_igd_wan_exposure is what proves the daemon stays LAN-only.
+  #   IPv6 to the LAN (odhcpd-ipv6only): the RA and DHCPv6 server. WITHOUT IT
+  #   THE DEVICE CANNOT HAND IPv6 TO A CLIENT AT ALL, whatever address the LAN
+  #   bridge carries -- MEASURED 2026-08-13, and it is the same shape as the
+  #   UPnP defect found the same day: the image shipped the CONFIGURATION for a
+  #   daemon it did not ship. Applying the lab's static /64 wrote
+  #   dhcp.lan.ra='server' / dhcpv6='server' happily, then died on
+  #   `/etc/init.d/odhcpd: not found`. Unlike UPnP this was NOT a silent build
+  #   drop -- the config says `# CONFIG_PACKAGE_odhcpd is not set`, an explicit
+  #   omission -- so the new selected-package guard would (correctly) never have
+  #   flagged it.
+  #
+  #     odhcpd-ipv6only, NOT plain odhcpd: dnsmasq already serves DHCPv4 here,
+  #       and the full variant would take that over. The -ipv6only build does
+  #       RA + DHCPv6 + prefix delegation and leaves v4 alone, which is exactly
+  #       the split this image already has and is upstream's own default.
+  #
+  #     ★ SCOPE THE CLAIM IT SUPPORTS. This makes the device able to SERVE a
+  #       prefix; it does not obtain one -- the upstream here delegates none
+  #       (a /128, no IA_PD), which is why the lab uses a declared static /64.
+  #       So a green v6 case says "routes and forwards IPv6 when given a
+  #       prefix", never "IPv6 works in production". Keep DHCPv6-PD correct so
+  #       it works the day a real delegation arrives.
   DEVICE_PACKAGES := dnsmasq firewall4 \
 	luci-base luci-mod-admin-full luci-theme-bootstrap \
 	uhttpd uhttpd-mod-ubus rpcd rpcd-mod-file \
 	wpad-basic-mbedtls wifi-scripts wireless-regdb iw \
 	ppp ppp-mod-pppoe kmod-ppp kmod-pppox kmod-pppoe \
-	miniupnpd-nftables
+	miniupnpd-nftables \
+	odhcpd-ipv6only
 endef
 TARGET_DEVICES += realtek_rtl9607f_x400axf

@@ -39,6 +39,17 @@
 # one device to any control point that keys on it.  Leaving the option UNSET is
 # what makes the init script mint a random per-unit UUID on first start and
 # persist it with `uci set` + `uci commit` -- correct and self-maintaining.
+# ★ DELETE EVERY perm_rule, NOT A COUNTED THREE.
+# This used to issue exactly three `delete upnpd.@perm_rule[-1]` -- a hardcoded
+# count of what the miniupnpd PACKAGE happens to ship. Measured 2026-08-13: it
+# ships TWO, so the third delete was a silent no-op and the result was right by
+# luck. The failure mode if that package ever ships more is not cosmetic: our
+# rules are ADDED AT THE END, so any survivor sits AHEAD of them, and miniupnpd
+# takes the FIRST matching rule -- a leftover `allow` would silently outrank the
+# `deny` this file exists to enforce, with nothing to see in the config.
+# A count is not a structure; loop until there are none left.
+while uci -q delete upnpd.@perm_rule[-1]; do :; done
+
 uci -q batch <<-EOF
 	delete upnpd.config
 	set upnpd.config=upnpd
@@ -53,9 +64,6 @@ uci -q batch <<-EOF
 	set upnpd.config.internal_iface='lan'
 	set upnpd.config.port='5000'
 	set upnpd.config.upnp_lease_file='/var/run/miniupnpd.leases'
-	delete upnpd.@perm_rule[-1]
-	delete upnpd.@perm_rule[-1]
-	delete upnpd.@perm_rule[-1]
 	add upnpd perm_rule
 	set upnpd.@perm_rule[-1].action='allow'
 	set upnpd.@perm_rule[-1].ext_ports='1024-65535'

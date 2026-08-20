@@ -35,7 +35,12 @@ start_service() {
 	# -b ADDR:PORT: listen on the LAN address only (LAN-only, not WAN).
 	# -l /bin/login: authenticate every session through login(1).
 	procd_set_param command "$PROG" -F -b "${lan_ip}:23" -l /bin/login
-	procd_set_param respawn
+	# retry 0 = respawn forever. A bare `respawn` inherits 3600 5 5 and procd
+	# then halts the instance permanently, so five deaths would silently drop
+	# the CERTIFIED LAN telnet posture (MGMT_TELNET_LAN_EXPECT = "enabled")
+	# until a reboot - and the field technician this device keeps telnet for
+	# would find it gone with nothing saying why.
+	procd_set_param respawn 3600 5 0
 	procd_set_param stdout 1
 	procd_set_param stderr 1
 	procd_close_instance

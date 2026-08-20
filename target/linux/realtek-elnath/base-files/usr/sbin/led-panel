@@ -14,17 +14,31 @@
 #              so a script here is the same architecture with none of the
 #              driver-side code or footprint.
 #
-#   LAN1-4     stock binds these to the netdev trigger on its per-port netdevs
-#              eth0.2/.3/.4/.5.  ★ Our clean-room NI driver registers ONE netdev
-#              (eth0) for the whole switch - there is no per-port netdev to bind
-#              - so the netdev trigger physically cannot express "port 3 link".
-#              The driver does export per-port PHY link state, so we read that.
-#              Difference from stock, stated plainly: these show LINK only, they
-#              do not blink on traffic (stock's trigger did link+tx+rx).  If
-#              per-port netdevs ever land, delete this half and use the netdev
-#              trigger with mode "link tx rx".
-#
 #   NET        internet/WAN reachability.  Cheap and honest: a default route.
+#
+# ★ LAN1-4 ARE NOT DRIVEN HERE ANY MORE — DO NOT ADD THEM BACK.  They are the
+# kernel's now: cortina_ni publishes one LED trigger per switch port and drives
+# it from the per-port PHY link it already polls at 1 Hz, and the device tree
+# binds each lamp to its port with linux,default-trigger.  See
+# drivers/net/ethernet/cortina/cortina-ni-leds.c and the leds node in
+# rtl9607f_x400axf.dts, which is also where the MIRRORED silkscreen map now
+# lives (socket LAN1 = switch port 3).
+#
+# WHY THE HALF THAT USED TO BE HERE WAS DELETED RATHER THAN REPAIRED, because
+# it is a defect worth not repeating: it read the per-port link out of
+# /proc/net/cortina_ni_rx, and that node was RETIRED on 2026-08-08 when every
+# countable value moved to `ethtool -S` and the narrative to debugfs (a node
+# named after one driver on one model has no counterpart on the vendor
+# firmware, so nothing read through it could ever be compared against stock).
+# The producer went; this consumer stayed, guarded by `[ -r "$NIRX" ] ||
+# return 0` — so it returned at its first line, every 2 s, in silence, and the
+# four lamps sat dark from then on with nothing anywhere saying why.  Reading
+# the link in the driver that already knows it removes the text interface, and
+# with it this entire failure mode.
+#
+# ⚠ AND IT WOULD NOW ACTIVELY FIGHT THE KERNEL: set_led() below forces
+# `trigger` back to `none` before writing brightness, which UNBINDS a lamp from
+# its port trigger.  A poll_lan() here would switch the LEDs off for good.
 #
 # PWR is handled entirely in the device tree (default-state = "on").  WPS and
 # FXS1 are declared in the DT but deliberately unmanaged: we ship no WPS
@@ -44,26 +58,10 @@
 
 LEDS=/sys/class/leds
 GPON=/proc/gpon
-NIRX=/proc/net/cortina_ni_rx
 
-# The one place the panel mapping lives.  LAN_LEDS is ordered by NI switch port
-# (port 0 first).
-#
-# *** THE SILKSCREEN IS MIRRORED RELATIVE TO THE SWITCH PORTS ***
-# Operator cable-check, 2026-07-26, all four sockets tried one at a time:
-#     socket LAN1 -> switch port3      socket LAN3 -> switch port1
-#     socket LAN2 -> switch port2      socket LAN4 -> switch port0
-# So the LED for the socket labelled LANn is driven by switch port (4-n).  The
-# first version of this list assumed port0=LAN1 and lit the LED at the OPPOSITE
-# end of the panel from the cable -- correct hardware, wrong label.  Do NOT
-# "simplify" this back to ascending order without redoing the cable check; the
-# sibling MIPS board numbers its sockets the other way round, which is exactly
-# how the wrong assumption got here.
 LED_PON="x400axf:green:pon"
 LED_LOS="x400axf:red:los"
 LED_NET="x400axf:green:net"
-# ordered by SWITCH PORT: port0 lights socket LAN4, port3 lights socket LAN1
-LAN_LEDS="x400axf:green:lan4 x400axf:green:lan3 x400axf:green:lan2 x400axf:green:lan1"
 
 POLL="${LED_PANEL_POLL:-2}"
 
@@ -118,22 +116,6 @@ poll_gpon() {
 	esac
 }
 
-# Per-port link, from the NI driver's own dump:
-#   "link port0 (phy1): bmsr=0x796d link=1"
-poll_lan() {
-	local i=0 led up
-
-	[ -r "$NIRX" ] || return 0
-	for led in $LAN_LEDS; do
-		up=$(sed -n "s/^link port$i .*link=\([0-9-]*\).*/\1/p" "$NIRX" 2>/dev/null | head -n1)
-		case "$up" in
-		1)	set_led "$led" on ;;
-		0)	set_led "$led" off ;;
-		esac
-		i=$((i + 1))
-	done
-}
-
 # NET: lit once the WAN actually gives us a default route (a DHCP lease or a
 # PPPoE session up, either way).  Deliberately not "the interface exists".
 # Read straight out of /proc/net/route (destination and mask both 0.0.0.0) so
@@ -150,7 +132,6 @@ poll_net() {
 
 while :; do
 	poll_gpon
-	poll_lan
 	poll_net
 	sleep "$POLL"
 done
