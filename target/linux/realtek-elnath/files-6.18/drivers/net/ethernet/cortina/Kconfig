@@ -17,6 +17,7 @@ config GEMINI_ETHERNET
 	depends on HAS_IOMEM
 	select PHYLIB
 	select CRC32
+	select CRC32
 	help
 	  This driver supports StorLink SL351x (Gemini) dual Gigabit Ethernet.
 
@@ -29,6 +30,20 @@ config CORTINA_NI
 	  This driver supports the Cortina-Access NI packet engine found in
 	  the Realtek RTL9607F "Elnath" GPON SoC, including its internal
 	  MDIO bus and quad GbE PHYs.
+
+config CORTINA_NI_DSA
+	bool "Expose the four RJ45 jacks as DSA ports lan1..lan4"
+	depends on CORTINA_NI
+	depends on NET_DSA
+	select NET_DSA_TAG_CORTINA
+	help
+	  Register the RTL9607F NI's four LAN jacks as Linux DSA user ports
+	  (lan1..lan4) behind the "eth0" conduit, so they appear as four
+	  separate ports (e.g. in LuCI) and can be bridged/VLANed with the
+	  standard Linux bridge.  The per-jack selector is carried in DMA
+	  metadata (RX HEADER_A.lspid / TX DESC1_DEST), tagged by the
+	  net/dsa/tag_cortina soft shim.  When off, the NI presents a single
+	  "eth0" netdev for all four jacks.
 
 config CORTINA_NI_FLOWOFFLOAD
 	bool "Cortina-Access NI L3FE nf_flow_table hardware flow offload"
@@ -68,5 +83,24 @@ config CORTINA_GPON
 	  found in the Realtek RTL9607F "Elnath" GPON ONU SoC: the PON-MAC
 	  register block, PSDS SerDes optics, PLOAM servicing and the GEM
 	  datapath.  Clean-room re-expression of the Cortina ca-network-engine.
+
+config CORTINA_GPON_OMCI_BRIDGE
+	bool "Userspace stock-OMCI daemon bridge"
+	depends on CORTINA_GPON
+	select NETFILTER
+	default y
+	help
+	  Present the two kernel seams the stock Zyxel/EcoNet omci_app / mosapp
+	  daemon expects -- a NETLINK OMCI plane (protos 1 and 2), an nf_sockopt
+	  control plane (optname 5400) and /proc/omci/devMode -- so the unmodified
+	  daemon can run in a chroot and build the real OLT-provisioned MIB, bridged
+	  to the in-kernel GPON MAC datapath.
+
+	  The daemon's OMCI socket co-registers on NETLINK proto 2 alongside
+	  NETLINK_USERSOCK without any core-kernel change (the .input callback is
+	  per-socket).  Diversion is off until armed at runtime with
+	  cortina_gpon.omci_userspace=1, so building this in is harmless otherwise.
+
+	  If unsure, say Y.
 
 endif # NET_VENDOR_CORTINA

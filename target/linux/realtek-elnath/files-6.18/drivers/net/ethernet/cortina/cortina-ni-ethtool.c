@@ -1,60 +1,95 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Cortina-Access NI Ethernet driver for the Realtek RTL9607F "Elnath" -
- * the STANDARD statistics + register-snapshot interface.
+ * Cortina-Access NI Ethernet driver for the Realtek RTL9607F "Elnath" /
+ * Taurus (AOT-5221Zy) - the STANDARD counter + register-snapshot interface:
  *
- *   ethtool -S <dev>	every countable quantity the driver and the engine have
- *   ethtool -d <dev>	the curated NI-window register snapshot
+ *   ethtool -S <dev>   every countable quantity the driver and the NI can
+ *                      report, as one flat name->value list
+ *   ethtool -d <dev>   the curated NI-window register snapshot, as a flat u32
+ *                      array, decodable through debugfs .../regdump_map
  *
- * WHY THIS FILE EXISTS, and it is not a style preference.  Every counter this
- * port publishes used to be reachable only through /proc nodes named after
- * this driver - cortina_ni_rx, cortina_ni_tx, cortina_l3fe.  The vendor
- * firmware has no node of those names (its own are cntr_rx, cntr_tx,
- * dropcount, ni_debug, l3fe_debug, l3qm_debug, pon_debug), so a test case
- * reading ours could only ever BLOCK when run against stock: the ORACLE half
- * of every stock-vs-ours comparison was structurally impossible, and any
- * "compared against stock" figure taken that way was never compared at all.
- * `ethtool` is served by both firmwares' kernels, so the SAME case runs on
- * both and the comparison exists.
+ * WHY THIS EXISTS BESIDE /proc, NOT INSTEAD OF IT
+ * -----------------------------------------------
+ * A test may not depend on a /proc node carrying this driver's name, because
+ * the VENDOR firmware has no node of that name - so a case that reads
+ * /proc/net/cortina_ni_rx can only ever BLOCK on stock, and the oracle half of
+ * the comparison is structurally impossible.  ethtool is served by both
+ * firmwares' kernels, so the same case runs on both and the answers are
+ * comparable.  /proc/net/cortina_ni_rx, /proc/net/cortina_ni_tx,
+ * /proc/cortina_ni_peek, /proc/cortina_ni_gsram and /proc/cortina_l3fe ALL
+ * STAY - every live probe in this project depends on them.
  *
- * The driver-named /proc nodes are GONE: this interface plus the debugfs
- * narrative replaced them.  Nothing here competes for the read-and-clear
- * counters any more - cortina_ni_nihv_sample() below is still the single
- * reader, because the debugfs dump goes through it too.
+ * ============================================================================
+ * ★★★ PORT NOTE - THIS FILE IS *NOT* A COPY OF THE UPSTREAM ONE
+ * ============================================================================
+ * Adapted from upstream commit 7c3c1d4 to THIS tree.  Upstream's file targets
+ * ELNATH register offsets.  On Taurus five of the registers it reads are
+ * UNMAPPED HOLES and four of those FAULT THE CPU (synchronous external abort ->
+ * kernel panic).  Porting it verbatim would have made `ethtool -S eth0` a
+ * remote board-kill - strictly worse than the /proc reader it complements.
+ * Every deviation below is recorded, with the fix number that established it:
  *
- * ★ AND THE ORACLE HALF IS REAL, not merely hoped for - MEASURED 2026-08-08 in
- * the vendor's own shipped module (tier 2: stock's binary, read with `strings`,
- * no SDK involved).  `ca-ne.ko` exports ca_ni_ethtool_ops and
- * ca_ni_cpu_port_ethtool_ops, backed by ca_ethtool_get_sset_count /
- * _get_strings / _get_ethtool_stats / _get_regs / _get_regs_len - so BOTH
- * `ethtool -S` and `ethtool -d` answer on the vendor firmware.  That is what
- * makes a stock-vs-ours case possible at all; it was never possible through a
- * /proc node of ours.
+ *  1. THE NI_HV READ-AND-CLEAR BLOCK.  Upstream samples 0xa9bc (l3fe_rx),
+ *     0xa9fc (l3qm_rx), 0xaa10 (l3qm_tx), 0xaa3c (mce_rx), 0xaa7c (dma_rx).
+ *     On this die:
+ *       0xa9bc  - HOLE.  fix#81: the generic map's NI_HV_INTPT_RX_PKT_CNT,
+ *                 which Taurus RELOCATED to 0xa92c; the name "L3FE_RX" was
+ *                 wrong as well (it is the NI INTERNAL-PORT rx count).  The
+ *                 symbol CA_NI_NI_L3FE_RX_PKT_CNT does not exist in our
+ *                 regs.h and MUST NOT be re-added.
+ *       0xa9fc / 0xaa10 / 0xa9f4 / 0xa9f8 - named in NEITHER register map, and
+ *                 a readl of them takes a synchronous external abort:
+ *                 "Internal error: 0000000096000010 ... pc: readl+0x0 ...
+ *                 Kernel panic".  cortina-ni-rx.c already refuses to read them
+ *                 (it prints a literal 0 for l3qm_rx).  They are NOT sampled
+ *                 here and must never be.
+ *       0xaa3c  - decodes, but is Taurus NI_HV_XRAM_CPUXRAM_BYT_CNT_0, a BYTE
+ *                 count.  Publishing it as "mce_rx_packets" would be a named
+ *                 lie through the most authoritative interface we have.  DROPPED.
+ *       0xaa7c  - decodes, but is Taurus NI_HV_MCE_LAST_IN_HDR2, a header
+ *                 LATCH.  Accumulating a latch into a monotonic u64 produces
+ *                 pure nonsense.  DROPPED; the real DMA packet count on this
+ *                 die is CA_NI_NI_XRAM_DMA_PKT_CNT (0xaa4c) and that is what
+ *                 is published.
+ *     ⇒ the sampler below reads the five NAMED-on-Taurus internal-port
+ *     counters (fix#42/#81), all five of which cortina-ni-rx.c already reads
+ *     live on the board without faulting.
  *
- * ⚠ The two name sets are NOT the same, and a case must not assume they are.
- * Stock publishes a 44-entry per-port MIB in the vendor's CamelCase
- * (RxUCPktCnt, RxMCFrmCnt, RxBCFrmCnt, RxCrcErrFrmCnt, the RxStatsFrm*oct size
- * bins, and the Tx* equivalents); ours is the broader lower_snake_case set
- * below.  A comparison therefore asks for a SEMANTIC FIELD and a short
- * per-firmware shim maps it to that firmware's string - it must never match on
- * a name and call the absence a device fact.
+ *  2. THE QM COUNTERS moved wholesale (fix#15): QM_RX_CNTR 0x6900 -> 0x67d8,
+ *     QM_TX_CNTR 0x690c -> 0x67e4, RMU_NO_BUF_DROP 0x6940 -> 0x6818,
+ *     RMU_FE_DROP 0x6944 -> 0x681c, RX_EOP_DROP 0x6948 -> 0x6820,
+ *     RX_LEN_ERR 0x694c -> 0x6824, RX_L2TE_DROP 0x6950 -> 0x6828.  The table
+ *     below names them BY SYMBOL, so it picks up our offsets automatically.
+ *     ⚠ NEVER convert a row here to a literal offset.
  *
- * NAMING RULES for the strings, because they become the test suite's field
- * names and a renamed field is a broken case: lower_snake_case, stable, and
- * they name WHAT IS COUNTED - never a board resource number.  The /proc
- * `irq_hits` line labelled its buckets with the Linux IRQ number the board
- * happened to allocate (irq_hits_19), which is not a property of the device at
- * all; here they are rx_epp_irq<N>_events, N being the per-CPU-port EPP
- * interrupt index, which is silicon.
+ *  3. THE PER-PORT MAC MIB.  Upstream reads it through 0xa168/0xa170 and
+ *     OMITS the TX half, on a 2026-07-29 "every cell moved by zero" verdict.
+ *     fix#80 RETRACTED that verdict: the sweep was reading PG_SA_CFG1/PC_DA2.
+ *     The real Taurus MIB is RX 0xa1a4/0xa1ac and TX 0xa1b0/0xa1b8, and both
+ *     are reached here through cortina-ni-rx.c's existing readers, so the
+ *     access pair is never open-coded twice.  We therefore publish the per-port
+ *     TX MIB that upstream could not.
+ *
+ *  4. THE `-d` SNAPSHOT IS 728 WORDS HERE, NOT UPSTREAM'S 872.  It is
+ *     ARRAY_SIZE-derived from the two tables that already live in
+ *     cortina-ni-rx.c beside the /proc reader that prints them - ONE list, so
+ *     the dump and the /proc render cannot drift.  Our
+ *     cortina_ni_qmdump_offs[] is 662 words rather than 806 because it is the
+ *     MECHANICALLY DERIVED, hole-filtered list (a dense ELNATH sweep aborted
+ *     the board at 0x6978 = QM_VOQ_STATUS8, which Taurus does not have).
+ *     ⚠ Do not "fix" the length toward upstream and do not hard-code 872.
+ * ============================================================================
  */
 
-#include <linux/bitfield.h>
-#include <linux/build_bug.h>
+#include <linux/debugfs.h>
+#include <linux/device.h>
+#include <linux/err.h>
 #include <linux/ethtool.h>
 #include <linux/io.h>
 #include <linux/kernel.h>
 #include <linux/netdevice.h>
 #include <linux/phy.h>
+#include <linux/seq_file.h>
 #include <linux/spinlock.h>
 #include <linux/stddef.h>
 #include <linux/string.h>
@@ -72,26 +107,23 @@ static inline void __iomem *ni_base(struct cortina_ni *ni)
 /* ------------------------------------------------------------------ */
 
 /*
- * The NI_HV per-interface packet counters, in enum cortina_ni_nihv_cnt order.
- * Read-and-clear (stock's ca-ne.ko labels the block "NI counter =====
- * (read-and-clear)"; measured directly on 0xa9bc and 0xa9fc, where a second
- * read inside one show() returned a structural zero).
+ * The NI_HV internal-port packet counters, in enum cortina_ni_nihv_cnt order.
+ * THESE ARE READ-AND-CLEAR (cortina-ni-regs.h: "with access opcode
+ * CA_NI_MIB_OP_READ_ONLY it is CUMULATIVE (unlike the NI_HV_INTPT_* per-stage
+ * counters, which are read-and-clear)"), which is why they may have exactly
+ * one reader - see the contract in cortina-ni.h.
  *
- * ⚠ The two SIBLING error words at 0xa9f4 (RX_MISSING_SOP_EOP) and 0xa9f8
- * (RX_SHORT_ERR) are deliberately NOT here.  They live in the same block and
- * are very probably the same kind of counter, but each packs TWO quantities
- * into one word (hi16/lo16), so a u64 accumulator would destroy the split and
- * a row named for one half would be a wrong name.  They are published further
- * down AS WORDS (rx_missing_sop_eop_word / rx_short_err_word) and read
- * directly; splitting them into named halves needs the hi/lo semantics
- * established on stock first.
+ * Every offset here is a Taurus-NAMED register that cortina-ni-rx.c already
+ * reads live on this board (cortina_ni_rx_delivery_dump's "DS-NI:" line and
+ * the /proc reader's fwd-chain line).  The ELNATH set upstream samples is
+ * deliberately absent: see PORT NOTE 1 at the top of this file.
  */
 static const u32 cortina_ni_nihv_off[CA_NI_NIHV_CNT_COUNT] = {
-	[CA_NI_NIHV_L3FE_RX]	= CA_NI_NI_L3FE_RX_PKT_CNT,
-	[CA_NI_NIHV_L3QM_RX]	= CA_NI_NI_L3QM_RX_PKT_CNT,
-	[CA_NI_NIHV_L3QM_TX]	= CA_NI_NI_L3QM_TX_PKT_CNT,
-	[CA_NI_NIHV_MCE_RX]	= CA_NI_NI_MCE_RX_PKT_CNT,
-	[CA_NI_NIHV_DMA_RX]	= CA_NI_NI_DMA_RX_PKT_CNT,
+	[CA_NI_NIHV_INTPT_RX]		= CA_NI_NI_INTPT_RX_PKT_CNT,	/* 0xa92c */
+	[CA_NI_NIHV_INTPT_MISS_SOP_EOP]	= CA_NI_NI_INTPT_RX_MISS_SOP_EOP, /* 0xa924 */
+	[CA_NI_NIHV_INTPT_SHORT_ERR]	= CA_NI_NI_INTPT_RX_SHORT_ERR,	/* 0xa928 */
+	[CA_NI_NIHV_INTPT_TX]		= CA_NI_NI_INTPT_TX_PKT_CNT,	/* 0xa940 */
+	[CA_NI_NIHV_XRAM_DMA]		= CA_NI_NI_XRAM_DMA_PKT_CNT,	/* 0xaa4c */
 };
 
 void cortina_ni_nihv_sample(struct cortina_ni *ni,
@@ -123,7 +155,7 @@ void cortina_ni_nihv_sample(struct cortina_ni *ni,
 }
 
 /* ------------------------------------------------------------------ */
-/* the statistics table                                                 */
+/* `ethtool -S`: ONE table drives both the names and the values         */
 /* ------------------------------------------------------------------ */
 
 enum ca_ni_stat_src {
@@ -131,19 +163,11 @@ enum ca_ni_stat_src {
 	CA_ST_TX_U64,		/* u64 at @arg bytes into struct cortina_ni_tx */
 	CA_ST_NI_REG,		/* plain cumulative register at NI + @arg      */
 	CA_ST_NIHV,		/* index @arg into the read-and-clear totals   */
-	CA_ST_PORT_MIB,		/* per-port RX MIB, @arg = counter id, i = port*/
+	CA_ST_PORT_RXMIB,	/* per-port RX MIB, @arg = counter id, i = port*/
+	CA_ST_PORT_TXMIB,	/* per-port TX MIB, @arg = counter id, i = port*/
 	CA_ST_DRV_FLAG,		/* a driver state bit, @arg selects which      */
 	CA_ST_L3FE,		/* index @arg into the offload snapshot        */
-	CA_ST_EPP_WRPTR,	/* EPP write pointer, masked to a ring offset  */
-	CA_ST_CB_OCC,		/* central-buffer occupancy aggregate, @arg    */
-	CA_ST_CB_PORT_FREE,	/* CB per-port free-count word, @arg = port    */
-	CA_ST_PHY_LINK,		/* per-GPHY-port PHY link, i = port            */
 };
-
-/* CA_ST_CB_OCC selectors */
-#define CA_ST_CB_TOTAL		0
-#define CA_ST_CB_MAX		1
-#define CA_ST_CB_NONZERO	2
 
 /* CA_ST_DRV_FLAG selectors */
 #define CA_ST_FLAG_RX_UP	0
@@ -156,6 +180,9 @@ enum ca_ni_stat_src {
  * - which is the failure mode of the two-parallel-lists shape this replaces.
  * @n comes from the driver's own constants, so growing a family (another VoQ,
  * another port) cannot silently leave the extra members unnamed.
+ *
+ * ⚠ Every name must fit ETH_GSTRING_LEN (32) INCLUDING the substituted index
+ * and the NUL; the longest here is 29.
  */
 struct ca_ni_stat_grp {
 	const char		*fmt;
@@ -225,6 +252,8 @@ static const struct ca_ni_stat_grp cortina_ni_stat_grps[] = {
 	{ "tx_pon_omci_frames",		1, CA_ST_TX_U64, S_TX(pon_enq) },
 	{ "tx_pon_omci_fail",		1, CA_ST_TX_U64, S_TX(pon_fail) },
 	{ "tx_pon_wan_frames",		1, CA_ST_TX_U64, S_TX(pon_data_enq) },
+	/* these stride the txq[] ARRAY, not a u64 array - the step is the
+	 * struct size, which the compiler computes; never hand-write it */
 	{ "tx_vp%u_enqueued",	CA_NI_TX_NUM_VPS, CA_ST_TX_U64,
 	  S_TX(txq[0].enq), sizeof(struct cortina_ni_txq) },
 	{ "tx_vp%u_reclaimed",	CA_NI_TX_NUM_VPS, CA_ST_TX_U64,
@@ -232,49 +261,69 @@ static const struct ca_ni_stat_grp cortina_ni_stat_grps[] = {
 
 	/*
 	 * ---- per-port MAC RX MIB ----------------------------------------
-	 * ⚠ PUBLISHED AS DATA, NOT AS AN INGRESS WITNESS.  These read ZERO on
-	 * fully-working STOCK as well as on ours, so a 0 here says nothing
-	 * about whether a socket ingressed - the frame is delivered without
-	 * ever incrementing them.  The witnesses that DO move on stock under
-	 * load are l3fe_rx_packets and l3qm_rx_packets below.  They are kept
-	 * because a raw counter costs nothing to carry and the reading may yet
-	 * be explained; they are named for the hardware block they come from
-	 * so nobody mistakes them for a datapath verdict.
-	 *
-	 * ⚠ The per-port TX MIB is deliberately ABSENT.  It was measured on
-	 * 2026-07-29 across all 8 ACCESS port values and every plausible
-	 * counter id while the driver transmitted 1164 frames out the cabled
-	 * port: every cell moved by zero, and some read non-zero and stayed
-	 * there.  Publishing a value that looks like a counter and never moves
-	 * through an interface as authoritative as `ethtool -S` would invite
-	 * exactly the wrong conclusion on a working port.  It comes back when
-	 * the counter ids have been re-derived FROM STOCK while stock
-	 * transmits - the oracle step that was skipped.
-	 *
-	 * ★ AND THAT ORACLE STEP IS NOW ONE COMMAND.  Stock's ethtool string
-	 * set contains TxUCPktCnt / TxMCFrmCnt / TxBCFrmCnt (see the file
-	 * header), i.e. the vendor publishes exactly the per-port TX counters
-	 * we could not make move.  So: boot stock, `ethtool -S <lan netdev>`
-	 * before and after pushing known traffic OUT that socket, and read
-	 * whether the vendor's own Tx cells climb.  They climb => our ACCESS
-	 * ids were wrong and the counter is real; they stay flat on WORKING
-	 * stock => it is a phantom on this silicon and leaving it out is
-	 * correct.  Either answer settles it; neither can be had from our side
-	 * alone, which is the whole reason this interface exists.
+	 * Read through the indirect ACCESS/DATA pair at the REAL Taurus
+	 * addresses (fix#80: CA_NI_HV_RXMIB_ACCESS 0xa1a4 / DATA0 0xa1ac; the
+	 * ELNATH 0xa168/0xa170 upstream uses is Taurus PG_SA_CFG1/PG_CFG1, and
+	 * reading it returned the constant 0x81008100 on every port - which is
+	 * what got this MIB written off as "a phantom").  ~0u means the GO poll
+	 * never cleared, so a stuck instrument is VISIBLE rather than reading as
+	 * a healthy zero.
 	 */
-	{ "port%u_mac_rx_unicast",	CA_NI_LAN_PORT_COUNT, CA_ST_PORT_MIB,
+	{ "port%u_mac_rx_unicast",	CA_NI_LAN_PORT_COUNT, CA_ST_PORT_RXMIB,
 	  CA_NI_MIB_RX_UC_PKT },
-	{ "port%u_mac_rx_multicast",	CA_NI_LAN_PORT_COUNT, CA_ST_PORT_MIB,
+	{ "port%u_mac_rx_multicast",	CA_NI_LAN_PORT_COUNT, CA_ST_PORT_RXMIB,
 	  CA_NI_MIB_RX_MC_PKT },
-	{ "port%u_mac_rx_broadcast",	CA_NI_LAN_PORT_COUNT, CA_ST_PORT_MIB,
+	{ "port%u_mac_rx_broadcast",	CA_NI_LAN_PORT_COUNT, CA_ST_PORT_RXMIB,
 	  CA_NI_MIB_RX_BC_PKT },
 
-	/* ---- engine, read-and-clear (accumulated; see the header) -------- */
-	{ "l3fe_rx_packets",	1, CA_ST_NIHV, CA_NI_NIHV_L3FE_RX },
-	{ "l3qm_rx_packets",	1, CA_ST_NIHV, CA_NI_NIHV_L3QM_RX },
-	{ "l3qm_tx_packets",	1, CA_ST_NIHV, CA_NI_NIHV_L3QM_TX },
-	{ "mce_rx_packets",	1, CA_ST_NIHV, CA_NI_NIHV_MCE_RX },
-	{ "dma_rx_packets",	1, CA_ST_NIHV, CA_NI_NIHV_DMA_RX },
+	/*
+	 * ---- per-port MAC TX MIB ----------------------------------------
+	 * ★ OURS, AND DELIBERATELY NOT UPSTREAM'S SHAPE.  Upstream omits the TX
+	 * MIB entirely, citing a measurement that fix#80 RETRACTED (that sweep
+	 * was reading PG_FXPT_CFG/PC_DA2, not a MIB).  At the real Taurus
+	 * addresses (0xa1b0/0xa1b8) this is the ONLY per-PHYSICAL-port egress
+	 * packet counter on this silicon, so it is worth publishing.
+	 *
+	 * ⚠ THE COUNTER IDS 1/2/3 ARE A DERIVATION, NOT A MEASUREMENT (from the
+	 * vendor table's size-bin anchor counter_id_TxStatsFrm65to127Oct = 0xf).
+	 * The anchor is published as a fourth row precisely so a stock-vs-ours
+	 * `ethtool -S` CONFIRMS the mapping instead of us trusting it: if the
+	 * anchor row matches stock and the UC/MC/BC rows do not, the ids are
+	 * wrong, not the addresses.
+	 * ⚠ NOTE cortina-ni-rx.c's /proc loop still passes the RX ids (0/1/2) to
+	 * cortina_ni_tx_mib_read() - a copy-paste slip.  Do not replicate it here.
+	 */
+	{ "port%u_mac_tx_unicast",	CA_NI_LAN_PORT_COUNT, CA_ST_PORT_TXMIB,
+	  CA_NI_MIB_TX_UC_PKT },
+	{ "port%u_mac_tx_multicast",	CA_NI_LAN_PORT_COUNT, CA_ST_PORT_TXMIB,
+	  CA_NI_MIB_TX_MC_PKT },
+	{ "port%u_mac_tx_broadcast",	CA_NI_LAN_PORT_COUNT, CA_ST_PORT_TXMIB,
+	  CA_NI_MIB_TX_BC_PKT },
+	{ "port%u_mac_tx_frm65_127",	CA_NI_LAN_PORT_COUNT, CA_ST_PORT_TXMIB,
+	  CA_NI_MIB_TX_FRM65_127 },
+
+	/*
+	 * ---- NI internal port, read-and-clear (accumulated) --------------
+	 * TOTALS SINCE BOOT, not since the last read: the registers are
+	 * read-and-clear and cortina_ni_nihv_sample() is their one reader (see
+	 * the contract in cortina-ni.h).  A caller that wants a delta keeps its
+	 * own snapshot of the TOTAL and subtracts; differencing the raw register
+	 * is a delta of deltas.
+	 *
+	 * ★ NAMES DIFFER FROM UPSTREAM ON PURPOSE.  Upstream calls the first row
+	 * "l3fe_rx_packets" from an ELNATH label that fix#81 proved wrong twice
+	 * over - wrong ADDRESS (0xa9bc is a hole here) and wrong NAME (it is the
+	 * NI internal-port count, not an L3FE count).  The retracted conclusion
+	 * "l3fe_rx=0, so LAN frames never enter the L3FE" came from exactly that
+	 * label; it must not be re-derivable from an ethtool string.
+	 */
+	{ "ni_intpt_rx_packets",	1, CA_ST_NIHV, CA_NI_NIHV_INTPT_RX },
+	{ "ni_intpt_rx_miss_sop_eop",	1, CA_ST_NIHV,
+	  CA_NI_NIHV_INTPT_MISS_SOP_EOP },
+	{ "ni_intpt_rx_short_err",	1, CA_ST_NIHV,
+	  CA_NI_NIHV_INTPT_SHORT_ERR },
+	{ "ni_intpt_tx_packets",	1, CA_ST_NIHV, CA_NI_NIHV_INTPT_TX },
+	{ "ni_xram_dma_packets",	1, CA_ST_NIHV, CA_NI_NIHV_XRAM_DMA },
 
 	/* ---- engine, cumulative registers -------------------------------
 	 * The datapath bisect, in flow order: L2FE ingest -> L2FE drop ->
@@ -282,10 +331,22 @@ static const struct ca_ni_stat_grp cortina_ni_stat_grps[] = {
 	 * stops climbing while the one before it climbs is the death stage.
 	 * 32-bit and free-running in hardware, so they wrap; difference two
 	 * readings rather than trusting an absolute.
+	 *
+	 * Every offset comes from OUR regs.h SYMBOL, which is what makes the
+	 * fix#15 QM remap (0x6900 -> 0x67d8 and six siblings) automatic here.
+	 * ⚠ Never convert a row below to a literal.
 	 */
-	{ "l2fe_ni_ingress_drops",	1, CA_ST_NI_REG,
+	/* ⛔ THE TWO L2FE ROWS ARE UNPROVEN AND NAMED SO.  RB17 (2026-08-11)
+	 * sampled them before and after 20 counted unicast pings + 10 broadcast
+	 * ARPs and they did not change by one bit (0x11bc read a constant, 0x1234
+	 * a constant 0xFF).  A pegged value that never moves under known-good
+	 * traffic is not saturation, it is a register that is not a counter -
+	 * the same failure mode as the pre-fix#80 MAC MIB.  Published as raw
+	 * register reads so a stock-vs-ours diff can settle them, NOT as
+	 * "drops": do not place a break point with these. */
+	{ "l2fe_ni_intf_drop_raw",	1, CA_ST_NI_REG,
 	  CA_NI_L2FE_NI_INTF_DROP_CNT },
-	{ "l2fe_dos_flood_drops",	1, CA_ST_NI_REG,
+	{ "l2fe_dos_flood_raw",		1, CA_ST_NI_REG,
 	  CA_NI_L2FE_DOS_FLOOD_CNT },
 	{ "l2tm_bm_rx_packets",		1, CA_ST_NI_REG, CA_NI_L2TM_BM_RX_PCNT },
 	{ "l2tm_bm_tx_packets",		1, CA_ST_NI_REG, CA_NI_L2TM_BM_TX_PCNT },
@@ -303,73 +364,14 @@ static const struct ca_ni_stat_grp cortina_ni_stat_grps[] = {
 	{ "qm_drop_rx_len_err",		1, CA_ST_NI_REG, CA_NI_QM_RX_LEN_ERR_CNTR },
 	{ "qm_drop_rx_l2te",		1, CA_ST_NI_REG, CA_NI_QM_RX_L2TE_DROP_CNTR },
 
-	/* ---- engine GAUGES -----------------------------------------------
-	 * A gauge in `ethtool -S` is ordinary and other drivers publish them;
-	 * these are here rather than in `ethtool -d` for one of two structural
-	 * reasons, never convenience.  A gauge's ABSOLUTE value is the
-	 * measurement, so it is never differenced.
-	 *
-	 * qm_free_pages + qm_interrupt_source are plain readl()s and DO appear
-	 * in the -d sweep as well; they are named here because a consumer that
-	 * wants one value should not have to resolve a positional index
-	 * through a decode map and pin an ABI the driver is allowed to append
-	 * to.  Both names come from stock's own register table (tier 2):
-	 * L2TM_QM_EQ_GLB_FREECNT and QM_INT_SRC.
-	 */
-	{ "qm_free_pages",	1, CA_ST_NI_REG, CA_NI_L2TM_QM_EQ_GLB_FREECNT },
-	{ "qm_interrupt_source", 1, CA_ST_NI_REG, CA_NI_QM_INT_SRC },
-
-	/*
-	 * The CPU port's two empty-buffer pools, as the RAW PA_REQ word.
-	 * `inactive` (the buffers a pool is SHORT, healthy 0) is bits[13:0]
-	 * and `ready` is bit31, so one word carries two quantities and
-	 * publishing it under either name would be naming it wrongly - the
-	 * consumer masks out the field it wants.  The two EQ ids are adjacent
-	 * by silicon, which the assert below refuses to let drift.
-	 */
-	{ "rx_cpu_pool%u_pa_req",	2, CA_ST_NI_REG,
-	  CA_NI_QM_EQM_PA_REQ(CA_NI_RX_EQ_ID), 4 },
-
-	/*
-	 * The two packed NI_HV error words, published AS WORDS.  Each carries
-	 * two 16-bit quantities (0xa9f4 hi=missing-SOP lo=missing-EOP, 0xa9f8
-	 * hi=short lo=err), so there is no single countable value and a row
-	 * named for one half would be a wrong name.  They are READ-AND-CLEAR
-	 * in hardware and are deliberately NOT routed through
-	 * cortina_ni_nihv_sample(): a u64 accumulator cannot add two packed
-	 * halves without destroying the split.  `ethtool -S` is now their only
-	 * reader, so nothing steals from anything.
-	 */
-	{ "rx_missing_sop_eop_word",	1, CA_ST_NI_REG,
-	  CA_NI_NI_L3QM_RX_MISS_SOP_EOP },
-	{ "rx_short_err_word",		1, CA_ST_NI_REG,
-	  CA_NI_NI_L3QM_RX_SHORT_ERR },
-
-	/* ---- indirect / derived / MDIO: what -d cannot carry -------------- */
-	{ "rx_epp_wrptr_voq%u",	CA_NI_RX_VOQ_COUNT, CA_ST_EPP_WRPTR },
-	{ "cb_voq_used_pages_total",	1, CA_ST_CB_OCC, CA_ST_CB_TOTAL },
-	{ "cb_voq_used_pages_max",	1, CA_ST_CB_OCC, CA_ST_CB_MAX },
-	{ "cb_voq_nonzero_count",	1, CA_ST_CB_OCC, CA_ST_CB_NONZERO },
-	{ "cb_lan_port_free_word",	1, CA_ST_CB_PORT_FREE,
-	  CA_NI_RX_CB_PORT_LAN },
-	{ "cb_cpu_port_free_word",	1, CA_ST_CB_PORT_FREE,
-	  CA_NI_RX_CB_PORT_CPU },
-	/*
-	 * ★ PER-PORT PHY LINK - which PRINTED socket the cable is actually in.
-	 * The one question this driver cannot answer any other standard way:
-	 * it registers ONE netdev on ONE phylib PHY, so get_link and
-	 * /sys/class/net/<if>/carrier speak for that PHY alone and every other
-	 * RJ45 is invisible.  This board links on port 3, not port 0, and its
-	 * panel order is MIRRORED, so a guessed map sends a technician to the
-	 * wrong socket.  ~0ULL = the MDIO read failed, which is not "no link".
-	 */
-	{ "port%u_phy_link",	CA_NI_LAN_PORT_COUNT, CA_ST_PHY_LINK },
-
 #if IS_ENABLED(CONFIG_CORTINA_NI_FLOWOFFLOAD)
 	/* ---- L3FE flow offload ------------------------------------------
 	 * Absent from the string set when the engine is not built in, which is
 	 * a STRUCTURAL absence (there is no engine to count), not a counter
 	 * that failed to be measured.
+	 * ⚠ CONFIG_CORTINA_NI_FLOWOFFLOAD is OFF in
+	 * target/linux/realtek-elnath/config-6.18, so these 19 rows compile out
+	 * of the default image and `ethtool -S eth0` reports 117 counters, not 136.
 	 */
 	{ "l3fe_flows_resident",	1, CA_ST_L3FE, CA_L3FE_FLOWS_RESIDENT },
 	{ "l3fe_ds_flows_resident",	1, CA_ST_L3FE, CA_L3FE_DS_FLOWS_RESIDENT },
@@ -394,28 +396,17 @@ static const struct ca_ni_stat_grp cortina_ni_stat_grps[] = {
 #endif
 };
 
-/* One sample of everything a single `ethtool -S` needs from a shared source,
+/*
+ * One sample of everything a single `ethtool -S` needs from a shared source,
  * so a read-and-clear register is sampled once per invocation and not once per
- * row that mentions it. */
+ * row that mentions it.
+ */
 struct ca_ni_stat_ctx {
 	u64	nihv[CA_NI_NIHV_CNT_COUNT];
-	/* The central-buffer scan is 128 indirect ACCESS/DATA transactions and
-	 * all three aggregates come out of ONE walk, so it is sampled once per
-	 * `ethtool -S` like the read-and-clear block above - not once per row
-	 * that mentions it. */
-	u64	cb_occ[3];
 #if IS_ENABLED(CONFIG_CORTINA_NI_FLOWOFFLOAD)
 	u64	l3fe[CA_L3FE_STAT_COUNT];
 #endif
 };
-
-/* CA_NI_RX_EQ_ID / _ID2 are the CPU port's two empty-buffer pools and the
- * stats row above reads them as ONE two-entry family at stride 4.  They are
- * adjacent by silicon today (5 and 6); the header records that they were once
- * 13 and 14, so if they are ever moved apart again this must become two rows
- * rather than silently reading the wrong register. */
-static_assert(CA_NI_RX_EQ_ID2 == CA_NI_RX_EQ_ID + 1,
-	      "rx_cpu_pool%u_pa_req reads the two pools as one stride-4 family");
 
 static u64 ca_ni_stat_value(struct cortina_ni *ni,
 			    const struct ca_ni_stat_grp *g, unsigned int i,
@@ -438,12 +429,16 @@ static u64 ca_ni_stat_value(struct cortina_ni *ni,
 		return readl(ni_base(ni) + g->arg + (size_t)i * g->step);
 	case CA_ST_NIHV:
 		return ctx->nihv[g->arg + i];
-	case CA_ST_PORT_MIB:
+	case CA_ST_PORT_RXMIB:
 		if (!ni_base(ni))
 			return 0;
 		/* ~0u on a stuck indirect access, so a broken instrument is
 		 * visible instead of reading as a silent zero */
 		return cortina_ni_rx_mib_read(ni, i, g->arg);
+	case CA_ST_PORT_TXMIB:
+		if (!ni_base(ni))
+			return 0;
+		return cortina_ni_tx_mib_read(ni, i, g->arg);
 	case CA_ST_DRV_FLAG:
 		switch (g->arg) {
 		case CA_ST_FLAG_RX_UP:
@@ -454,30 +449,25 @@ static u64 ca_ni_stat_value(struct cortina_ni *ni,
 	case CA_ST_L3FE:
 		return ctx->l3fe[g->arg + i];
 #endif
-	case CA_ST_EPP_WRPTR:
-		return cortina_ni_rx_epp_wrptr(ni, i);
-	case CA_ST_CB_OCC:
-		return ctx->cb_occ[g->arg];
-	case CA_ST_CB_PORT_FREE:
-		return cortina_ni_rx_cb_port_free_word(ni, g->arg);
-	case CA_ST_PHY_LINK: {
-		int up = cortina_ni_rx_phy_link(ni, i);
-
-		/* ~0ULL, not 0: "the MDIO read did not complete" and "this
-		 * socket has no cable" are different answers, and reporting
-		 * the second when the first happened is a sentence about the
-		 * device manufactured by a fault of the instrument. */
-		return up < 0 ? ~0ULL : (u64)up;
-	}
 	default:
 		return 0;
 	}
 }
 
 /* ------------------------------------------------------------------ */
-/* ethtool ops                                                          */
+/* the ethtool_ops bodies                                              */
 /* ------------------------------------------------------------------ */
 
+/*
+ * cortina_ni_tx_probe() allocates the netdev with
+ *   devm_alloc_etherdev(ni->dev, sizeof(struct cortina_ni *))
+ * so the private area is exactly ONE pointer, and every callback in
+ * cortina-ni-tx.c already reaches the driver state this way.
+ *
+ * ⚠ NEVER attach cortina_ni_ethtool_ops to the GPON WAN netdev: cortina-gpon.c
+ * allocates it with alloc_etherdev(0) - priv size ZERO - and this would read
+ * past the end of the allocation.
+ */
 static struct cortina_ni *cortina_ni_of_netdev(struct net_device *dev)
 {
 	return *(struct cortina_ni **)netdev_priv(dev);
@@ -523,9 +513,6 @@ static void cortina_ni_get_ethtool_stats(struct net_device *dev,
 
 	/* ONE sample of every shared source, before the walk */
 	cortina_ni_nihv_sample(ni, ctx.nihv);
-	cortina_ni_rx_cb_occupancy(ni, &ctx.cb_occ[CA_ST_CB_TOTAL],
-				   &ctx.cb_occ[CA_ST_CB_MAX],
-				   &ctx.cb_occ[CA_ST_CB_NONZERO]);
 #if IS_ENABLED(CONFIG_CORTINA_NI_FLOWOFFLOAD)
 	cortina_ni_flowoffload_stats(ctx.l3fe);
 #endif
@@ -542,11 +529,18 @@ static void cortina_ni_get_ethtool_stats(struct net_device *dev,
  * `ethtool -d`: the curated NI-window register snapshot, as a flat u32 array.
  * The blob is opaque to userspace by design (no vendor decode plugin exists
  * and adding one is a userspace change we do not control), so the name and
- * offset of each word are published separately through debugfs .../regdump_map
- * - one index -> one name -> one offset, generated from the SAME table, so the
- * decode cannot drift from the dump.
+ * offset of each word are published separately through debugfs
+ * cortina-ni/regdump_map - one index -> one name -> one offset, generated from
+ * the SAME table as the dump, so the decode cannot drift from it.
+ *
+ * ★ VERSION 2, NOT UPSTREAM'S 1.  The word order IS the ABI, and ours is a
+ * DIFFERENT snapshot: 66 named words + 662 sweep words = 728 (2912 bytes),
+ * against upstream's 66 + 806 = 872.  A decoder pinned to upstream's version 1
+ * would mis-decode every word past the first divergence, so the version number
+ * says up front that this is another table.  Appending is fine; reordering or
+ * removing is not without bumping this again.
  */
-#define CA_NI_REGDUMP_VERSION	1
+#define CA_NI_REGDUMP_VERSION	2
 
 static int cortina_ni_get_regs_len(struct net_device *dev)
 {
@@ -571,6 +565,11 @@ static void cortina_ni_get_drvinfo(struct net_device *dev,
 const struct ethtool_ops cortina_ni_ethtool_ops = {
 	.get_drvinfo		= cortina_ni_get_drvinfo,
 	.get_link		= ethtool_op_get_link,
+	/* ndev->phydev is set by phy_connect_direct() in cortina_ni_open and
+	 * cleared in cortina_ni_stop, and is never set at all when the driver
+	 * is booted with cortina_ni.skip_mdio=1 - phylib then returns
+	 * -EOPNOTSUPP here rather than faulting.  A blank `ethtool eth0` on the
+	 * bring-up configuration is that, not a broken port. */
 	.get_link_ksettings	= phy_ethtool_get_link_ksettings,
 	.get_sset_count		= cortina_ni_get_sset_count,
 	.get_strings		= cortina_ni_get_strings,
@@ -578,3 +577,61 @@ const struct ethtool_ops cortina_ni_ethtool_ops = {
 	.get_regs_len		= cortina_ni_get_regs_len,
 	.get_regs		= cortina_ni_get_regs,
 };
+
+/* ------------------------------------------------------------------ */
+/* debugfs: the decode key for the `ethtool -d` blob                    */
+/* ------------------------------------------------------------------ */
+
+/*
+ * `ethtool -d` hands userspace a flat u32 array and no tool knows how to name
+ * its words, so the map is published beside it: one line per word,
+ * index -> name -> NI-window offset, generated by cortina_ni_regdump_entry()
+ * from the same tables the dump is taken from.  Read-only, no register access.
+ */
+static int cortina_ni_dbgfs_regmap_show(struct seq_file *m, void *v)
+{
+	unsigned int i, n = cortina_ni_regdump_len();
+
+	seq_printf(m, "# ethtool -d words: %u (u32 each, NI window)\n", n);
+	seq_printf(m, "# regdump version: %u\n", CA_NI_REGDUMP_VERSION);
+	seq_puts(m, "# index name offset\n");
+	for (i = 0; i < n; i++) {
+		const char *name;
+		u32 off;
+
+		cortina_ni_regdump_entry(i, &name, &off);
+		seq_printf(m, "%u %s 0x%04x\n", i, name, off);
+	}
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(cortina_ni_dbgfs_regmap);
+
+static void cortina_ni_debugfs_release(void *data)
+{
+	debugfs_remove_recursive(data);
+}
+
+void cortina_ni_debugfs_init(struct cortina_ni *ni)
+{
+	struct dentry *d;
+
+	/* A stub when debugfs is off: debugfs_create_dir() then returns an
+	 * ERR_PTR that every later call swallows, so nothing here has to be
+	 * conditional - but an ERR_PTR must not be handed to devm as a pointer
+	 * to free. */
+	d = debugfs_create_dir(CA_NI_DRV_NAME, NULL);
+	if (IS_ERR_OR_NULL(d))
+		return;
+	ni->dbgfs = d;
+
+	/* teardown is tied to the device: this driver has no .remove, and a
+	 * dentry left behind by a module unload would collide with the next
+	 * probe's create */
+	if (devm_add_action_or_reset(ni->dev, cortina_ni_debugfs_release, d)) {
+		ni->dbgfs = NULL;
+		return;
+	}
+
+	debugfs_create_file("regdump_map", 0444, d, ni,
+			    &cortina_ni_dbgfs_regmap_fops);
+}

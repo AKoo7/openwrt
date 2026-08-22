@@ -35,20 +35,22 @@
 #include "cortina-i2c.h"
 
 /* per_i2c bus 0 (the BOSA bus, /dev/i2c-0 on stock) */
-#define CGI2C_PHYS		0xf4329170ULL
-#define CGI2C_SIZE		0x28
-
 /*
- * GLB pinmux: the i2c0 SCL/SDA pads must be routed to the BIW engine or every
- * transfer silently no-ops (unrouted pins float, the ACK line reads low = fake
- * ACK, reads return 0x00 — the exact cold-boot "BOSA all-zero / DS LOF / FSM
- * stuck O1" failure).  Live-verified: cold power-on reset value 0x00100000,
- * stock-running value 0x00110000 — bit16 = the i2c0 pin group.  Stock routes
- * it from userspace before rtkbosa runs; we must do it in-kernel before the
- * first BIW transfer.
+ * ★ 2026-08-08 AOT5221ZY (fix #10): 40-bit physical, and the AOT register map.
+ * Two independent corrections, both taken from the board's own shipping driver
+ * rather than guessed:
+ *   1. These blocks live at 0x4_Fxxx_xxxx in the Linux physical map (bit34 set),
+ *      not at the 32-bit 0xFxxx_xxxx the u-boot DTS prints.  This board's DTS
+ *      already reflects that -- gpon@f5500000 is reg = <0x04 0xf5500000 ...>.
+ *      A readl() of the unbacked low alias is a SYNCHRONOUS EXTERNAL ABORT, which
+ *      is exactly how this was found: panic at cg_i2c_init+0x4c -> cg_bosa_init
+ *      -> cg_mac_activate+0x54 on the first boot after the laser fix.
+ *   2. The AOT is the rtl8277c map: the PER block sits 0x10 LOWER, so BIW0_CFG is
+ *      PER+0x160, not PER+0x170 (0x170 is BIW0_ACK here).  Same -0x10 shift that
+ *      put this board's MDIO at 0xf4329118 instead of the X400AXF's ...9128.
  */
-#define CGI2C_PINMUX_PHYS	0xf4320430ULL	/* GLB 0xf4320000 + 0x430 */
-#define CGI2C_PINMUX_I2C0_EN	BIT(16)		/* route the i2c0 pin group */
+#define CGI2C_PHYS		0x4f4329160ULL	/* PER 0x4f4329000 + 0x160 = BIW0_CFG */
+#define CGI2C_SIZE		0x28
 
 #define CGI2C_PCLK_HZ		125000000	/* g3_apb_pclk */
 #define CGI2C_BUS_HZ		100000		/* standard mode, as stock */
@@ -202,27 +204,17 @@ out:
 int cg_i2c_init(struct device *dev)
 {
 	u32 prer = CGI2C_PCLK_HZ / (5 * CGI2C_BUS_HZ) - 1;
-	void __iomem *pinmux;
 	u32 v;
 
 	if (cgi2c_base)
 		return 0;
 
-	/* route the i2c0 pads BEFORE any BIW transfer (see CGI2C_PINMUX_PHYS) */
-	pinmux = devm_ioremap(dev, CGI2C_PINMUX_PHYS, sizeof(u32));
-	if (!pinmux) {
-		dev_err(dev, "cortina-i2c: cannot map pinmux @ 0x%llx\n",
-			CGI2C_PINMUX_PHYS);
-		return -ENOMEM;
-	}
-	v = readl(pinmux);
-	if (!(v & CGI2C_PINMUX_I2C0_EN)) {
-		writel(v | CGI2C_PINMUX_I2C0_EN, pinmux);
-		dev_info(dev, "cortina-i2c: routed i2c0 pinmux (0x%08x -> 0x%08x)\n",
-			 v, readl(pinmux));
-	}
-	devm_iounmap(dev, pinmux);
-
+	/* ★ 2026-08-08 AOT5221ZY (fix #10): the GLB+0x430 GLOBAL_PIN_MUX_2 poke is
+	 * REMOVED.  That register is an rtl9607f-ism that does not exist on this
+	 * silicon -- it is past the end of this board's ~0x300 GLB decode (which is
+	 * why our DTS gives the glb window size 0x300), so even the READ aborts.
+	 * On the AOT (8277c die) the i2c0 SCL/SDA pads are already routed by the
+	 * bootloader, so nothing has to be routed here. */
 	cgi2c_base = devm_ioremap(dev, CGI2C_PHYS, CGI2C_SIZE);
 	if (!cgi2c_base) {
 		dev_err(dev, "cortina-i2c: cannot map BIW @ 0x%llx\n", CGI2C_PHYS);

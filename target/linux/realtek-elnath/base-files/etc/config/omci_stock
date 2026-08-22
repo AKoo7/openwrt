@@ -1,0 +1,10 @@
+config omci_stock 'settings'
+	# Master switch. 0 = inert (default; safe on Airtel = no DS OMCI).
+	# Set to 1 for a Create-model / auditing OLT repoint experiment.
+	option enabled '0'
+	# GPON serial the daemon announces in OMCI (must match the ranged SN).
+	option serial 'XPONxxxxxxxx'
+	# bridge | router | hybrid
+	option devtype 'bridge'
+	# off | err | warn | info | dbg
+	option dbg 'info'

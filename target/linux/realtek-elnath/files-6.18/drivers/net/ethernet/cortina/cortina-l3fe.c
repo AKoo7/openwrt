@@ -321,6 +321,34 @@ static int l3fe_poll_clear(void __iomem *ne, u32 off, u32 mask)
 	return -ETIMEDOUT;
 }
 
+/*
+ * ★ fix#93 (2026-08-11) INSTRUMENT - do not remove until the L3FE arm boots clean.
+ *
+ * Image 135 (the first build in this tree with CONFIG_CORTINA_NI_FLOWOFFLOAD=y, i.e. the
+ * first time this file has EVER executed on the board) async-SErrors inside this function:
+ *
+ *   [2.567] cortina-ni: l3fe: pre-arm MH0=00000000 MA0=00000000 INI=00000000 (expect all 0)
+ *   [2.577] SError Interrupt on CPU0, code 0x00000000be000011 -- SError
+ *   [2.578] Kernel panic - not syncing: Asynchronous SError Interrupt
+ *
+ * An ASYNCHRONOUS SError names no address - the CPU is already past the offending write by
+ * the time it is taken, which is exactly why nine sessions of this project have been unable
+ * to attribute one.  So each arm stage prints an EMERG marker and then SETTLES (dsb + isb +
+ * a 200 us window) before the next stage runs: the fault therefore lands inside its OWN
+ * stage's window and THE LAST MARKER ON THE CONSOLE IS THE STAGE THAT FAULTED.
+ *
+ * pr_emerg, not dev_info: the panic path truncates lower levels, and `dmesg -n 1` (which
+ * every harness sets) would suppress dev_info entirely - a trap already paid for once in
+ * this tree (fix#86).
+ */
+static void l3fe_arm_stage(int n, const char *what)
+{
+	dsb(sy);
+	isb();
+	udelay(200);
+	pr_emerg("l3fe-arm: stage %d ENTER: %s\n", n, what);
+}
+
 int cortina_l3fe_engine_init(void __iomem *ne, const struct cn_l3e_tables *t)
 {
 	int ret, i;
@@ -329,16 +357,19 @@ int cortina_l3fe_engine_init(void __iomem *ne, const struct cn_l3e_tables *t)
 	 * 1. Engine SRAM/table self-init - MUST precede the base/size arm.
 	 *    Kick req_sts (bit0), poll its self-clear.
 	 */
+	l3fe_arm_stage(1, "MEM_INI self-init kick (0x393c <- 1)");
 	writel(1, ne + L3FE_HS_MEM_INI);
 	ret = l3fe_poll_clear(ne, L3FE_HS_MEM_INI, BIT(0));
 	if (ret)
 		return ret;
 
+	l3fe_arm_stage(2, "SW-zero the DDR carve (no MMIO)");
 	/* 2. SW-zero the DDR tables (belt and braces, matches vendor). */
 	memset(t->key_virt, 0, CN_L3E_KEY_TBL_BYTES);
 	memset(t->fib_virt, 0, CN_L3E_FIB_TBL_BYTES);
 	wmb();	/* coherent carve: make the zeroing visible before the arm */
 
+	l3fe_arm_stage(3, "DDR base regs MH0/MH1/MA0/MA1 (0x383c/3838/3844/3840)");
 	/* 3. DDR base registers (physical, 128-byte aligned, [31:7] in
 	 * place; hi regs hold phys[39:32]).  Overflow/default/cache bases
 	 * stay 0 as on stock. */
@@ -347,17 +378,20 @@ int cortina_l3fe_engine_init(void __iomem *ne, const struct cn_l3e_tables *t)
 	writel(lower_32_bits(t->fib_pa), ne + L3FE_HS_BA_MA0);
 	writel(upper_32_bits(t->fib_pa) & 0xff, ne + L3FE_HS_BA_MA1);
 
+	l3fe_arm_stage(4, "geometry HASH_INI/CACHE_INI/CACHE_MISC (0x3834/...)");
 	/* 4. Geometry + cache config (stock-verbatim). */
 	writel(L3FE_HASH_INI_VAL, ne + L3FE_HS_HASH_INI);
 	writel(L3FE_CACHE_INI_VAL, ne + L3FE_HS_CACHE_INI);
 	writel(L3FE_CACHE_MISC_VAL, ne + L3FE_HS_CACHE_MISC);
 
+	l3fe_arm_stage(5, "anti-wedge RSV0/RSV1 + AXIM2_CONFIG (0x3944/3948/3c80)");
 	/* 5. Anti-wedge HW patch (do NOT skip: the engine can stall under
 	 * DDR read load without it) + AXI outstanding depth. */
 	writel(readl(ne + L3FE_HS_RSV0) | L3FE_RSV0_PATCH, ne + L3FE_HS_RSV0);
 	writel(readl(ne + L3FE_HS_RSV1) | L3FE_RSV1_PATCH, ne + L3FE_HS_RSV1);
 	writel(L3FE_AXIM2_CONFIG_VAL, ne + L3FE_AXIM2_CONFIG);
 
+	l3fe_arm_stage(6, "CHK_FAIL_CTRL + HS_DEFAULT_ACTION table (0x3940/3860..)");
 	/* 6. Miss/fail never drops: double-check-fail punt + the internal
 	 * default (miss) actions, def_reg=1 mode - stock programs words
 	 * 0..3, the rest stay 0. */
@@ -365,13 +399,16 @@ int cortina_l3fe_engine_init(void __iomem *ne, const struct cn_l3e_tables *t)
 	for (i = 0; i < 4; i++)
 		writel(L3FE_DEFAULT_ACTION_VAL, ne + L3FE_HS_DEFAULT_ACTION(i));
 
+	l3fe_arm_stage(7, "AGING_GRANULARITY 0 (0x3924)");
 	/* 7. HW auto-age-countdown OFF (stock): hardware must never age a
 	 * flow out from under the Linux flowtable.  Liveness = HW hit-rearm
 	 * + the SW sweep; lifetime = nf gc + FLOW_CLS_DESTROY. */
 	writel(0, ne + L3FE_HS_AGING_GRANULARITY);
 
+	l3fe_arm_stage(8, "AQM_TIMER (0x3aa8)");
 	/* 8. AQM flow-stat timer, stock-verbatim. */
 	writel(L3FE_AQM_TIMER_VAL, ne + L3FE_AQM_TIMER);
+	l3fe_arm_stage(9, "ARM COMPLETE - no stage faulted");
 
 	return 0;
 }

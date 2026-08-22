@@ -4,16 +4,18 @@ config interface 'loopback'
 	option ipaddr '127.0.0.1'
 	option netmask '255.0.0.0'
 
-# M3d: LAN = br-lan bridging eth0 (Cortina-NI port0) with the WiFi APs
-# (wlan0 2.4G + wlan1 5G join via wifi-iface network 'lan'), mirroring the
-# stock br0 topology. The bring-up-era direct-eth0 config (used during M2
-# while RX was still dead, to dodge a br-lan-route-shadows-eth0 artifact of
-# the then-half-working datapath) is superseded now the NI datapath is solid.
-# br-lan inherits eth0's (factory) MAC, so the LAN identity matches stock br0.
-config device
+# ★DSA (lan1..lan4): br-lan bridges the four DSA user ports, NOT the conduit
+# 'eth0'.  Under DSA every LAN frame is delivered on lan1..lan4 (its jack's
+# netdev); eth0 is the CPU/conduit and carries no LAN traffic, so bridging eth0
+# would black-hole the LAN.  The bridge software-forwards LAN<->LAN through the
+# CPU (this switch traps LAN ingress to the CPU; it does not forward in HW yet).
+config device 'lan_br'
 	option name 'br-lan'
 	option type 'bridge'
-	list ports 'eth0'
+	list ports 'lan1'
+	list ports 'lan2'
+	list ports 'lan3'
+	list ports 'lan4'
 
 config interface 'lan'
 	option device 'br-lan'
@@ -21,43 +23,25 @@ config interface 'lan'
 	option ipaddr '192.168.1.1'
 	option netmask '255.255.255.0'
 
-# Stage D: gpon0 = the GPON WAN data path (cortina-gpon). Carrier comes up
-# when the OLT's OMCI provisioning (data T-CONT + GEM) is installed; netifd
-# then DHCPs the WAN lease (lab: 192.168.158.0/24 from hades).
-#
-# keepalive = "<lcp-echo-failure> <lcp-echo-interval>"; only PPPoE/PPP protos
-# read it, so it is inert while proto is dhcp and is here so a switch to pppoe
-# inherits a survivable value.
-#
-# ★ WHY: OpenWrt's ppp.sh default is keepalive="5 1" = an LCP echo EVERY SECOND
-# with teardown after 5 misses -- a 5 SECOND tolerance, and pppd then EXITS
-# (ppp.sh sets maxfail 1 with no persist), so netifd destroys and recreates the
-# ppp netdev. Board A/B, identical 45 s upstream 60 B UDP flood:
-#     keepalive default (interval 1 , failure 5): teardowns 15->18  *** BOUNCED ***
-#     keepalive "5 30"  (interval 30, failure 5): teardowns 19->19  SESSION HELD
-# `lcp-echo-adaptive` (on by default) does NOT save it: it suppresses echoes
-# only when traffic arrives FROM the peer, and an upstream-only flow gives the
-# peer nothing to send back.
-#
-# The values below MATCH STOCK, recovered from stock's own PPP daemon
-# (bin/spppd, a BSD-sppp port driven by spppctl) at two independent points:
-#   - libmib.so's startPPP() issues `spppctl katimer 20` + `spppctl echo_retry 6`
-#   - spppd's .data max_alive_cnt holds 06000000 = 6
-# => stock tolerates 20 s x 6 = 120 s, i.e. 24x our old window. Stock also never
-# issues its `noredial`/`holdoff`/`diska` knobs, so it redials indefinitely and
-# never disables keepalive.
-#
-# DELIBERATE DEVIATION: we keep `lcp-echo-adaptive` (stock's sppp is
-# non-adaptive and lets only echo traffic reset the liveness counter). Adaptive
-# is strictly MORE tolerant, so it can only help; noted here so it is a recorded
-# choice and not an accidental mismatch.
-#
-# persist + holdoff: stock does not cap redials, and a transient echo timeout
-# should not tear the netdev down and rebuild it (that is what produced the
-# ifindex 10->11 churn). persist keeps pppd alive; holdoff paces reconnects.
+# ★ WAN = GPON PPPoE on VLAN102 (2026-08-19c merge of the gponAOT189/190 internet
+# recipe into the DSA build).  gpon0 is a STANDALONE WAN netdev: the driver demuxes
+# DS-RX by HEADER_A.lspid (PON 0x07 / L3_WAN 0x18) straight to gpon0
+# (cortina_ni_rx_wan_dest, rx.c) BEFORE the DSA branch, and US-TX egresses only via
+# gpon0's xmit (cortina_ni_pon_data_tx, pon_data_pol_en=1 -> data GEM 225/T-CONT1).
+# So NO eth0<->gpon0 bridge is needed (eth0 is the DSA conduit and must NOT be a
+# bridge member).  WAN is L3-routed+NAT against br-lan (see firewall).
+config device
+	option name 'gpon0.102'
+	option type '8021q'
+	option ifname 'gpon0'
+	option vid '102'
+
 config interface 'wan'
-	option device 'gpon0'
-	option proto 'dhcp'
-	option keepalive '6 20'
-	option persist '1'
-	option holdoff '5'
+	option device 'gpon0.102'
+	option proto 'pppoe'
+	# ★ Set your ISP's PPPoE credentials here (and the VLAN id in the gpon0.102
+	# device above) before use.  Placeholders only — do NOT commit real creds.
+	option username 'CHANGEME'
+	option password 'CHANGEME'
+	option ipv6 'auto'
+	option keepalive '5 20'

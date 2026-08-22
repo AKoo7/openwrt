@@ -6,7 +6,7 @@
 #   NAND "ubi_device" partition -> UBI volume "ubi_Config" (auto-attached
 #   READ-ONLY as ubi0 via bootargs ubi.mtd=ubi_device; every MTD partition
 #   is read-only in the DTS) -> config_hs.xml:
-#     <Value Name="ELAN_MAC_ADDR" Value="98c7a46cafcb"/>   (base MAC)
+#     <Value Name="ELAN_MAC_ADDR" Value="xxxxxxxxxxxx"/>   (base MAC)
 # (U-Boot env "ethaddr" is a 00:50:c2 placeholder and the DTB is not
 # bootloader-patched, so this XML is the ONLY per-board MAC source.)
 #
@@ -47,10 +47,18 @@ wan_mac=$(macaddr_add "$lan_mac" 1)
 
 logger -t factory-mac "factory MAC: eth0(LAN)=$lan_mac gpon0(WAN)=$wan_mac"
 
+# ★DSA: eth0 is the CPU/conduit — keep pinning ITS macaddr to the ELAN base so
+# the driver re-keys the my-MAC comparator + WAN-delivery FDB (gpon0 = ELAN+1)
+# on link-up.  BUT the LAN gateway is now br-lan (bridging lan1..lan4); its MAC
+# would otherwise default to a DSA user port's, which inherited the driver's
+# probe-time LAA fallback (DSA registers at probe, before this script).  Pin
+# br-lan (section lan_br) to the SAME ELAN base so the LAN gateway MAC matches
+# the armed HW L3-LAN comparator — otherwise L3FE LAN<->WAN forwarding diverges.
 uci -q batch <<EOF
 set network.lan_dev=device
 set network.lan_dev.name='eth0'
 set network.lan_dev.macaddr='$lan_mac'
+set network.lan_br.macaddr='$lan_mac'
 set network.wan_dev=device
 set network.wan_dev.name='gpon0'
 set network.wan_dev.macaddr='$wan_mac'

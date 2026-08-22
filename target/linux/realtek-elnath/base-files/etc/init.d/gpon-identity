@@ -12,7 +12,7 @@
 # Provisioning source (the one stock uses; live-verified 2026-07-16):
 #   NAND "ubi_device" -> UBI volume "ubi_Config" (auto-attached READ-ONLY as
 #   ubi0 via bootargs ubi.mtd=ubi_device) -> config_hs.xml:
-#     <Value Name="GPON_SN" Value="XPON5C6CAFCB"/>
+#     <Value Name="GPON_SN" Value="XPONxxxxxxxx"/>
 #   i.e. the very file that carries ELAN_MAC_ADDR. Stock reads the same value
 #   from the same place, in userspace, and passes it to its PON/OMCI stack
 #   (rc2 mounts ubi0:ubi_Config on /var/config; runomci.sh does
@@ -20,8 +20,8 @@
 #   `omci_app -s <SN>`; the PON-mode script splits the same string into the
 #   4-character vendor-id and the 8-hex-digit vendor-specific serial number).
 #   Nothing in stock derives the serial number from the MAC: its built-in
-#   default is the generic "RTKG11111111", so the fact that this unit's serial
-#   number shares three bytes with its MAC is factory numbering, not a rule.
+#   default is the generic "RTKG11111111". A unit's factory serial and MAC
+#   are assigned independently; do not assume a relationship between them.
 # Not a source: U-Boot env (generic placeholder), the runtime DTB (no
 # bootloader fixup), the OTP (PCIe calibration only), static_conf (blank).
 #
@@ -33,69 +33,35 @@
 # (itself per-board, from ELAN_MAC_ADDR / eth0) as vendor-id "XPON" + the MAC's
 # low 4 bytes. That keeps every unit UNIQUE, but it is NOT the factory serial
 # number, so the OLT will not have it provisioned - hence the loud logger/echo.
-# It is deliberately NOT the "5C || MAC[3..5]" shape this unit happens to have:
-# that pattern is unproven, and silently reproducing this board's real serial
-# number is exactly the defect this script exists to remove.
+# The fallback deliberately does not attempt to reconstruct a unit's real
+# factory serial number from its MAC: that would just recreate the collision
+# this script exists to prevent.
 #
 # Auto-enabled at image build (rootfs.mk enables every /etc/init.d script with
 # the rc.common shebang). START=11: right after /etc/init.d/boot, so ranging
 # starts as early as the volume is mountable.
-#
-# ★★ THIS SCRIPT RETRIES FOREVER, AND THAT IS THE WHOLE POINT (operator,
-# 2026-08-13: "las cosas WAN ONU son de reintento infinito").  It used to be a
-# ONE-SHOT: a single `return 1` and nothing on the box ever ran it again.  Every
-# failure it can hit is TRANSIENT and all of them happen precisely at START=11,
-# which is the earliest moment the volume is mountable and therefore the most
-# likely moment for the UBI attach to still be in flight:
-#   - /proc/gpon absent      -> cortina-gpon has not finished probing YET
-#   - the ubifs mount fails  -> ubi0:ubi_Config is not attached YET
-# and the consequence of losing that race was permanent: the driver waits
-# CG_SN_WAIT_SECS (60 s), shouts, and ranges with its placeholder, which the OLT
-# will not admit - so the unit sits with NO PON identity and NO WAN until a human
-# reboots it.  One lost race, one dead subscriber, nothing in the system trying
-# again.  Rate-bounded (5 s doubling to a RETRY_MAX ceiling), count-unbounded.
-#
-# ★ A FAILED MOUNT IS NOT "THIS BOARD HAS NO GPON_SN".  The MAC-derived fallback
-# below exists for a volume that genuinely carries no serial number; taking it
-# because the volume was merely not mounted YET would push a serial the OLT has
-# never heard of and then STOP - a wrong identity latched by a race.  So the two
-# cases are kept apart: mounted-but-no-GPON_SN is final and takes the fallback;
-# not-mounted keeps retrying for the real one.  The driver supports the late
-# arrival by design (cg_sn_set re-ranges when a real serial number turns up).
 
 START=11
-
-RETRY_FIRST=5		# seconds before the first re-attempt
-RETRY_MAX=300		# ceiling: keep looking ~every 5 min, forever
 
 # START=11 runs BEFORE /etc/init.d/log, so syslog may not be listening yet:
 # mirror every message into the kernel ring too, where it lands next to the
 # driver's own identity lines and survives into `dmesg`/the serial console.
-# $3 ("always") speaks even from inside the quiet retry loop, so the one line
-# that matters - the serial number finally taking - is never suppressed.
 say() {
-	# ${quiet:-} / ${3:-}: `quiet` is only set inside the retry subshell and
-	# most calls pass no $3, so both are legitimately unset on the common
-	# path. Spelled with the default so this cannot abort under `set -u`.
-	[ -n "${quiet:-}" ] && [ -z "${3:-}" ] && return 0
 	logger -t gpon-identity ${2:+-p daemon.err} "$1"
 	echo "gpon-identity: $1" > /dev/kmsg 2>/dev/null
 }
 
-# ONE attempt. 0 = the identity is set (or the board genuinely has none and the
-# fallback was applied); non-zero = TRANSIENT, ask again later.
-try_set() {
+start() {
 	local mnt="/tmp/.gpon_identity"
-	local sn="" mac="" src="" mounted=0
+	local sn="" mac="" src=""
 
 	[ -e /proc/gpon ] || {
-		say "no /proc/gpon - the cortina-gpon driver has not probed yet; will retry" err
+		say "no /proc/gpon - the cortina-gpon driver is absent; GPON identity NOT set" err
 		return 1
 	}
 
 	mkdir -p "$mnt"
 	if mount -t ubifs -o ro ubi0:ubi_Config "$mnt" 2>/dev/null; then
-		mounted=1
 		sn=$(sed -n 's/.*Name="GPON_SN"[^V]*Value="\([^"]\{12\}\)".*/\1/p' \
 			"$mnt/config_hs.xml" 2>/dev/null | head -n1)
 		mac=$(sed -n 's/.*Name="ELAN_MAC_ADDR"[^V]*Value="\([0-9a-fA-F]\{12\}\)".*/\1/p' \
@@ -113,20 +79,12 @@ try_set() {
 	esac
 
 	if [ -z "$sn" ]; then
-		# THE RACE, kept apart from the genuine case: if the volume was
-		# not mounted, "no GPON_SN" is not a fact about this board yet.
-		# Taking the fallback here would latch a serial the OLT has never
-		# been given and stop looking for the real one.
-		[ "$mounted" = 1 ] || {
-			say "ubi0:ubi_Config not mountable yet - will retry for the factory serial number" err
-			return 1
-		}
 		[ "${#mac}" = "12" ] || \
 			mac=$(tr -d : < /sys/class/net/eth0/address 2>/dev/null)
 		if [ "${#mac}" = "12" ]; then
 			sn="XPON$(echo "${mac#????}" | tr 'a-f' 'A-F')"
 			src="MAC-derived FALLBACK - unique but NOT the factory serial number"
-			say "no GPON_SN in ubi0:ubi_Config config_hs.xml - using $sn ($src); the OLT will not have this serial provisioned" err always
+			say "no GPON_SN in ubi0:ubi_Config config_hs.xml - using $sn ($src); the OLT will not have this serial provisioned" err
 		else
 			say "no GPON_SN and no base MAC readable - leaving the driver to its own placeholder; this ONU has NO valid PON identity" err
 			return 1
@@ -134,40 +92,10 @@ try_set() {
 	fi
 
 	if echo "sn $sn" > /proc/gpon 2>/dev/null; then
-		say "GPON serial number $sn from $src" "" always
+		say "GPON serial number $sn from $src"
 	else
 		say "the driver REJECTED serial number '$sn' (see dmesg)" err
 		return 1
 	fi
-	return 0
-}
-
-start() {
-	local iv="$RETRY_FIRST"
-
-	try_set && return 0
-
-	# ★ NEVER GIVE UP. Everything above that returned non-zero is a state the
-	# box can grow out of on its own - a driver still probing, a UBI volume
-	# still attaching - so keep asking, at a growing and CAPPED interval, for
-	# as long as the unit is powered. Nothing else in the system would ever
-	# retry this, and the cost of not retrying is a subscriber with no WAN.
-	#
-	# Quiet inside the loop: the first attempt has already said what is wrong,
-	# and a message every RETRY_MAX seconds forever would bury the log. The
-	# line that matters - the serial number taking - speaks anyway ("always").
-	say "GPON identity not set yet - retrying every ${RETRY_FIRST}s up to ${RETRY_MAX}s, indefinitely" err
-	(
-		quiet=1
-		while :; do
-			sleep "$iv"
-			try_set && exit 0
-			iv=$((iv * 2))
-			[ "$iv" -gt "$RETRY_MAX" ] && iv="$RETRY_MAX"
-		done
-	) &
-
-	# The retry runs detached, so the boot is not held up by a board whose
-	# identity is late; procd/rc.common gets a clean start either way.
 	return 0
 }

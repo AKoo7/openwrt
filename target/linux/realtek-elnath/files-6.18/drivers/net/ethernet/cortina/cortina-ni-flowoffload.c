@@ -52,6 +52,7 @@
 #include <linux/ip.h>
 #include <linux/jiffies.h>
 #include <linux/mm.h>
+#include <linux/proc_fs.h>
 #include <linux/sched.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
@@ -1121,6 +1122,10 @@ static bool hw_l3_fwd = true;	/* ★ 2026-07-23 TEST-ONLY = true (revert to plai
 			 * the driver's US HW-forward (forge_inject + /proc install) is independent.
 			 * Validated offload-ON datapath: L3QM dest-port fix + mangle fix (PE_CFG
 			 * mtu_chk_en cleared -> 0x00105602); large ICMP 1472 + full SSH KEX pass. */
+static bool l3fe_dma32 = true;	/* ★fix#94: keep the L3FE carve below 4 GB (see cn_l3e probe) */
+module_param(l3fe_dma32, bool, 0444);
+MODULE_PARM_DESC(l3fe_dma32,
+		 "force a 32-bit coherent DMA mask for the L3FE carve so it lands below 4GB (default on; =0 to A/B the >4GB allocation that async-SErrors once the engine goes live)");
 module_param(hw_l3_fwd, bool, 0644);
 MODULE_PARM_DESC(hw_l3_fwd,
 	"enable HW L3-forwarding (default OFF - routed frame dies at the L2FE->L3FE handoff before the L3FE)");
@@ -1560,69 +1565,6 @@ static enum cn_pppoe_leg_verdict cn_pppoe_leg_check(bool pppoe_mode, bool ds_leg
 }
 
 /*
- * "is this device on the LAN side of the router?" - a bridge port, or the
- * bridge itself.  ONE spelling, used twice and mirrored: on the INGRESS device
- * to decide which leg a rule is, and on a US leg's EGRESS device to decide
- * whether its redirect really is the WAN.  This board's physical LAN ports are
- * VLAN uppers (eth0.2..eth0.5, one HW VLAN per RJ45) and answer yes.
- */
-static bool cn_dev_is_lan_side(const struct net_device *dev)
-{
-	return dev && (netif_is_any_bridge_port(dev) ||
-		       netif_is_bridge_master(dev));
-}
-
-/*
- * ★★ THE DISARM HALF OF GAP-3 - a PURE predicate (functional core: no MMIO, no
- * state), the exact mirror of the arm.
- *
- * The armed shadow (l3e->data_pppoe_session) is set LAZILY, by the first
- * offloaded US flow carrying a FLOW_ACTION_PPPOE_PUSH - nothing else arms it.
- * It used to be cleared by only three events: the WAN data path going away
- * (cortina_ni_gpon_data_path_set(gem_id = 0)), the hw_pppoe 1->0 edge, and the
- * manual `pppoe 0` control write.  NONE of them happens when the WAN is simply
- * reconfigured from PPPoE back to IPoE with the PON link left up - which is an
- * ordinary service change, not an exotic case.  The shadow then outlives its
- * session, cn_pppoe_leg_check() reads {no rule sid, a shadow} as NO_PUSH, and
- * EVERY upstream flow is refused for the rest of the boot.  Nothing breaks:
- * the WAN keeps working, on the CPU, which is why it survived so long.
- *
- * ★ MEASURED on this board, 2026-08-09, driving dhcp -> pppoe -> dhcp:
- * upstream 954.9 Mbps at 3.0 % CPU before the transition, 581.7 Mbps with one
- * core at 99.5 % after, 4 runs of 4.  The driver's own ledger on that boot read
- * `us_refused = 672` with `ds_refused = 0` and `unsupp = 672` - so the PPPoE US
- * gate accounted for the WHOLE unsupported-refusal count, to the unit.  The
- * downstream leg was never refused (cn_pppoe_leg_check returns OK for it), and
- * downstream indeed stayed accelerated: the collapse is upstream-only, which is
- * the second, independent prediction this mechanism makes.
- *
- * The disarm is therefore driven by the same evidence as the arm, and that
- * evidence is authoritative: nf_flow_table builds the US rule from the ACTUAL
- * forward path (pppoe_fill_forward_path), so a rule whose egress IS the WAN and
- * which carries no session id is the kernel stating that this WAN no longer has
- * one.  A live PPPoE WAN cannot produce that rule shape - if it could, the same
- * absent sid could never have armed the shadow in the first place.
- *
- * @ds_leg        the reply leg never carries a push, so it can say NOTHING
- *                about the WAN's encapsulation - only the US leg is evidence.
- * @egress_is_lan the redirect device is LAN-side, so this leg's egress is not
- *                the WAN and its lack of a session means nothing about it.
- * @rule_sid      the session THIS rule carries (its own PPPOE_PUSH, or the one
- *                resolved off a tagged WAN chain).  Non-zero = still PPPoE.
- * @armed_sid     the shadow.  Zero = there is nothing to disarm.
- *
- * ⚠ One deliberate consequence: an operator who armed the shadow by hand for a
- * manual install (`pppoe <sid>`) has it disarmed by the next auto US flow.  That
- * is the better of the two behaviours - the alternative is the manual arm
- * silently costing the whole box its upstream offload, which is this very bug.
- */
-static bool cn_pppoe_shadow_stale(bool ds_leg, bool egress_is_lan,
-				  u16 rule_sid, u16 armed_sid)
-{
-	return !ds_leg && !egress_is_lan && armed_sid && !rule_sid;
-}
-
-/*
  * ★★ GAP-2 INSTRUMENT - the DS PPPoE punt integrity check.
  *
  * The 2026-07-20 regression was observed as "DS frames of the offloaded 5-tuple
@@ -1667,7 +1609,7 @@ static bool cn_pppoe_shadow_stale(bool ds_leg, bool egress_is_lan,
 bool cortina_ni_pppoe_punt_check;
 module_param_named(pppoe_punt_check, cortina_ni_pppoe_punt_check, bool, 0644);
 MODULE_PARM_DESC(pppoe_punt_check,
-	"inspect every CPU-punted 0x8864 PPPoE session frame for self-consistency (PPPoE length vs inner IP total length, inner TCP data-offset sanity, session id) and report in debugfs .../cortina-l3fe/state under `pppoe_punt:` - the GAP-2 (DS-mangle) witness. Default OFF; run it with hw_pppoe=0 FIRST to establish the clean baseline");
+	"inspect every CPU-punted 0x8864 PPPoE session frame for self-consistency (PPPoE length vs inner IP total length, inner TCP data-offset sanity, session id) and report in /proc/cortina_l3fe pppoe_punt: - the GAP-2 (DS-mangle) witness. Default OFF; run it with hw_pppoe=0 FIRST to establish the clean baseline");
 
 static atomic_t cn_pppoe_punt_seen = ATOMIC_INIT(0);
 static atomic_t cn_pppoe_punt_ctrl = ATOMIC_INIT(0);
@@ -1954,22 +1896,14 @@ MODULE_PARM_DESC(hw_ds_deepq,
  * l3fe_rx during a download does NOT prove "the DS frame never entered the
  * L3FE" - only the per-direction age re-arm (ds_hits) plus the hw_ds_probe
  * ladder above can say that.  Printed raw AND as a delta since the previous
- * /proc read.
- *
- * ★★ THEY ARE NO LONGER READ HERE.  Both are READ-AND-CLEAR, and this file
- * readl()'d them while /proc/net/cortina_ni_rx readl()'d the same two - so
- * whichever was cat'ed first TOOK the count and the other printed a confident
- * zero.  Two files stealing from each other is the same defect as the two
- * lines of one file that were fixed on 2026-08-05, one scope wider, and
- * `ethtool -S` publishing them made it three.  They now come from the ONE
- * reader, cortina_ni_nihv_sample(), as cumulative totals.
- *
- * ⚠ AND THE DELTA WAS WRONG TOO, not merely fragile: the old line printed
- * `raw - prev_raw`, but with read-and-clear the RAW READ IS ALREADY THE DELTA,
- * so that was a delta of deltas and went NEGATIVE (printed as a huge unsigned)
- * whenever traffic slowed between two reads.  The snapshot below is of the
- * TOTAL, which makes the subtraction mean what the label says.
+ * /proc read, so their read-vs-clear semantics do not matter.
  */
+/* ⛔ THE TWO PRIVATE OFFSETS THAT USED TO BE HERE ARE GONE (fix#81 + the
+ * ethtool port).  0xa9bc is an unmapped HOLE on Taurus and 0xa9fc takes a
+ * synchronous external abort - reading this file panicked the board.  The
+ * values now come from cortina_ni_nihv_sample(), the ONE reader of the
+ * read-and-clear NI_HV block (see cortina-ni.h), at the Taurus-named offsets.
+ * ⚠ never readl 0xa9bc/0xa9fc/0xaa10/0xa9f4/0xa9f8 from anywhere. */
 static u64 cn_l3e_ni_rx_prev[2];
 
 /*
@@ -2345,8 +2279,7 @@ int cortina_ni_wan_pppoe_session_set(u16 session)
 	 * sid; never leave a live flow carrying a stale sid.  Cheap + rare;
 	 * the entry_by_idx scan avoids an rhashtable-walk use-after-free.
 	 * ★ Caller MUST hold cn_flow_offload_mutex.  All four in-tree callers do:
-	 * the debugfs "pppoe" control write (cortina_ni_l3fe_debug_write takes it),
-	 * cn_l3e_set_us_egress
+	 * the /proc "pppoe" write (cn_l3e_proc_write takes it), cn_l3e_set_us_egress
 	 * via cn_flow_replace, the WAN data-path teardown and the hw_pppoe 1->0 edge
 	 * (the last two take it around the call - both run in sleepable context). */
 	if (session != READ_ONCE(l3e->data_pppoe_session) &&
@@ -2387,12 +2320,7 @@ EXPORT_SYMBOL_GPL(cortina_ni_wan_pppoe_session_set);
  * behind, and a stale sid then refuses every later flow on this WAN (the
  * "shadow armed but the rule carries no push" branch in cn_flow_replace) -
  * i.e. a PPPoE experiment silently cost the IPoE path its HW offload until the
- * next reboot.  ★ That is the SAME defect cn_pppoe_shadow_stale() now covers in
- * general - a plain PPPoE->IPoE WAN change, with the mode left ON, went the
- * whole boot on the CPU - so this edge is no longer the only rescue; it stays
- * because turning the mode off must take its HW state with it immediately,
- * rather than waiting for the next offered flow.  Turning it ON arms nothing:
- * the L3-IF entry is programmed
+ * next reboot.  Turning it ON arms nothing: the L3-IF entry is programmed
  * lazily from the first offered flow's live sid, so no HW state can be armed
  * against a session that does not exist.
  */
@@ -4151,7 +4079,8 @@ static int cn_flow_replace(struct flow_cls_offload *f, struct net_device *dev)
 		flow_rule_match_meta(rule, &m);
 		idev = dev_get_by_index(dev_net(dev), m.key->ingress_ifindex);
 		if (idev) {
-			lan_ingress = cn_dev_is_lan_side(idev);
+			lan_ingress = netif_is_any_bridge_port(idev) ||
+				      netif_is_bridge_master(idev);
 			/* ★ The DS leg's WAN side is its INGRESS device, so this
 			 * is the only point where the DS half of the VLAN-WAN
 			 * refusal can be decided - and it is decided HERE, while
@@ -4444,32 +4373,8 @@ static int cn_flow_replace(struct flow_cls_offload *f, struct net_device *dev)
 	 * cn_l3e_set_us_egress never falls back to it, so a stale sid can cost HW
 	 * offload but can never put a wrong header on the wire (GAP-3).  The
 	 * shadow is cleared on WAN data-path teardown, on the hw_pppoe 1->0 edge,
-	 * by `echo 'pppoe 0' > /proc/cortina_l3fe`, and - since the shadow must
-	 * not depend on any of those happening - by the disarm directly below.
+	 * and by `echo 'pppoe 0' > /proc/cortina_l3fe`.
 	 */
-	/*
-	 * ★ DISARM a shadow whose session this WAN no longer has, BEFORE the gate
-	 * reads it.  See cn_pppoe_shadow_stale() for the mechanism and for the
-	 * board measurement that pinned it (a PPPoE->IPoE WAN change with the PON
-	 * link up left every upstream flow refused for the rest of the boot).
-	 *
-	 * Cost: at most ONE call per transition - the next rule sees a zero shadow
-	 * and the predicate is false - so the steady state is a single predicate
-	 * evaluation per offered flow.  Runs under cn_flow_offload_mutex like every
-	 * other caller of cortina_ni_wan_pppoe_session_set(), which also clears the
-	 * HW L3-IF word and flushes the flows still pointing at it, so no installed
-	 * entry is left referring to an encapsulation the WAN has stopped using.
-	 * The flush cannot touch THIS flow (not installed yet) nor its reply leg
-	 * (nf_flow_table offers ORIGINAL before REPLY), and this flow then passes
-	 * the gate as plain IPoE - so the transition costs no flow at all.
-	 */
-	if (cn_pppoe_shadow_stale(ds_leg, cn_dev_is_lan_side(odev), pppoe_sid,
-				  READ_ONCE(cn_l3e->data_pppoe_session))) {
-		pr_info("cortina-l3fe: WAN egress %s offers no PPPoE session while %#x is armed - the session is gone, disarming (a stale shadow refuses every upstream flow)\n",
-			netdev_name(odev),
-			READ_ONCE(cn_l3e->data_pppoe_session));
-		cortina_ni_wan_pppoe_session_set(0);
-	}
 	/* ★ On a tagged PPPoE WAN the SHADOW is not armed - nothing arms it,
 	 * because the arming path is cn_l3e_set_us_egress() and no rule carried a
 	 * sid.  The chain-resolved session stands in as the ARMED value (never as
@@ -5623,66 +5528,7 @@ static u32 cn_l3e_proc_parse_ip(const char *s)
 	return 0;
 }
 
-/*
- * The offload engine's countable quantities, for `ethtool -S` - see the
- * declaration in cortina-ni.h for what this may and may not do.
- *
- * Lock-free on purpose.  Every value is an atomic_t or a u32 the aarch64 CPU
- * cannot tear, so each one is individually correct; what the caller does NOT
- * get is a mutually consistent instant across all of them, which no statistics
- * interface promises and which is not worth blocking on the offload mutex for
- * (that mutex is held across the whole /proc read, including hardware sweeps).
- *
- * ⚠ It runs NO age sweep.  /proc/cortina_l3fe deliberately does, because a
- * single `cat` during traffic then becomes a hit witness - but that sweep
- * CONSUMES the engine's per-entry age re-arms, so a second consumer would
- * steal hits from the 5 s sweep the way a second reader steals a
- * read-and-clear count.  hw/us/ds hits here are therefore the totals the sweep
- * has accumulated, which is exactly what a monotonic statistic should be.
- *
- * The counters that are GAUGES (currently-resident entries, not events) are
- * named _resident so nobody differences them into a rate.
- */
-void cortina_ni_flowoffload_stats(u64 out[CA_L3FE_STAT_COUNT])
-{
-	struct cn_l3e *l3e = cn_l3e;
-
-	out[CA_L3FE_FLOWS_RESIDENT]	= atomic_read(&cn_flow_installed);
-	out[CA_L3FE_DS_FLOWS_RESIDENT]	= atomic_read(&cn_ds_installed);
-	out[CA_L3FE_HW_HITS]		= atomic_read(&cn_l3e_hw_hits);
-	out[CA_L3FE_US_HITS]		= atomic_read(&cn_l3e_us_hits);
-	out[CA_L3FE_DS_HITS]		= atomic_read(&cn_l3e_ds_hits);
-	out[CA_L3FE_HITS_UNATTRIBUTED]	= atomic_read(&cn_l3e_hits_unattr);
-	out[CA_L3FE_PPPOE_US_HITS]	= atomic_read(&cn_pppoe_us_hits);
-	out[CA_L3FE_PPPOE_DS_HITS]	= atomic_read(&cn_pppoe_ds_hits);
-	out[CA_L3FE_FLOWS_REFUSED]	= atomic_read(&cn_flow_refused);
-	out[CA_L3FE_REFUSED_UNSUPPORTED] = atomic_read(&cn_flow_refused_unsupp);
-	out[CA_L3FE_REFUSED_TABLE_FULL]	= atomic_read(&cn_flow_refused_full);
-	out[CA_L3FE_REFUSED_DUPLICATE]	= atomic_read(&cn_flow_refused_dup);
-	out[CA_L3FE_REFUSED_ERROR]	= atomic_read(&cn_flow_refused_err);
-	out[CA_L3FE_VLAN_WAN_REFUSED_US] = atomic_read(&cn_vlan_wan_refused_us);
-	out[CA_L3FE_VLAN_WAN_REFUSED_DS] = atomic_read(&cn_vlan_wan_refused_ds);
-	out[CA_L3FE_VLAN_PPPOE_PROGRAMMED] = atomic_read(&cn_vlan_pppoe_ok);
-	out[CA_L3FE_VLAN_PPPOE_READBACK_FAIL] =
-					atomic_read(&cn_vlan_pppoe_readback);
-	/* the DMA-AFT ledger lives in the engine instance; the refusal counters
-	 * above do not, and are counted even when the engine never armed - so
-	 * only these two are gated on it */
-	out[CA_L3FE_VLAN_PUSH_LEGS]	= l3e ? l3e->aft_push : 0;
-	out[CA_L3FE_VLAN_STRIP_LEGS]	= l3e ? l3e->aft_strip : 0;
-}
-
-/*
- * The offload engine's own narrative.  debugfs .../cortina-l3fe/state, was
- * /proc/cortina_l3fe.  Every COUNTER it printed (hits, refusals, the VLAN/PPPoE
- * programming tallies, the resident-flow gauge) is an `ethtool -S` row now, so
- * the half a test reads is on an interface stock's kernel serves too.  What is
- * left is the FIB read-back with its READ-BACK FAILED rows, the armed
- * descriptor latch, the per-stage ledgers and the engine's own verdicts - our
- * engine's internals, for which stock has no counterpart under any name.
- * NON-COMPARATIVE by construction, and no test may read it.
- */
-int cortina_ni_l3fe_debug_show(struct seq_file *m, void *v)
+static int cn_l3e_proc_show(struct seq_file *m, void *v)
 {
 	struct cn_l3e *l3e = cn_l3e;
 	unsigned long flags;
@@ -5881,16 +5727,11 @@ int cortina_ni_l3fe_debug_show(struct seq_file *m, void *v)
 		   "★ DS OFFLOAD CANNOT WORK: set cortina_gpon.hw_l3_ds=1 (needs cortina_ni.hw_l3_fwd=1 too)" :
 		   "stage-A precondition satisfied");
 	{
-		u64 nihv[CA_NI_NIHV_CNT_COUNT];
-		u64 l3fe_rx, l3qm_rx;
-
-		/* the ONE reader; never readl() 0xa9bc/0xa9fc from here */
-		cortina_ni_nihv_sample(l3e->ni, nihv);
-		l3fe_rx = nihv[CA_NI_NIHV_L3FE_RX];
-		l3qm_rx = nihv[CA_NI_NIHV_L3QM_RX];
+		u32 l3fe_rx = readl(l3e->ne_base + CN_L3E_NI_L3FE_RX_PKT_CNT);
+		u32 l3qm_rx = readl(l3e->ne_base + CN_L3E_NI_L3QM_RX_PKT_CNT);
 
 		seq_printf(m,
-			   "ni_hv: l3fe_rx(0xa9bc)=%llu delta=%llu l3qm_rx(0xa9fc)=%llu delta=%llu  [cumulative total since boot; delta = since the previous read of THIS file]\n",
+			   "ni_hv: l3fe_rx(0xa9bc)=%u delta=%u l3qm_rx(0xa9fc)=%u delta=%u  [delta = since the previous read of THIS file]\n",
 			   l3fe_rx, l3fe_rx - cn_l3e_ni_rx_prev[0],
 			   l3qm_rx, l3qm_rx - cn_l3e_ni_rx_prev[1]);
 		seq_puts(m,
@@ -6252,14 +6093,13 @@ int cortina_ni_l3fe_debug_show(struct seq_file *m, void *v)
 	return 0;
 }
 
-/*
- * The engine's WRITE side: manual flow install/delete, the descriptor latch,
- * the PPPoE session shadow.  A bring-up CONTROL, not a measurement - `ethtool`
- * is read-only and stock has no counterpart by construction, so debugfs is
- * where it belongs and a stock-vs-ours verdict may never be derived through it.
- */
-ssize_t cortina_ni_l3fe_debug_write(struct file *file, const char __user *ubuf,
-				    size_t len, loff_t *ppos)
+static int cn_l3e_proc_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, cn_l3e_proc_show, NULL);
+}
+
+static ssize_t cn_l3e_proc_write(struct file *file, const char __user *ubuf,
+				 size_t len, loff_t *ppos)
 {
 	struct cn_l3e *l3e = cn_l3e;
 	char buf[160], cmd[16] = {};
@@ -6494,6 +6334,13 @@ out:
 	return err ? err : len;
 }
 
+static const struct proc_ops cn_l3e_proc_ops = {
+	.proc_open	= cn_l3e_proc_open,
+	.proc_read	= seq_read,
+	.proc_lseek	= seq_lseek,
+	.proc_release	= single_release,
+	.proc_write	= cn_l3e_proc_write,
+};
 
 /* ------------------------------------------------------------------ */
 /* probe entry (called once from the cortina-ni platform probe).  Any  */
@@ -6514,7 +6361,6 @@ int cortina_ni_flowoffload_probe(struct cortina_ni *ni)
 	if (!l3e)
 		return -ENOMEM;
 	l3e->dev = ni->dev;
-	l3e->ni = ni;
 	l3e->ne_base = ne;
 	/* the DMA window is already mapped for the TX ring; the DMA-AFT VLAN
 	 * edit tables live in the same 4K page, so there is nothing to map. */
@@ -6534,10 +6380,40 @@ int cortina_ni_flowoffload_probe(struct cortina_ni *ni)
 
 	/* one coherent carve: key table then FIB (stock places the FIB at
 	 * key base + 0x40000 the same way) */
+	/*
+	 * ★ fix#94 (2026-08-11).  fix#93 proved the arm sequence is NOT the fault: ALL NINE
+	 * stages of cortina_l3fe_engine_init() complete ("stage 9 ENTER: ARM COMPLETE - no
+	 * stage faulted") and the SError arrives 6 ms LATER and ON A DIFFERENT CPU (CPU1,
+	 * while the arm ran on CPU0).  A fault on another core is not a bad store by this
+	 * thread - it is the ENGINE, now live, issuing AXI transactions that fault.  The only
+	 * thing the engine touches once armed is this carve.
+	 *
+	 * The vendor driver does NOT use generic coherent DMA for NE structures: it carries a
+	 * dedicated non-cached DDR base (Track A boot: ca_ne_reg_init:
+	 * ca_ne_ddr_noncache_phy_base=0x109000000), and this tree already records that
+	 * fbm_enable "DMA'd into a non-reserved region and trashed the slab".  So the carve's
+	 * PHYSICAL address is the prime suspect - and it has never been printed before the
+	 * arm, only after, where the panic guarantees we never see it.
+	 *
+	 * Print it FIRST (pr_emerg - dmesg -n 1 in every harness eats dev_info), then offer
+	 * the one-line hypothesis test: force the coherent mask to 32 bits so the carve lands
+	 * below 4 GB.  DRAM on this SoC starts at 0x1_0000_0000, so an unconstrained
+	 * allocation is >4 GB and the L3FE base regs only carry [39:32] in MH1/MA1's low byte;
+	 * if the engine's AXI master is narrower than that, every access it makes faults
+	 * exactly like this.  A/B with cortina_ni.l3fe_dma32=0.
+	 */
+	if (l3fe_dma32) {
+		int mret = dma_set_coherent_mask(ni->dev, DMA_BIT_MASK(32));
+
+		pr_emerg("l3fe-carve: dma_set_coherent_mask(32) -> %d\n", mret);
+	}
 	l3e->carve = dma_alloc_coherent(ni->dev, CN_L3E_CARVE_BYTES,
 					&l3e->carve_pa, GFP_KERNEL);
 	if (!l3e->carve)
 		return -ENOMEM;
+	pr_emerg("l3fe-carve: %u bytes at pa=0x%llx va=%p (dma32=%d) - the ONLY memory the armed engine touches\n",
+		 (unsigned int)CN_L3E_CARVE_BYTES, (unsigned long long)l3e->carve_pa,
+		 l3e->carve, l3fe_dma32);
 	l3e->key_tbl = l3e->carve;
 	l3e->key_tbl_pa = l3e->carve_pa;
 	l3e->fib_tbl = l3e->carve + CN_L3E_KEY_TBL_BYTES;
@@ -6564,8 +6440,8 @@ int cortina_ni_flowoffload_probe(struct cortina_ni *ni)
 		goto err_free_carve;
 	}
 
-	/* the state dump + the manual-install control are published from
-	 * cortina_ni_debugfs_init(), which runs at the end of probe */
+	/* P3 manual-install / HW-HIT proof (coherent carve write) */
+	proc_create_data("cortina_l3fe", 0644, NULL, &cn_l3e_proc_ops, NULL);
 
 	/* phase-1 gate evidence: read back everything the arm wrote */
 	dev_info(ni->dev,

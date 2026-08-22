@@ -1,0 +1,72 @@
+#!/bin/sh /etc/rc.common
+# omci_stock -- persistent procd service: run the STOCK Zyxel omci_app in a
+# native aarch64 chroot, bridged to the M2 in-kernel cortina-omci-bridge.
+#
+# DISABLED by default (UCI): the Airtel line is a pre-OMCI serial-number gate
+# (zero DS OMCI) so the daemon has nothing to serve there.  Enable it for a
+# Create-model / auditing OLT (DigiWorld-class) repoint experiment.
+USE_PROCD=1
+START=95
+STOP=10
+EXTRA_COMMANDS="uninstall"
+EXTRA_HELP="	uninstall	Stop, safely unmount the chroot, and remove /opt/omci_m3 + service files"
+
+OMCI_ROOT=/opt/omci_m3
+
+start_service() {
+	config_load omci_stock
+	local enabled serial devtype dbg
+	config_get_bool enabled settings enabled 0
+	config_get serial  settings serial  XPONxxxxxxxx
+	config_get devtype settings devtype bridge
+	config_get dbg     settings dbg     info
+
+	[ "$enabled" = "1" ] || {
+		echo "omci_stock: disabled (uci set omci_stock.settings.enabled=1 && /etc/init.d/omci_stock restart)"
+		return 0
+	}
+	[ -x "$OMCI_ROOT/omci_chroot/bin/omci_app" ] || {
+		echo "omci_stock: chroot not installed at $OMCI_ROOT (run install_m3.sh)"
+		return 1
+	}
+
+	procd_open_instance
+	procd_set_param command /bin/sh "$OMCI_ROOT/omci_svc.sh" "$serial"
+	procd_set_param env \
+		OMCI_CHROOT="$OMCI_ROOT/omci_chroot" \
+		OMCI_DEVTYPE="$devtype" OMCI_DBG="$dbg" OMCI_ARM=1
+	procd_set_param respawn 3600 10 0
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}
+
+stop_service() {
+	[ -x "$OMCI_ROOT/omci_stop.sh" ] && \
+		OMCI_CHROOT="$OMCI_ROOT/omci_chroot" /bin/sh "$OMCI_ROOT/omci_stop.sh"
+}
+
+service_triggers() {
+	procd_add_reload_trigger omci_stock
+}
+
+# Safe removal: stop, force-kill a stuck daemon, unmount, and HARD-ABORT if any
+# chroot bind-mount survives (rm -rf into the bound real /dev would unlink
+# /dev/null,/dev/console,... and break the live router).
+uninstall() {
+	local m croot="$OMCI_ROOT/omci_chroot"
+	stop
+	killall -9 omci_app 2>/dev/null
+	for m in proc dev sys; do umount "$croot/$m" 2>/dev/null; done
+	for m in proc dev sys; do
+		if mountpoint -q "$croot/$m" 2>/dev/null; then
+			echo "omci_stock: $croot/$m still mounted (a process holds the chroot) -- aborting, nothing removed"
+			return 1
+		fi
+	done
+	disable
+	rm -rf "$OMCI_ROOT"
+	rm -f /etc/init.d/omci_stock /etc/config/omci_stock
+	sync
+	echo "omci_stock: uninstalled"
+}

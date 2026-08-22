@@ -23,8 +23,9 @@ ccflags-y += -I$(srctree)/drivers/net/gpon
 
 obj-$(CONFIG_GEMINI_ETHERNET) += gemini.o
 obj-$(CONFIG_CORTINA_NI) += cortina_ni.o
-cortina_ni-y := cortina-ni.o cortina-ni-tx.o cortina-ni-rx.o cortina-ni-ethtool.o \
-	cortina-ni-leds.o
+cortina_ni-y := cortina-ni.o cortina-ni-tx.o cortina-ni-rx.o cortina-ni-ethtool.o
+# DSA (lan1..lan4): the switch driver half; the tagger is net/dsa/tag_cortina.o
+cortina_ni-$(CONFIG_CORTINA_NI_DSA) += cortina-ni-dsa.o
 # L3FE main-hash flow engine (nf_flow_table HW offload backend)
 cortina_ni-$(CONFIG_CORTINA_NI_FLOWOFFLOAD) += cortina-ni-flowoffload.o \
 	cortina-l3fe.o cortina-l3fe-aging.o
@@ -39,3 +40,8 @@ obj-$(CONFIG_CORTINA_GPON) += cortina_gpon.o
 # move changed no byte, and what stayed behind are documented at the include in
 # cortina-gpon.c.
 cortina_gpon-y := cortina-gpon.o cortina-gpon-bosa.o cortina-i2c.o
+# M2 userspace-daemon bridge: netlink OMCI plane + nf_sockopt control plane +
+# /proc/omci/devMode, so the stock Zyxel omci_app can run in a chroot and drive
+# the real provisioned MIB.  Selects nothing at runtime unless
+# cortina_gpon.omci_userspace=1.
+cortina_gpon-$(CONFIG_CORTINA_GPON_OMCI_BRIDGE) += cortina-omci-bridge.o

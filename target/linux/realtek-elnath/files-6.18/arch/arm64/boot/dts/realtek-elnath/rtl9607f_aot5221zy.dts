@@ -1,0 +1,672 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+/*
+ * Zyxel AOT5221ZY — Realtek RTL9607F "Elnath" GPON ONU.
+ *
+ * The RTL9607F is a Cortina-Access "Venus"-family SoC (dual Cortex-A55,
+ * GICv3) that Realtek productized after acquiring Cortina Access. This is a
+ * minimal M1 device tree: enough to reach a serial console + initramfs shell
+ * when the image is TFTP'd into RAM and booted by the vendor U-Boot. The
+ * switch/GPON/WiFi nodes are added as their clean-room drivers land.
+ *
+ * Hardware facts (base MMIO 0xf43xxxxx; GIC lives above 4 GB at 0x4_f80xxxxx):
+ *   - 2x Cortex-A55 @ up to 1.2 GHz, PSCI (SMC) secondary bring-up
+ *   - DDR3, 512 MiB at physical 0x0
+ *   - Console = Cortina custom-register UART at 0xf43291b0, GIC SPI 4,
+ *     clocked by an always-on 125 MHz fixed clock (no PLL driver needed)
+ */
+
+/dts-v1/;
+
+/ {
+	model = "Zyxel AOT5221ZY (Realtek RTL9607F Elnath)";
+	compatible = "zyxel,aot5221zy", "realtek,rtl9607f";
+	#address-cells = <0x02>;
+	#size-cells = <0x02>;
+	interrupt-parent = <&gic>;
+
+	aliases {
+		serial0 = &uart0;
+	};
+
+	chosen {
+		stdout-path = "serial0:115200n8";
+		/* ubi.mtd: auto-attach the stock NAND UBI (READ-ONLY - every
+		 * partition below carries read-only, so UBI attaches in ro
+		 * mode) so early boot can read the per-board factory
+		 * provisioning (ubi_Config/config_hs.xml: ELAN_MAC_ADDR,
+		 * GPON_SN).  We still run from the RAM initramfs. */
+		bootargs = "earlycon=serial,0xf43291b0 console=ttyS0,115200";
+	};
+
+	memory@0 {
+		device_type = "memory";
+		/* 512 MiB at 0x0 */
+		reg = <0x00 0x00 0x00 0x20000000>;
+	};
+
+	/*
+	 * The Cortina NI packet engine's two DMA pools live inside our DRAM and
+	 * must be carved out: a small coherent descriptor buffer and the large
+	 * non-cached packet-buffer pool. Both are below the TFTP load addr
+	 * (0x05000000) region we boot from, so no collision.
+	 */
+	reserved-memory {
+		#address-cells = <0x02>;
+		#size-cells = <0x02>;
+		ranges;
+
+		/* ★★ build79: no-map so the CPU-EPP ring region is carved OUT of the RAM
+		 * linear map -> memremap(MEMREMAP_WC) SUCCEEDS on it (build78's WC was
+		 * REJECTED because a mapped System-RAM region can't be remapped WC).  The
+		 * NE DMA is non-coherent, so the ring MUST be uncached; WC on a no-map
+		 * carveout gives an uncached CPU view without touching NAPI/dma_sync. */
+		ddr_cache_buffer: buf@bc48000 {
+			no-map;
+			reg = <0x00 0x0bc48000 0x00 0x60000>;
+		};
+
+		ddr_noncache_buffer: buf@9000000 {
+			no-map;
+			reg = <0x00 0x09000000 0x00 0x1a50000>;
+		};
+	};
+
+	psci {
+		compatible = "arm,psci-0.2";
+		method = "smc";
+	};
+
+	cpus {
+		#address-cells = <0x02>;
+		#size-cells = <0x00>;
+
+		cpu0: cpu@0 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a55";
+			reg = <0x00 0x00>;
+			enable-method = "psci";
+		};
+
+		cpu1: cpu@100 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a55";
+			reg = <0x00 0x100>;
+			enable-method = "psci";
+		};
+	};
+
+	timer {
+		compatible = "arm,armv8-timer";
+		/* secure, non-secure, virtual, hypervisor PPIs (13/14/11/10) */
+		interrupts = <0x01 0x0d 0xff08>,
+			     <0x01 0x0e 0xff08>,
+			     <0x01 0x0b 0xff08>,
+			     <0x01 0x0a 0xff08>;
+	};
+
+	gic: interrupt-controller@4f8000000 {
+		compatible = "arm,gic-v3";
+		#interrupt-cells = <0x03>;
+		#redistributor-regions = <0x01>;
+		interrupt-controller;
+		/* GICD @ 0x4_f8000000 (64 KiB), GICR @ 0x4_f8040000 (512 KiB) */
+		reg = <0x04 0xf8000000 0x00 0x10000>,
+		      <0x04 0xf8040000 0x00 0x80000>;
+		interrupts = <0x01 0x09 0x04>;
+	};
+
+	uart_clk: uart-clk {
+		compatible = "fixed-clock";
+		#clock-cells = <0x00>;
+		clock-frequency = <125000000>;	/* 125 MHz APB */
+	};
+
+	uart0: serial@f43291b0 {	/* ★ AOT5221ZY: console UART is at ...1b0, NOT the X400AXF's ...1c0 */
+		compatible = "cortina,serial";
+		reg = <0x00 0xf43291b0 0x00 0x30>;
+		interrupts = <0x00 0x04 0x04>;	/* GIC SPI 4, level-high */
+		clocks = <&uart_clk>;
+		clock-frequency = <125000000>;
+		status = "okay";
+	};
+
+	/*
+	 * Cortina NI (network engine) — the RTL9607F Ethernet packet engine.
+	 * 22 register windows read BY POSITIONAL INDEX (null placeholder slots
+	 * keep their position). resets=/pinctrl-0/nvmem-cells are deliberately
+	 * OMITTED for M2: the bootloader already de-asserted/muxed the NI (it
+	 * TFTPs through it), so of_*_get soft-fails and the driver continues.
+	 */
+	ethernet@f4300000 {
+		compatible = "cortina,ni-interface";
+		/* ★ 2026-08-07 AOT5221ZY: ne-intr and mdio use THIS BOARD's addresses, taken
+		 * from its on-device production DTB (via the shipping 6.6 DTS), not the
+		 * X400AXF's: ne-intr 0xf4320164 (not ...194) and mdio 0x00 0xf4329118
+		 * (not 0x04 0xf4329128 - note also the different address-space cell). */
+		reg = <0x04 0xf4300000 0x00 0x10000  0x04 0xf4320164 0x00 0x10
+		       0x00 0xf4329118 0x00 0x48     0x00 0xf4500000 0x00 0x2000
+		       0x04 0xf7001000 0x00 0x1000   0x00 0x80000000 0x00 0x2c000
+		/* ★ 2026-08-07 AOT5221ZY: buffer-pool sizes from THIS board's production DTB
+		 * (0x60000 and 0x1a50000), not the X400AXF's (0x20000 / 0x1628800). Undersized
+		 * pools let the NE bus masters DMA past the reserved carveouts once ne-reset
+		 * releases them - which is what "Asynchronous SError Interrupt on CPU1" (an
+		 * IDLE cpu, i.e. a bus-master fault, not a CPU access) ~105ms after ne-reset is. */
+		       0x00 0x0bc48000 0x00 0x60000  0x01 0x09000000 0x00 0x1a50000
+		       0x04 0xf5500000 0x00 0xc000   0x04 0xf4320000 0x00 0x300
+		       0x04 0xf432d000 0x00 0x20b8   0x04 0xf4600000 0x00 0x100000
+		       0x04 0x00 0x00 0x00           0x04 0xf4330000 0x00 0x10000
+		       0x04 0xd000 0x00 0x00         0x04 0xf4700000 0x00 0x100
+		       0x00 0x90301000 0x00 0x2000   0x04 0x00 0x00 0x00
+		       0x00 0x90300800 0x00 0xb8     0x00 0x90300900 0x00 0x10
+		       0x00 0x90300a00 0x00 0xec     0x00 0x90300b00 0x00 0x3c4>;
+		interrupt-parent = <&gic>;
+		interrupts = <0x00 0x54 0x04>, <0x00 0x55 0x04>, <0x00 0x56 0x04>, <0x00 0x57 0x04>,
+			     <0x00 0x58 0x04>, <0x00 0x59 0x04>, <0x00 0x5a 0x04>, <0x00 0x5b 0x04>,
+			     <0x00 0x4c 0x04>, <0x00 0x4d 0x04>, <0x00 0x4e 0x04>, <0x00 0x4f 0x04>,
+			     <0x00 0x48 0x04>, <0x00 0x49 0x04>, <0x00 0x4a 0x04>, <0x00 0x4b 0x04>;
+		memory-region = <&ddr_cache_buffer>, <&ddr_noncache_buffer>;
+		/* ★★ 2026-07-15: NO dma-coherent - the NE runs FULLY NON-COHERENT on our
+		 * kernel.  The ACE/coherent fabric path does not work here even though it
+		 * does on stock: the CPU-EPP descriptor writeback with the stock coherent
+		 * attr 0x12008060 raised QM_INT_SRC bit30 (axim_cpuepp_resp_error) per frame
+		 * and never reached DRAM, and the DMA-LSO ACE descriptor fetch (usr_pat
+		 * ace_cmd) never completed (TXQ rptr pinned 0).  Every DMA path is therefore
+		 * explicitly non-coherent now: RX ring + RX pool are memremap-WC with the
+		 * non-coherent QM AXI attrs, and the TX rings/buffers rely on the DMA API's
+		 * cache maintenance - which dma-coherent would silently DISABLE (it makes
+		 * dma_alloc_coherent return cached memory and dma_map_single skip the cache
+		 * clean).  (The old build51 note claimed dma-coherent made the coherent
+		 * writeback work; live 0x611c bit30 + poison descriptors disproved that.) */
+
+		/* The CPU-side MAC = the DSA conduit ("eth0").  The driver sets
+		 * this netdev's of_node to this child (matched by name "ethernet")
+		 * so port@4's `ethernet = <&conduit>` resolves to it.  No unit
+		 * address: it has no reg, and DSA/of_get_child_by_name match on
+		 * the node name, not a reg. */
+		conduit: ethernet {
+			local-mac-address = [00 00 00 00 00 00];
+		};
+
+		/* ★DSA (lan1..lan4): the four RJ45 jacks as DSA user ports plus
+		 * the CPU/conduit port.  dp->index == RX HEADER_A.lspid == TX
+		 * DESC1_DEST (identity for LAN NI ports), so port@N == jack N.
+		 * fixed-link 1G/full for M1: the GPHYs are already brought up in
+		 * the driver (fix#141); real per-port phylink over the GPHYs
+		 * (carrier/speed, restoring the phy@1..4 mdio children below) is
+		 * M2. */
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				label = "lan1";
+				phy-mode = "internal";
+				fixed-link { speed = <1000>; full-duplex; };
+			};
+			port@1 {
+				reg = <1>;
+				label = "lan2";
+				phy-mode = "internal";
+				fixed-link { speed = <1000>; full-duplex; };
+			};
+			port@2 {
+				reg = <2>;
+				label = "lan3";
+				phy-mode = "internal";
+				fixed-link { speed = <1000>; full-duplex; };
+			};
+			port@3 {
+				reg = <3>;
+				label = "lan4";
+				phy-mode = "internal";
+				fixed-link { speed = <1000>; full-duplex; };
+			};
+
+			port@4 {
+				reg = <4>;
+				ethernet = <&conduit>;
+				phy-mode = "internal";
+				fixed-link { speed = <1000>; full-duplex; };
+			};
+		};
+
+		/* ★ 2026-08-07 AOT5221ZY: the mdio child node (phy@1..phy@4) is REMOVED.
+		 * devm_of_mdiobus_register() scans those PHYs right after the GPHY wrapper
+		 * enable, and that scan raises 'Asynchronous SError Interrupt' (0xbe000011)
+		 * on this board - its PHYs report id 0x001ccac4 where the X400AXF expects
+		 * 0x001ccac5, so the reference's MDIO/GPHY access pattern is not valid here.
+		 * The shipping 6.6 DTS for this board (transcribed from its production DTB)
+		 * declares NO mdio node either, and its NI comes up. GPON does not need the
+		 * LAN PHYs; restore this once the GPHY sequence is ported for this revision. */
+	};
+
+	/*
+	 * Cortina-Access QSPI flash controller -> the boot SPI-NAND (Fudan
+	 * FM25S01A, 128 MiB / 128 KiB blocks / 2 KiB pages, in the mainline
+	 * SPI-NAND table).  Layout mirrors the stock mtdparts (live-verified
+	 * on stock: "ca_spinand_flash:2048K(boot),256K@0x280000(env),
+	 * 256K@0x2C0000(env2),256K@0x300000(static_conf),
+	 * 251648K@0x340000(ubi_device)"; the last one truncates to the
+	 * 128 MiB device end = 0x7cc0000).  The 0x200000-0x280000 gap is the
+	 * vendor bad-block-list area - deliberately unmapped.
+	 *
+	 * ★ EVERY partition is read-only: this OpenWrt runs from RAM and must
+	 * NEVER write the NAND (stock firmware + per-board factory data live
+	 * there).  The read-only flags also force the UBI attach (bootargs
+	 * ubi.mtd=ubi_device) into ro mode.  ubi_Config/config_hs.xml is the
+	 * per-board provisioning source, read at boot from userspace: the base
+	 * MAC (ELAN_MAC_ADDR) by the 05_factory_mac uci-defaults script, and the
+	 * GPON serial number (GPON_SN) by /etc/init.d/gpon-identity, which pushes
+	 * it into the GPON driver (cortina-gpon holds ranging off until it has it).
+	 */
+	spi@f4324000 {
+		compatible = "cortina,ca-qspi";
+		reg = <0x04 0xf4324000 0x00 0x50>;
+		reg-names = "qspi-base";
+		#address-cells = <0x01>;
+		#size-cells = <0x00>;
+		spi-tx-bus-width = <0x01>;
+		spi-rx-bus-width = <0x01>;
+
+		nand@0 {
+			compatible = "spi-nand";
+			reg = <0x00>;
+
+			partitions {
+				compatible = "fixed-partitions";
+				#address-cells = <0x01>;
+				#size-cells = <0x01>;
+
+				partition@0 {
+					label = "boot";
+					reg = <0x0 0x200000>;
+					read-only;
+				};
+				partition@280000 {
+					label = "env";
+					reg = <0x280000 0x40000>;
+					read-only;
+				};
+				partition@2c0000 {
+					label = "env2";
+					reg = <0x2c0000 0x40000>;
+					read-only;
+				};
+				partition@300000 {
+					label = "static_conf";
+					reg = <0x300000 0x40000>;
+					read-only;
+				};
+				partition@340000 {
+					label = "ubi_device";
+					reg = <0x340000 0x7cc0000>;
+					read-only;
+				};
+			};
+		};
+	};
+
+	/*
+	 * Cortina GPON MAC (CA8277C class) — PON register window 0x4_F5500000,
+	 * 48 KiB; the GPON MAC block sits at window + 0x6000.  Validated on real
+	 * hardware: the vendor-id register reads ASCII "XPON" (the ONU serial
+	 * number prefix).  The same window is also listed positionally in the
+	 * cortina,ni-interface node; the gpon driver ioremaps it non-exclusively.
+	 */
+	gpon@f5500000 {
+		compatible = "realtek,rtl9607f-gpon";
+		reg = <0x04 0xf5500000 0x00 0xc000>;
+		/*
+		 * The GPON MAC has no dedicated GIC SPI: its int_top feeds
+		 * GLOBAL_PON_INTERRUPT_0 (GLB+0x180, PON_MACi bit0), which is
+		 * line 5 of the NE global sub-controller ne_ictl@0xf4320194
+		 * (cortina,per-ictl: +0 STATUS/+4 ENABLE), whose output is
+		 * GIC SPI 1 (stock DTB: ne_ictl interrupts = <0 1 4>, child
+		 * pon_ictl@0 interrupts = <5>).  We carry no per-ictl irqchip,
+		 * so the gpon driver takes GIC SPI 1 directly (IRQF_SHARED)
+		 * and manages the PON_MACe / ne_ictl-line-5 gates itself.
+		 */
+		interrupts = <0x00 0x01 0x04>;	/* GIC SPI 1, level-high (NE global) */
+	};
+
+	/*
+	 * PCIe root complex "pcie0" -> 5 GHz WiFi endpoint [10ec:c852] RTW8852CE
+	 * (WiFi 6, mainline rtw89).  Faithful to the board's stock DTB (mtd6 UBI
+	 * DTB0): reg map, GIC SPI 44/45, pci-domain 0, num-lanes 2 (the endpoint
+	 * trains Gen2 x1), and the authentic revB v1.1 (2024.06.04) SerDes table.
+	 * clocks/resets/phys are omitted like pcie2: the glue drives the rstmgr/
+	 * GPIO registers directly (S0_* masks, gate_pcie0 bits 10/22 in GLB 0xc8).
+	 * MUST stay ordered BEFORE pcie2: stock brings pcie0/S0 up first -- its
+	 * 2-lane LONG RX-cal preconditions the SHARED SerDes analog that pcie2's
+	 * SHORT cal depends on (probe order follows DT order).
+	 * NOTE: the glue's pcie0 path applies its RE'd table (identical pairs) to
+	 * lane0 only, as proven live; serdes-cfg-dataB is carried for fidelity.
+	 * ★ XTAL FLAG: non-40M variant, same as pcie2.
+	 */
+	pcie0: pcie@f4325000 {
+		compatible = "cortina,venus-pcie";
+		reg = <0x00 0xf4325000 0x00 0x400>,	/* glbl_regs   */
+		      <0x00 0xa0000000 0x00 0x1000>,	/* rc_dbi      */
+		      <0x00 0xa0001000 0x00 0x2000>,	/* config      */
+		      <0x00 0xa0300000 0x00 0x100000>,	/* iatu        */
+		      <0x00 0xf4333000 0x00 0x2000>;	/* serdes_phy  */
+		reg-names = "glbl_regs", "rc_dbi", "config", "iatu", "serdes_phy";
+
+		device_type = "pci";
+		#address-cells = <0x03>;
+		#size-cells = <0x02>;
+		bus-range = <0x00 0xff>;
+		ranges = <0x81000000 0x00 0x00        0x00 0xa0003000 0x00 0x10000>,	/* downstream I/O  */
+			 <0x82000000 0x00 0xa0400000 0x00 0xa0400000 0x00 0xfc00000>;	/* non-prefetch mem */
+
+		id = <0x00>;
+		num-viewport = <0x01>;
+		num-lanes = <0x02>;
+		linux,pci-domain = <0x00>;
+
+		interrupts = <0x00 0x2c 0x04>, <0x00 0x2d 0x04>;	/* GIC SPI 44,45 level-high (stock) */
+
+		/* Stock DTB pcie0 serdes-cfg-dataB, revB v1.1 (2024.06.04), 25 MHz XTAL. */
+		serdes-cfg-dataB = <0x04 0xa855 0x08 0x60c6 0x10 0x4000 0x18 0x1f 0x20 0x3591 0x28 0xf610 0x2c 0xa91d 0x30 0xc008 0x34 0xf732 0x38 0x1000 0x74 0xca1f 0x78 0xe0e2 0x80 0xd488 0x84 0x77dd 0x88 0x23 0x8c 0x1b63 0x90 0x4f30 0x9c 0x61d6 0xa0 0xf802 0xac 0xb813 0xc0 0x55 0xc8 0xf0f3 0x24 0x520c 0x104 0xa84a 0x108 0x60c6 0x110 0x4000 0x118 0x1f 0x120 0x3591 0x128 0xf610 0x12c 0xa91d 0x130 0xc008 0x134 0xf732 0x138 0x1000 0x174 0xda1f 0x178 0xe0e2 0x188 0x23 0x18c 0x1b63 0x190 0x4f0c 0x19c 0x61d6 0x1a0 0xf802 0x1ac 0xb813 0x1bc 0xe900 0x1c0 0x4a 0x1c8 0xf0f3 0x124 0x520c>;
+
+		/* ★ 2026-08-07 AOT5221ZY: PCIe DISABLED. This ONT has no PCIe endpoint (the
+		 * X400AXF carries WiFi cards there). With it enabled the 6.18 kernel resets
+		 * DETERMINISTICALLY at t=0.41s right after "cortina-pcie ...: host bridge
+		 * /pcie@f4325000 ranges:" - reproduced on two independent boots. GPON needs
+		 * none of it. */
+		status = "disabled";
+
+		#interrupt-cells = <0x01>;
+		interrupt-map-mask = <0x00 0x00 0x00 0x07>;
+		interrupt-map = <0x00 0x00 0x00 0x01 &pcie0_intc 0x00>,	/* INT A */
+				<0x00 0x00 0x00 0x02 &pcie0_intc 0x01>,	/* INT B */
+				<0x00 0x00 0x00 0x03 &pcie0_intc 0x02>,	/* INT C */
+				<0x00 0x00 0x00 0x04 &pcie0_intc 0x03>;	/* INT D */
+
+		pcie0_intc: interrupt-controller {
+			interrupt-controller;
+			#address-cells = <0x00>;
+			#interrupt-cells = <0x01>;
+		};
+	};
+
+	/*
+	 * PCIe root complex "pcie2" -> 2.4 GHz WiFi endpoint [10ec:0192] RTL8192F.
+	 * Faithful to the board's stock DTB (mtd6 UBI DTB0): reg map, GIC SPI 46/47,
+	 * pci-domain 1, and the authentic revB v1.1 (2024.06.04) SerDes table.
+	 * clocks/resets/phys/iommus are omitted for bring-up (the glue treats them
+	 * optional and the bootloader already ungated the PCIe clocks).
+	 * ★ XTAL FLAG: this is the non-40M SerDes variant; if this board runs a
+	 * 40 MHz crystal, replace the pairs with the stock serdes-cfg-dataB_40M set.
+	 */
+	pcie2: pcie@f4327000 {
+		compatible = "cortina,venus-pcie";
+		reg = <0x00 0xf4327000 0x00 0x400>,	/* glbl_regs   */
+		      <0x00 0xc0000000 0x00 0x1000>,	/* rc_dbi      */
+		      <0x00 0xc0001000 0x00 0x2000>,	/* config      */
+		      <0x00 0xc0300000 0x00 0x100000>,	/* iatu        */
+		      <0x00 0xf4337000 0x00 0x1000>;	/* serdes_phy  */
+		reg-names = "glbl_regs", "rc_dbi", "config", "iatu", "serdes_phy";
+
+		device_type = "pci";
+		#address-cells = <0x03>;
+		#size-cells = <0x02>;
+		bus-range = <0x00 0xff>;
+		ranges = <0x81000000 0x00 0x00        0x00 0xc0003000 0x00 0x10000>,	/* downstream I/O  */
+			 <0x82000000 0x00 0xc0400000 0x00 0xc0400000 0x00 0xfc00000>;	/* non-prefetch mem */
+
+		id = <0x02>;
+		num-viewport = <0x01>;
+		num-lanes = <0x01>;
+		linux,pci-domain = <0x01>;
+
+		interrupts = <0x00 0x2e 0x04>, <0x00 0x2f 0x04>;	/* GIC SPI 46,47 level-high (stock) */
+
+		/* 25 MHz-XTAL SerDes table (from a live stock dump).  It carries stock's
+		 * low-block CMU/analog config (0x08/0x0c/0x14/0x1c, 0x3c-0x50, 0x68/0x94/0x98/
+		 * 0xa4/0xa8/0xb0/0xb4/0xb8) which the stock DTB write-list omits (it relies on
+		 * them being HW/cal defaults) -- these are what LOCK the CMU cold (bare
+		 * write-list alone reads 0x500e = unlocked; +these -> 0x780e).  page0 also uses
+		 * the RX manual-override VALUES (0x2c=0xa91d bit4 SET, 0x90=0x4f28) so the RX
+		 * front-end locks from the fixed code applied IN-RESET (the CMU only locks during
+		 * the in-reset table apply; an out-of-reset runtime cal drops the lock and cannot
+		 * re-lock on this revB silicon).  Result: CMU+CDR lock cold 0x780e.  Each page
+		 * ends with the 0x24/0x124 bit9 cal edge. */
+		serdes-cfg-dataB = <0x04 0xa855 0x10 0x5000 0x18 0x1f 0x20 0x3591 0x24 0x520c 0x28 0xc670 0x2c 0xa90d 0x30 0xc008 0x34 0xf732 0x38 0x5000 0x64 0x7d63 0x6c 0xea1 0x70 0x2001 0x74 0xda1f 0x78 0x66eb 0x80 0xd488 0x84 0x77dd 0x88 0x23 0x8c 0x1b63 0x90 0x4f30 0x9c 0x1d6 0xa0 0xf802 0xac 0xb8d3 0xbc 0x7055 0xc8 0xf0f3 0x24 0x500c 0x24 0x520c 0x104 0xa84a 0x110 0x5000 0x118 0x1f 0x120 0x3591 0x124 0x520c 0x128 0xc670 0x12c 0xa90d 0x130 0xc008 0x134 0xf732 0x138 0x5000 0x164 0x7d63 0x16c 0xf41 0x170 0x2001 0x174 0xda1f 0x180 0xd4aa 0x188 0x23 0x18c 0x1b63 0x190 0x4f0c 0x19c 0x1d6 0x1a0 0xf802 0x1ac 0xb9d3 0x1bc 0xd04a 0x1c8 0xf0f3 0x124 0x500c 0x124 0x520c>;  /* AUTO table (0x2c=0xa90d): the LONG-cal ramp runs the HW cal engine (needs auto mode); manual mode blocks cal-done (bit4). */
+
+		/* M3a/M3b PCIe bring-up boot: enabled to test the clean-room glue in
+		 * isolation (WiFi driver not yet built) — expect "cortina-pcie … Link up"
+		 * + [10ec:0192] endpoint enumeration.  If the glue SErrors on serdes MMIO,
+		 * the boot log will show it. */
+		/* ★ 2026-08-07 AOT5221ZY: PCIe DISABLED. This ONT has no PCIe endpoint (the
+		 * X400AXF carries WiFi cards there). With it enabled the 6.18 kernel resets
+		 * DETERMINISTICALLY at t=0.41s right after "cortina-pcie ...: host bridge
+		 * /pcie@f4325000 ranges:" - reproduced on two independent boots. GPON needs
+		 * none of it. */
+		status = "disabled";
+
+		#interrupt-cells = <0x01>;
+		interrupt-map-mask = <0x00 0x00 0x00 0x07>;
+		interrupt-map = <0x00 0x00 0x00 0x01 &pcie2_intc 0x00>,	/* INT A */
+				<0x00 0x00 0x00 0x02 &pcie2_intc 0x01>,	/* INT B */
+				<0x00 0x00 0x00 0x03 &pcie2_intc 0x02>,	/* INT C */
+				<0x00 0x00 0x00 0x04 &pcie2_intc 0x03>;	/* INT D */
+
+		pcie2_intc: interrupt-controller {
+			interrupt-controller;
+			#address-cells = <0x00>;
+			#interrupt-cells = <0x01>;
+		};
+	};
+
+	/*
+	 * ======================= FRONT PANEL: GPIO, LEDs, BUTTONS ==============
+	 *
+	 * The SoC's peripheral GPIO block is five 32-pin groups, three words each
+	 * (CFG/OUT/IN) at PERI + 0x300 + 0x24 * group, plus one pin-mux word per
+	 * group at GLB + 0x130 + 4 * group where setting bit N routes pin N to the
+	 * GPIO block.  One node per group, so only the three groups this board
+	 * actually uses are mapped; the second reg entry is that group's mux word,
+	 * which the driver OR-s the requested pin into (we build without PINCTRL,
+	 * so nothing else would route the pad).
+	 *
+	 * Only CFG/OUT/IN are mapped (length 0xc).  The rest of each 0x24 bank
+	 * block is interrupt logic, which the driver does not implement — hence the
+	 * buttons below are gpio-keys-POLLED.
+	 *
+	 * ★ Shared with the GPON driver: cortina-gpon's cg_laser_on() also writes
+	 * these same CFG/OUT words for the BOSA/laser nets it owns, including
+	 * whole-register stores to groups 3 and 4.  That is why this driver only
+	 * ever read-modify-writes single bits and maps the window non-exclusively.
+	 * A consequence to be aware of: the GPON driver re-applies stock's group-3
+	 * snapshot on every (re-)activation, which momentarily forces the LED levels
+	 * on this list; the panel daemon re-asserts them on its next poll.
+	 */
+	gpio0: gpio@f4329300 {
+		compatible = "cortina,ca77xx-gpio";
+		reg = <0x04 0xf4329300 0x00 0x0c>,	/* group 0 CFG/OUT/IN   */
+		      <0x04 0xf4320130 0x00 0x04>;	/* group 0 pin-mux word */
+		gpio-controller;
+		#gpio-cells = <0x02>;
+		ngpios = <0x10>;
+	};
+
+	gpio3: gpio@f432936c {
+		compatible = "cortina,ca77xx-gpio";
+		reg = <0x04 0xf432936c 0x00 0x0c>,	/* group 3 CFG/OUT/IN   */
+		      <0x04 0xf432013c 0x00 0x04>;	/* group 3 pin-mux word */
+		gpio-controller;
+		#gpio-cells = <0x02>;
+		ngpios = <0x19>;
+	};
+
+	gpio4: gpio@f4329390 {
+		compatible = "cortina,ca77xx-gpio";
+		reg = <0x04 0xf4329390 0x00 0x0c>,	/* group 4 CFG/OUT/IN   */
+		      <0x04 0xf4320140 0x00 0x04>;	/* group 4 pin-mux word */
+		gpio-controller;
+		#gpio-cells = <0x02>;
+		ngpios = <0x11>;
+	};
+
+	/*
+	 * Front-panel LEDs.  The panel carries twelve: PWR, PON, LOS, NET, LAN1-4,
+	 * 2.4G, 5G, WPS, FXS1 (operator-confirmed).  The ten below are the ones on
+	 * SoC GPIO; 2.4G and 5G are NOT — they hang off each WiFi chip's own LED pad
+	 * and so cannot be declared here, because no SoC GPIO reaches them (a guessed
+	 * GPIO would drive some other net).  They are not a gap any more: each pad is
+	 * the WiFi MAC's GPIO 8, and our rtw89 registers a led_classdev per radio for
+	 * it (drivers/net/wireless/realtek/rtw89/led.c, CONFIG_RTW89_LEDS), naming
+	 * them aot5221zy:green:2.4g and aot5221zy:green:5g to match the ten below.
+	 * mac80211's throughput trigger then holds each one on while its radio is up.
+	 * Do NOT add them to this node.
+	 *
+	 * Pin numbers come from the stock firmware's own device tree, whose vendor
+	 * LED node spells each LED as <gpio-bank-phandle, pin-in-bank, flags> —
+	 * the ordinary OF GPIO specifier, as its sibling standard gpio-keys node
+	 * proves.  Flags are 0 on every LED there, i.e. ACTIVE HIGH, and that is
+	 * independently confirmed by live stock register values: at Online the
+	 * group-0 OUT word drives pin 6 (PWR) HIGH with pins 11 (LOS) and 12 (FXS)
+	 * LOW, and the group-3 OUT word drives pin 4 (PON) HIGH — exactly a running
+	 * ONU with a good fibre.  The set of pins stock configures as group-3
+	 * OUTPUTS is precisely this LED list plus the xgphy reset, which is what
+	 * makes the decode certain rather than plausible.
+	 *
+	 * The stock tree ALSO declares LED_USB0/LED_USB1; this board has no USB
+	 * port, so they are deliberately absent here.  That stock tree is a FAMILY
+	 * device tree — it covers models with USB, and conversely has no WiFi LED
+	 * although this board does.  Do not "restore" the USB entries from it.
+	 *
+	 * Names are OpenWrt-idiomatic <board>:<colour>:<function>; the vendor label
+	 * is kept in a comment so the mapping stays traceable.  Colours: the vendor
+	 * _G suffix means green (PWR/NET/WPS); PON green and LOS red are the
+	 * project's stated stock behaviour.  LAN and FXS1 colours are assumed green
+	 * and are cosmetic — they affect only the sysfs name, never a pin.
+	 */
+	leds {
+		compatible = "gpio-leds";
+
+		/* LED_PWR_G — group 0 pin 6.  On for the whole time we are up. */
+		led-power {
+			label = "aot5221zy:green:power";
+			gpios = <&gpio0 0x06 0x00>;
+			default-state = "on";
+		};
+
+		/* LED_PON — group 3 pin 4.  Driven by the panel daemon from the
+		 * GPON activation state (solid at O5, blinking while ranging). */
+		led-pon {
+			label = "aot5221zy:green:pon";
+			gpios = <&gpio3 0x04 0x00>;
+			default-state = "off";
+		};
+
+		/* LED_LOS — group 0 pin 11.  Daemon-driven: on ONLY while the
+		 * downstream optical signal is lost. */
+		led-los {
+			label = "aot5221zy:red:los";
+			gpios = <&gpio0 0x0b 0x00>;
+			default-state = "off";
+		};
+
+		/* LED_PPP_G — group 3 pin 12.  The panel silkscreen calls this
+		 * NET: internet/WAN reachability, daemon-driven from the WAN
+		 * interface state (PPPoE session up, or a WAN default route). */
+		led-net {
+			label = "aot5221zy:green:net";
+			gpios = <&gpio3 0x0c 0x00>;
+			default-state = "off";
+		};
+
+		/*
+		 * LED_EPHY0..3 — the four RJ45 link LEDs, group 3 pins 6/3/1/7.
+		 * Stock binds them to its per-port netdevs eth0.2/.3/.4/.5, i.e.
+		 * NI switch ports 0/1/2/3 in order (three independent sources in
+		 * the stock firmware agree: its switch node's per-port
+		 * netdev-name, its board_init.sh netdev-trigger wiring, and its
+		 * disabled hardware port-LED node).
+		 *
+		 * ★ We cannot use the netdev trigger for these: our clean-room NI
+		 * driver registers ONE netdev (eth0) for the whole switch, not a
+		 * per-port subdevice, so there is no netdev to bind per RJ45.  The
+		 * panel daemon drives them from the per-port PHY link state the
+		 * driver already exports instead.  LEDn <-> port n is proven; only
+		 * which silkscreened RJ45 is port 0 is not (the sibling MIPS board
+		 * numbers its sockets the other way round), so the lanN NAME may
+		 * be reversed even though each LED does track its own port.
+		 */
+		led-lan1 {
+			label = "aot5221zy:green:lan1";	/* LED_EPHY0, port 0 */
+			gpios = <&gpio3 0x06 0x00>;
+			default-state = "off";
+		};
+
+		led-lan2 {
+			label = "aot5221zy:green:lan2";	/* LED_EPHY1, port 1 */
+			gpios = <&gpio3 0x03 0x00>;
+			default-state = "off";
+		};
+
+		led-lan3 {
+			label = "aot5221zy:green:lan3";	/* LED_EPHY2, port 2 */
+			gpios = <&gpio3 0x01 0x00>;
+			default-state = "off";
+		};
+
+		led-lan4 {
+			label = "aot5221zy:green:lan4";	/* LED_EPHY3, port 3 */
+			gpios = <&gpio3 0x07 0x00>;
+			default-state = "off";
+		};
+
+		/* LED_WPS_G — group 3 pin 0.  Declared so the pad is owned and
+		 * scriptable; we ship no WPS registrar, so nothing drives it. */
+		led-wps {
+			label = "aot5221zy:green:wps";
+			gpios = <&gpio3 0x00 0x00>;
+			default-state = "off";
+		};
+
+		/* LED_FXS — group 0 pin 12.  The panel has an FXS1 indicator, but
+		 * we drive no voice stack, so this is declared only. */
+		led-fxs1 {
+			label = "aot5221zy:green:fxs1";
+			gpios = <&gpio0 0x0c 0x00>;
+			default-state = "off";
+		};
+	};
+
+	/*
+	 * Reset and WPS buttons (both on the side of the case, operator-confirmed).
+	 * Pins and key codes are the stock device tree's own gpio-keys node, which
+	 * uses the identical <bank pin flags> form as the LEDs above: reset =
+	 * group 4 pin 8, WPS = group 3 pin 16, both ACTIVE LOW.  Stock's live
+	 * register state corroborates it — group 4 pin 8 is the one pin in that
+	 * group left as an INPUT while its neighbours are driven outputs.
+	 *
+	 * POLLED, not interrupt-driven: our GPIO driver implements no irqchip, and
+	 * OpenWrt's gpio-button-hotplug refuses a plain "gpio-keys" node whose
+	 * lines cannot be mapped to an IRQ.  A button is a human-timescale input,
+	 * so a 100 ms poll is indistinguishable in use.
+	 *
+	 * The stock tree also has a third button (WiFi on/off, group 3 pin 15).
+	 * This panel has only reset and WPS, so it is left out.
+	 */
+	keys {
+		compatible = "gpio-keys-polled";
+		poll-interval = <0x64>;		/* 100 ms */
+
+		button-reset {
+			label = "reset";
+			linux,code = <0x198>;	/* KEY_RESTART */
+			gpios = <&gpio4 0x08 0x01>;
+		};
+
+		button-wps {
+			label = "wps";
+			linux,code = <0x211>;	/* KEY_WPS_BUTTON */
+			gpios = <&gpio3 0x10 0x01>;
+		};
+	};
+};

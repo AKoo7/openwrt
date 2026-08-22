@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+. /lib/functions/uci-defaults.sh
+
+board_config_update
+
+# ★ DSA (2026-08-19): the four RJ45 jacks are the DSA user ports lan1..lan4; the
+# conduit 'eth0' carries no LAN traffic.  List all four as the LAN ports so that
+# /etc/board.json gets  network.lan.ports = [lan1,lan2,lan3,lan4]  (a space-separated
+# device turns into a ports[] array, see ucidef_set_interface).  LuCI's
+# Status->Overview "Ethernet Ports" panel calls luci.getBuiltinEthernetPorts, which
+# reads board.json network.<role>.ports[] (else the single .device) -- so without
+# this it emitted the generic lan.device='eth0' and the overview showed ONE port
+# "eth0" instead of the four LAN jacks.  WAN is GPON (gpon0), not an ethernet port.
+ucidef_set_interface_lan "lan1 lan2 lan3 lan4"
+
+board_config_flush
+
+exit 0

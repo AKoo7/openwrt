@@ -1,0 +1,9 @@
+# uhttpd default max_requests=3 is too low for LuCI's parallel XHR/asset loads on
+# this box -> slots exhaust -> slow page loads and ERR_EMPTY_RESPONSE.  Raise it.
+uci -q batch <<-UCI
+	set uhttpd.main.max_requests=30
+	set uhttpd.main.max_connections=100
+	set uhttpd.main.no_dirlists=1
+	commit uhttpd
+UCI
+exit 0

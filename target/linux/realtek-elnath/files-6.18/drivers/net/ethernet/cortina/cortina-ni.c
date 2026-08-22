@@ -9,8 +9,6 @@
  */
 
 #include <linux/bitfield.h>
-#include <linux/build_bug.h>
-#include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
@@ -23,8 +21,8 @@
 #include <linux/of_reserved_mem.h>
 #include <linux/phy.h>
 #include <linux/platform_device.h>
+#include <linux/proc_fs.h>
 #include <linux/seq_file.h>
-#include <linux/spinlock.h>
 
 #include "cortina-ni.h"
 
@@ -177,172 +175,6 @@ static int cortina_ni_gphy_write(struct cortina_ni *ni, int addr, int regnum,
 	return 0;
 }
 
-/*
- * Internal-GPHY firmware (SRAM) patch (see cortina-ni-regs.h).  The on-PHY
- * microcontroller's DSP-SRAM must be seeded with the apro_gen2 firmware body
- * before the PHY forwards a frame across its system-side GMII to the NI MAC.
- * We keep U-Boot's live link (never reset the PHY), so the uC is running - the
- * gate/lock handshake holds it, the firmware image is written word-by-word,
- * then the uC is resumed.  Applied per bank.  The raw OCP accessors are plain
- * memory-mapped readl/writel (no page shadow, no 1 ms MDIO delay - the image
- * is streamed back-to-back).
- */
-struct cortina_ni_gphy_patch_word {
-	u16	addr;	/* SRAM word address (via OCP 0xa436) */
-	u16	data;	/* 16-bit word        (via OCP 0xa438) */
-};
-
-/*
- * apro_gen2 internal-GPHY uC firmware body, LIVE-DUMPED from RTL9607F stock
- * (per bank, uC held, via OCP 0xa436=addr / read 0xa438=data).  This is the
- * closed apro_gen2 image (not in open source; see cortina-ni-regs.h) and is
- * applied verbatim, in ascending-address order, to all four internal-PHY banks.
- * The known analog tweaks (0x8011=0xff77, 0x809b=0x7c70, 0x80ad=0x0c23) are
- * already baked into these words - do NOT layer any separate RMW on top.
- * 560 words, SRAM 0x8000..0x83f1.
- */
-static const struct cortina_ni_gphy_patch_word cortina_ni_gphy_patch_words[] = {
-	{ 0x8000, 0x0430 }, { 0x8001, 0x3051 }, { 0x8002, 0x5144 }, { 0x8003, 0x4451 },
-	{ 0x8004, 0x5144 }, { 0x8005, 0x4404 }, { 0x8006, 0x0400 }, { 0x8007, 0x0051 },
-	{ 0x8008, 0x5144 }, { 0x8009, 0x4451 }, { 0x800a, 0x5144 }, { 0x800b, 0x4402 },
-	{ 0x800c, 0x02e8 }, { 0x800d, 0xe851 }, { 0x800e, 0x5144 }, { 0x800f, 0x44ff },
-	{ 0x8010, 0xffff }, { 0x8011, 0xff77 }, { 0x8012, 0x77ff }, { 0x8013, 0xff00 },
-	{ 0x8014, 0x0078 }, { 0x8015, 0x7805 }, { 0x8016, 0x0500 }, { 0x8029, 0x0001 },
-	{ 0x802a, 0x0100 }, { 0x803e, 0x0080 }, { 0x803f, 0x8048 }, { 0x8040, 0x4806 },
-	{ 0x8041, 0x061f }, { 0x8042, 0x1f08 }, { 0x8043, 0x081f }, { 0x8044, 0x1f32 },
-	{ 0x8045, 0x321e }, { 0x8046, 0x1e6e }, { 0x8047, 0x6e24 }, { 0x8048, 0x2423 },
-	{ 0x8049, 0x23e7 }, { 0x804a, 0xe730 }, { 0x804b, 0x3000 }, { 0x804d, 0x0024 },
-	{ 0x804e, 0x2423 }, { 0x804f, 0x2327 }, { 0x8050, 0x2731 }, { 0x8051, 0x3100 },
-	{ 0x8053, 0x0024 }, { 0x8054, 0x2423 }, { 0x8055, 0x23e7 }, { 0x8056, 0xe730 },
-	{ 0x8057, 0x3000 }, { 0x8059, 0x0024 }, { 0x805a, 0x2423 }, { 0x805b, 0x23e7 },
-	{ 0x805c, 0xe730 }, { 0x805d, 0x3000 }, { 0x805f, 0x0019 }, { 0x8060, 0x1923 },
-	{ 0x8061, 0x23e7 }, { 0x8062, 0xe730 }, { 0x8063, 0x3000 }, { 0x8065, 0x0019 },
-	{ 0x8066, 0x1923 }, { 0x8067, 0x23e7 }, { 0x8068, 0xe730 }, { 0x8069, 0x3000 },
-	{ 0x806b, 0x0019 }, { 0x806c, 0x1923 }, { 0x806d, 0x23e7 }, { 0x806e, 0xe730 },
-	{ 0x806f, 0x3000 }, { 0x8072, 0x0049 }, { 0x8073, 0x4900 }, { 0x8075, 0x007e },
-	{ 0x8076, 0x7e01 }, { 0x8077, 0x0100 }, { 0x8078, 0x007e }, { 0x8079, 0x7e00 },
-	{ 0x807b, 0x007f }, { 0x807c, 0x7f00 }, { 0x807e, 0x009e }, { 0x807f, 0x9e00 },
-	{ 0x8083, 0x0080 }, { 0x8084, 0x808b }, { 0x8085, 0x8b16 }, { 0x8086, 0x1610 },
-	{ 0x8087, 0x1049 }, { 0x8088, 0x4910 }, { 0x8089, 0x1097 }, { 0x808a, 0x9743 },
-	{ 0x808b, 0x4300 }, { 0x808c, 0x00d4 }, { 0x808d, 0xd4c4 }, { 0x808e, 0xc409 },
-	{ 0x808f, 0x09ea }, { 0x8090, 0xea07 }, { 0x8091, 0x0709 }, { 0x8092, 0x09ae },
-	{ 0x8093, 0xaeca }, { 0x8094, 0xca1f }, { 0x8095, 0x1ffd }, { 0x8096, 0xfd1e },
-	{ 0x8097, 0x1e0a }, { 0x8098, 0x0add }, { 0x8099, 0xdd0e }, { 0x809a, 0x0e7c },
-	{ 0x809b, 0x7c70 }, { 0x809c, 0x7073 }, { 0x809d, 0x7340 }, { 0x809e, 0x4000 },
-	{ 0x80a0, 0x002e }, { 0x80a1, 0x2efb }, { 0x80a2, 0xfb73 }, { 0x80a3, 0x7308 },
-	{ 0x80a4, 0x0808 }, { 0x80a5, 0x08fc }, { 0x80a6, 0xfc05 }, { 0x80a7, 0x05f0 },
-	{ 0x80a8, 0xf087 }, { 0x80a9, 0x8737 }, { 0x80aa, 0x3719 }, { 0x80ab, 0x19af },
-	{ 0x80ac, 0xaf0c }, { 0x80ad, 0x0c23 }, { 0x80ae, 0x23dd }, { 0x80af, 0xdd1e },
-	{ 0x80b0, 0x1e78 }, { 0x80b1, 0x7870 }, { 0x80b2, 0x7073 }, { 0x80b3, 0x7340 },
-	{ 0x80b4, 0x4000 }, { 0x80b6, 0x002e }, { 0x80b7, 0x2e06 }, { 0x80b8, 0x067c },
-	{ 0x80b9, 0x7c68 }, { 0x80ba, 0x6806 }, { 0x80bb, 0x0688 }, { 0x80bc, 0x8805 },
-	{ 0x80bd, 0x05f1 }, { 0x80be, 0xf17a }, { 0x80bf, 0x7a31 }, { 0x80c0, 0x3119 },
-	{ 0x80c1, 0x19c1 }, { 0x80c2, 0xc10c }, { 0x80c3, 0x0c23 }, { 0x80c4, 0x23dd },
-	{ 0x80c5, 0xdd0e }, { 0x80c6, 0x0e78 }, { 0x80c7, 0x7870 }, { 0x80c8, 0x7073 },
-	{ 0x80c9, 0x7340 }, { 0x80ca, 0x4000 }, { 0x80d4, 0x000a }, { 0x80d5, 0x0a04 },
-	{ 0x80d6, 0x0400 }, { 0x80ea, 0x0020 }, { 0x80eb, 0x2001 }, { 0x80ec, 0x0120 },
-	{ 0x80ed, 0x2001 }, { 0x80ee, 0x0120 }, { 0x80ef, 0x2001 }, { 0x80f0, 0x0120 },
-	{ 0x80f1, 0x2001 }, { 0x80f2, 0x0120 }, { 0x80f3, 0x2001 }, { 0x80f4, 0x0120 },
-	{ 0x80f5, 0x2001 }, { 0x80f6, 0x0120 }, { 0x80f7, 0x2001 }, { 0x80f8, 0x0120 },
-	{ 0x80f9, 0x2001 }, { 0x80fa, 0x0120 }, { 0x80fb, 0x2001 }, { 0x80fc, 0x0120 },
-	{ 0x80fd, 0x2001 }, { 0x80fe, 0x0157 }, { 0x80ff, 0x5724 }, { 0x8100, 0x2400 },
-	{ 0x8101, 0x0011 }, { 0x8102, 0x1111 }, { 0x8103, 0x1111 }, { 0x8104, 0x1122 },
-	{ 0x8105, 0x2222 }, { 0x8106, 0x2222 }, { 0x8107, 0x2222 }, { 0x8108, 0x2243 },
-	{ 0x8109, 0x4365 }, { 0x810a, 0x6577 }, { 0x810b, 0x7707 }, { 0x810c, 0x0700 },
-	{ 0x8118, 0x0006 }, { 0x8119, 0x0676 }, { 0x811a, 0x7600 }, { 0x811b, 0x000a },
-	{ 0x811c, 0x0a00 }, { 0x811d, 0x0064 }, { 0x811e, 0x6403 }, { 0x811f, 0x03e8 },
-	{ 0x8120, 0xe804 }, { 0x8121, 0x0401 }, { 0x8122, 0x0144 }, { 0x8123, 0x440b },
-	{ 0x8124, 0x0be0 }, { 0x8125, 0xe007 }, { 0x8126, 0x0700 }, { 0x8127, 0x00d6 },
-	{ 0x8128, 0xd6dc }, { 0x8129, 0xdce4 }, { 0x812a, 0xe4ea }, { 0x812b, 0xeaf0 },
-	{ 0x812c, 0xf0f6 }, { 0x812d, 0xf6fc }, { 0x812e, 0xfc04 }, { 0x812f, 0x040a },
-	{ 0x8130, 0x0a10 }, { 0x8131, 0x1016 }, { 0x8132, 0x161c }, { 0x8133, 0x1c24 },
-	{ 0x8134, 0x242a }, { 0x8135, 0x2a30 }, { 0x8136, 0x3036 }, { 0x8137, 0x363c },
-	{ 0x8138, 0x3c00 }, { 0x813c, 0x0008 }, { 0x813d, 0x0803 }, { 0x813e, 0x0300 },
-	{ 0x8142, 0x0001 }, { 0x8143, 0x012c }, { 0x8144, 0x2c00 }, { 0x8149, 0x009f },
-	{ 0x814a, 0x9f00 }, { 0x814b, 0x009f }, { 0x814c, 0x9f00 }, { 0x814d, 0x002e },
-	{ 0x814e, 0x2e00 }, { 0x814f, 0x00ae }, { 0x8150, 0xae02 }, { 0x8151, 0x0216 },
-	{ 0x8152, 0x1604 }, { 0x8153, 0x0404 }, { 0x8154, 0x0400 }, { 0x8155, 0x0055 },
-	{ 0x8156, 0x5500 }, { 0x8158, 0x0055 }, { 0x8159, 0x5500 }, { 0x815b, 0x0055 },
-	{ 0x815c, 0x5500 }, { 0x815e, 0x0055 }, { 0x815f, 0x5500 }, { 0x8166, 0x0004 },
-	{ 0x8167, 0x0410 }, { 0x8168, 0x1000 }, { 0x8169, 0x0004 }, { 0x816a, 0x0403 },
-	{ 0x816b, 0x030f }, { 0x816c, 0x0f10 }, { 0x816d, 0x1001 }, { 0x816e, 0x0100 },
-	{ 0x816f, 0x0043 }, { 0x8170, 0x4384 }, { 0x8171, 0x84ed }, { 0x8172, 0xed6a },
-	{ 0x8173, 0x6a01 }, { 0x8174, 0x0100 }, { 0x8175, 0x00f8 }, { 0x8176, 0xf8ce },
-	{ 0x8177, 0xce00 }, { 0x8178, 0x0090 }, { 0x8179, 0x9030 }, { 0x817a, 0x3070 },
-	{ 0x817b, 0x7010 }, { 0x817c, 0x1000 }, { 0x817d, 0x0018 }, { 0x817e, 0x1806 },
-	{ 0x817f, 0x06f4 }, { 0x8180, 0xf408 }, { 0x8181, 0x08ef }, { 0x8182, 0xef08 },
-	{ 0x8183, 0x08f3 }, { 0x8184, 0xf30c }, { 0x8185, 0x0ca6 }, { 0x8186, 0xa60d },
-	{ 0x8187, 0x0dc8 }, { 0x8188, 0xc806 }, { 0x8189, 0x0410 }, { 0x818a, 0x1008 },
-	{ 0x818b, 0x0800 }, { 0x818c, 0x00ff }, { 0x818d, 0xffff }, { 0x818e, 0xff00 },
-	{ 0x818f, 0x00ff }, { 0x8190, 0xffff }, { 0x8191, 0xff00 }, { 0x8192, 0x00ff },
-	{ 0x8193, 0xffff }, { 0x8194, 0xff00 }, { 0x8195, 0x00ff }, { 0x8196, 0xffff },
-	{ 0x8197, 0xff00 }, { 0x8198, 0x00ff }, { 0x8199, 0xffff }, { 0x819a, 0xff00 },
-	{ 0x819b, 0x00ff }, { 0x819c, 0xffff }, { 0x819d, 0xff00 }, { 0x819e, 0x00ff },
-	{ 0x819f, 0xffff }, { 0x81a0, 0xff00 }, { 0x81a1, 0x00ff }, { 0x81a2, 0xffff },
-	{ 0x81a3, 0xff00 }, { 0x81a4, 0x00ff }, { 0x81a5, 0xffff }, { 0x81a6, 0xff00 },
-	{ 0x81a7, 0x00ff }, { 0x81a8, 0xffff }, { 0x81a9, 0xff00 }, { 0x81aa, 0x00ff },
-	{ 0x81ab, 0xffff }, { 0x81ac, 0xff00 }, { 0x81ad, 0x00ff }, { 0x81ae, 0xffff },
-	{ 0x81af, 0xff00 }, { 0x81b0, 0x00ff }, { 0x81b1, 0xffff }, { 0x81b2, 0xff00 },
-	{ 0x81b3, 0x00ff }, { 0x81b4, 0xffff }, { 0x81b5, 0xff00 }, { 0x81b6, 0x00ff },
-	{ 0x81b7, 0xffff }, { 0x81b8, 0xff00 }, { 0x81b9, 0x00ff }, { 0x81ba, 0xffff },
-	{ 0x81bb, 0xff00 }, { 0x81be, 0x0082 }, { 0x81bf, 0x8249 }, { 0x81c0, 0x4982 },
-	{ 0x81c1, 0x8249 }, { 0x81c2, 0x4909 }, { 0x81c3, 0x0906 }, { 0x81c4, 0x0609 },
-	{ 0x81c5, 0x0906 }, { 0x81c6, 0x0601 }, { 0x81c7, 0x01f0 }, { 0x81c8, 0xf003 },
-	{ 0x81c9, 0x03e4 }, { 0x81ca, 0xe401 }, { 0x81cb, 0x0100 }, { 0x81cc, 0x0004 },
-	{ 0x81cd, 0x041a }, { 0x81ce, 0x1a43 }, { 0x81cf, 0x4303 }, { 0x81d0, 0x0344 },
-	{ 0x81d1, 0x4440 }, { 0x81d2, 0x4009 }, { 0x81d3, 0x09cb }, { 0x81d4, 0xcb00 },
-	{ 0x81d5, 0x00f0 }, { 0x81d6, 0xf0f6 }, { 0x81d7, 0xf632 }, { 0x81d8, 0x3201 },
-	{ 0x81d9, 0x0117 }, { 0x81da, 0x1704 }, { 0x81db, 0x0410 }, { 0x81dc, 0x10bc },
-	{ 0x81dd, 0xbc02 }, { 0x81de, 0x023f }, { 0x81df, 0x3f11 }, { 0x81e0, 0x1105 },
-	{ 0x81e1, 0x05d3 }, { 0x81e2, 0xd300 }, { 0x81e3, 0x00f4 }, { 0x81e4, 0xf43a },
-	{ 0x81e5, 0x3a01 }, { 0x81e6, 0x0106 }, { 0x81e7, 0x0604 }, { 0x81e8, 0x0410 },
-	{ 0x81e9, 0x10cb }, { 0x81ea, 0xcb02 }, { 0x81eb, 0x023c }, { 0x81ec, 0x3c3d },
-	{ 0x81ed, 0x3d05 }, { 0x81ee, 0x05df }, { 0x81ef, 0xdf00 }, { 0x81f0, 0x0008 },
-	{ 0x81f1, 0x08f0 }, { 0x81f2, 0xf0f6 }, { 0x81f3, 0xf632 }, { 0x81f4, 0x3201 },
-	{ 0x81f5, 0x0117 }, { 0x81f6, 0x1704 }, { 0x81f7, 0x0410 }, { 0x81f8, 0x10bc },
-	{ 0x81f9, 0xbc02 }, { 0x81fa, 0x023f }, { 0x81fb, 0x3f11 }, { 0x81fc, 0x1105 },
-	{ 0x81fd, 0x05d3 }, { 0x81fe, 0xd300 }, { 0x81ff, 0x00f4 }, { 0x8200, 0xf43a },
-	{ 0x8201, 0x3a01 }, { 0x8202, 0x0106 }, { 0x8203, 0x0604 }, { 0x8204, 0x0410 },
-	{ 0x8205, 0x10cb }, { 0x8206, 0xcb02 }, { 0x8207, 0x023c }, { 0x8208, 0x3c3d },
-	{ 0x8209, 0x3d05 }, { 0x820a, 0x05df }, { 0x820b, 0xdf00 }, { 0x820d, 0x00f0 },
-	{ 0x820e, 0xf0f6 }, { 0x820f, 0xf632 }, { 0x8210, 0x3201 }, { 0x8211, 0x0117 },
-	{ 0x8212, 0x1704 }, { 0x8213, 0x0410 }, { 0x8214, 0x10bc }, { 0x8215, 0xbc02 },
-	{ 0x8216, 0x023f }, { 0x8217, 0x3f11 }, { 0x8218, 0x1105 }, { 0x8219, 0x05d3 },
-	{ 0x821a, 0xd300 }, { 0x821b, 0x00f4 }, { 0x821c, 0xf43a }, { 0x821d, 0x3a01 },
-	{ 0x821e, 0x0106 }, { 0x821f, 0x0604 }, { 0x8220, 0x0410 }, { 0x8221, 0x10cb },
-	{ 0x8222, 0xcb02 }, { 0x8223, 0x023c }, { 0x8224, 0x3c3d }, { 0x8225, 0x3d05 },
-	{ 0x8226, 0x05df }, { 0x8227, 0xdf00 }, { 0x8229, 0x00f0 }, { 0x822a, 0xf002 },
-	{ 0x822b, 0x021e }, { 0x822c, 0x1e0a }, { 0x822d, 0x0a01 }, { 0x822e, 0x0100 },
-	{ 0x8242, 0x0004 }, { 0x8243, 0x0400 }, { 0x8244, 0x000a }, { 0x8245, 0x0a07 },
-	{ 0x8246, 0x0727 }, { 0x8247, 0x27fe }, { 0x8248, 0xfe26 }, { 0x8249, 0x2688 },
-	{ 0x824a, 0x8888 }, { 0x824b, 0x8888 }, { 0x824c, 0x8888 }, { 0x824d, 0x8800 },
-	{ 0x824e, 0x0002 }, { 0x824f, 0x0201 }, { 0x8250, 0x0100 }, { 0x827a, 0x0001 },
-	{ 0x827b, 0x0100 }, { 0x832b, 0x0008 }, { 0x832c, 0x0808 }, { 0x832d, 0x0808 },
-	{ 0x832e, 0x0808 }, { 0x832f, 0x0806 }, { 0x8330, 0x0606 }, { 0x8331, 0x0606 },
-	{ 0x8332, 0x0606 }, { 0x8333, 0x0600 }, { 0x8334, 0x0002 }, { 0x8335, 0x0201 },
-	{ 0x8336, 0x0110 }, { 0x8337, 0x1010 }, { 0x8338, 0x1010 }, { 0x8339, 0x1010 },
-	{ 0x833a, 0x1000 }, { 0x833e, 0x0010 }, { 0x833f, 0x1000 }, { 0x8358, 0x0088 },
-	{ 0x8359, 0x8888 }, { 0x835a, 0x8800 }, { 0x836f, 0x0099 }, { 0x8370, 0x9938 },
-	{ 0x8371, 0x3806 }, { 0x8372, 0x0638 }, { 0x8373, 0x3800 }, { 0x8375, 0x0003 },
-	{ 0x8376, 0x0304 }, { 0x8377, 0x0405 }, { 0x8378, 0x0506 }, { 0x8379, 0x06f4 },
-	{ 0x837a, 0xf44d }, { 0x837b, 0x4d06 }, { 0x837c, 0x0600 }, { 0x837e, 0x0001 },
-	{ 0x837f, 0x0100 }, { 0x8380, 0x0080 }, { 0x8381, 0x8000 }, { 0x83a7, 0x0007 },
-	{ 0x83a8, 0x0700 }, { 0x83af, 0x0001 }, { 0x83b0, 0x0106 }, { 0x83b1, 0x0600 },
-	{ 0x83b6, 0x00c8 }, { 0x83b7, 0xc800 }, { 0x83b8, 0x00c8 }, { 0x83b9, 0xc842 },
-	{ 0x83ba, 0x42fd }, { 0x83bc, 0x7800 }, { 0x83bd, 0x0050 }, { 0x83be, 0x5080 },
-	{ 0x83bf, 0x8000 }, { 0x83c2, 0x4a29 }, { 0x83c3, 0x004a }, { 0x83c4, 0x4aa9 },
-	{ 0x83c5, 0xa94e }, { 0x83c6, 0x4eb3 }, { 0x83c7, 0xfd00 }, { 0x83c8, 0x3fde },
-	{ 0x83c9, 0xc84a }, { 0x83ca, 0x4ac4 }, { 0x83cb, 0xc444 }, { 0x83cc, 0x44f8 },
-	{ 0x83cd, 0xf84a }, { 0x83ce, 0x4aa9 }, { 0x83cf, 0xa900 }, { 0x83d0, 0x00c8 },
-	{ 0x83d1, 0xc84e }, { 0x83d2, 0x4ebc }, { 0x83d3, 0xbc4a }, { 0x83d4, 0x4ad6 },
-	{ 0x83d5, 0xd64a }, { 0x83d6, 0x4a93 }, { 0x83d7, 0x9300 }, { 0x83d8, 0x0045 },
-	{ 0x83d9, 0x454b }, { 0x83da, 0x4b75 }, { 0x83db, 0x751f }, { 0x83dc, 0x1f41 },
-	{ 0x83dd, 0x4182 }, { 0x83de, 0x8249 }, { 0x83df, 0x4907 }, { 0x83e0, 0x077a },
-	{ 0x83e1, 0x7a07 }, { 0x83e2, 0x0771 }, { 0x83e3, 0x7107 }, { 0x83e4, 0x077a },
-	{ 0x83e5, 0x7a05 }, { 0x83e6, 0x0526 }, { 0x83e7, 0x261e }, { 0x83e8, 0x1ee1 },
-	{ 0x83e9, 0xe100 }, { 0x83ea, 0x0029 }, { 0x83eb, 0x2900 }, { 0x83ed, 0x0007 },
-	{ 0x83ee, 0x077a }, { 0x83ef, 0x7a4b }, { 0x83f0, 0x4b69 }, { 0x83f1, 0x6900 },
-};
 
 static u16 cortina_ni_gphy_ocp_read(void __iomem *bank, u16 ocp)
 {
@@ -354,93 +186,12 @@ static void cortina_ni_gphy_ocp_write(void __iomem *bank, u16 ocp, u16 val)
 	writel(val, bank + CA_NI_GPHY_OCP(ocp));
 }
 
-/* write one firmware word: address register, then data register */
-static void cortina_ni_gphy_sram_write(void __iomem *bank, u16 addr, u16 data)
-{
-	cortina_ni_gphy_ocp_write(bank, CA_NI_GPHY_SRAM_ADDR, addr);
-	cortina_ni_gphy_ocp_write(bank, CA_NI_GPHY_SRAM_DATA, data);
-}
+/* ★ 2026-08-08 AOT5221ZY: see the bisect note at the call site in the probe. */
+static bool skip_mdio;
+module_param(skip_mdio, bool, 0444);
+MODULE_PARM_DESC(skip_mdio,
+		 "skip the MDIO bus + internal-PHY scan (AOT5221ZY SError bisect; the GPON WAN path does not need the LAN PHYs)");
 
-/*
- * Load the internal-GPHY SRAM firmware image + resume the uC, per bank.
- *
- * TIMING: the uC SRAM is only writable while the uC is HELD.  The uC only
- * becomes lockable AFTER the MDIO/GPHY init - i.e. around LINK-UP, NOT at probe
- * (where SRAM writes are ignored).  So this runs from the link-up hook
- * (cortina_ni_rx_link_up), not probe.  For each bank we take the gate/lock/
- * ready-poll handshake (cortina-ni-regs.h), stream the firmware image, then
- * clear the hold bit so the uC runs the freshly-written image (its default ROM
- * firmware does NOT forward - the SRAM image is what enables line<->system
- * forwarding).
- *
- * One-shot per bank per boot (ni->gphy_patched[]); a bank whose gate reads
- * EXT_INI (not lockable yet) is left for the next link-up.  If the ready-poll
- * times out we log it and write the words anyway (the hold bit still took).
- */
-static bool gphy_patch = true;
-module_param(gphy_patch, bool, 0444);
-MODULE_PARM_DESC(gphy_patch,
-		 "load the internal-GPHY SRAM firmware image before resuming the uC (default on)");
-
-void cortina_ni_gphy_patch_and_resume(struct cortina_ni *ni)
-{
-	void __iomem *win = ni->win[CA_NI_WIN_GPHY];
-	unsigned int b, i, t;
-
-	if (!win)
-		return;		/* GPHY window not mapped */
-
-	for (b = 0; b < CA_NI_GPHY_COUNT; b++) {
-		void __iomem *bank = win + CA_NI_GPHY_BANK(b);
-		u16 gate, ready = 0;
-		bool ok = false;
-
-		if (ni->gphy_patched[b])
-			continue;	/* one-shot per bank per boot */
-
-		/* gate: EXT_INI = uC not lockable yet, retry next link-up */
-		gate = readl(bank + CA_NI_GPHY_LOCK_GATE) & 0xffff;
-		if ((gate & CA_NI_GPHY_LOCK_GATE_MASK) ==
-		    CA_NI_GPHY_LOCK_GATE_EXT_INI)
-			continue;
-
-		/* hold the uC (SRAM only writable while held) */
-		writel(readl(bank + CA_NI_GPHY_LOCK) | CA_NI_GPHY_LOCK_HOLD,
-		       bank + CA_NI_GPHY_LOCK);
-
-		/* wait for pcs-locked, bounded; on timeout patch anyway */
-		for (t = 0; t < CA_NI_GPHY_LOCK_READY_TRIES; t++) {
-			ready = readl(bank + CA_NI_GPHY_LOCK_READY) & 0xffff;
-			if ((ready & CA_NI_GPHY_LOCK_READY_MASK) ==
-			    CA_NI_GPHY_LOCK_READY_VAL) {
-				ok = true;
-				break;
-			}
-			udelay(100);
-		}
-
-		/* stream the live-dumped firmware, one word at a time, in order */
-		if (gphy_patch)
-			for (i = 0;
-			     i < ARRAY_SIZE(cortina_ni_gphy_patch_words); i++)
-				cortina_ni_gphy_sram_write(bank,
-					cortina_ni_gphy_patch_words[i].addr,
-					cortina_ni_gphy_patch_words[i].data);
-
-		/* resume: clear the hold bit so the uC runs the fresh firmware */
-		writel(readl(bank + CA_NI_GPHY_LOCK) & ~CA_NI_GPHY_LOCK_HOLD,
-		       bank + CA_NI_GPHY_LOCK);
-
-		ni->gphy_patched[b] = true;
-
-		dev_info(ni->dev,
-			 "gphy patch bank %u: gate=0x%04x ready=%s wrote %u words\n",
-			 b, gate, ok ? "ok" : "timeout",
-			 gphy_patch ?
-			 (unsigned int)ARRAY_SIZE(cortina_ni_gphy_patch_words)
-			 : 0);
-	}
-}
 
 static int cortina_ni_mdio_read(struct mii_bus *bus, int addr, int regnum)
 {
@@ -488,6 +239,87 @@ static void cortina_ni_mdio_hw_enable(struct cortina_ni *ni)
 	dev_info(ni->dev, "GPHY wrapper: EN0=0x%08x EN1=0x%08x (patch_phy_done set)\n",
 		 readl(wrap + CA_NI_GPHY_WRAP_EN0),
 		 readl(wrap + CA_NI_GPHY_WRAP_EN1));
+}
+
+/*
+ * ★fix#138: faithful port of the vendor aal_internal_phy_init (Track A
+ * ca-ne/el/aal_phy.c) - the internal quad-GPHY bring-up - done entirely via the
+ * MEMORY-MAPPED GPHY path (cortina_ni_gphy_*), which NEVER touches the MDIO bus
+ * whose auto-scan SErrors on this AOT-5221Zy revision.  Vendor order:
+ *   1. aal_mdio_global_init + patch_phy_done: enable the GPHY wrapper (EN0/EN1),
+ *      which turns on the GPHY->port-MAC datapath for ALL four ports.
+ *   2. aal_internal_phy_patch: stream the SRAM firmware patch to all 4 banks.
+ *   3. POWER UP each PHY: the vendor does `data = MDIO_READ(phy,0); data &= 0xf7ff;
+ *      MDIO_WRITE(phy,0,data)` for phy 1..4 - clearing BMCR(reg0) bit11 (power-down)
+ *      so EVERY LAN jack's PHY comes up, not just the one U-Boot left enabled.
+ *      (0xf7ff keeps bit9 clear, so no auto-neg restart / no link bounce.)
+ * The vendor's optional rtct/green/force-100m/uC sub-patches (EEE + cable-diag)
+ * are NOT ported here - they are enhancements, not required for link.
+ */
+static void cortina_ni_internal_phy_init(struct cortina_ni *ni)
+{
+	void __iomem *wrap = ni->win[CA_NI_WIN_GPHY_WRAP];
+	int p;
+
+	if (wrap) {
+		u32 c1 = readl(wrap + CA_NI_GPHY_WRAP_CTRL1);
+
+		writel((c1 & ~CA_NI_GPHY_WRAP_CTRL1_PWRUP) |
+		       CA_NI_GPHY_WRAP_CTRL1_PWRUP, wrap + CA_NI_GPHY_WRAP_CTRL1);
+		usleep_range(1000, 1500);
+	}
+
+	cortina_ni_mdio_hw_enable(ni);	/* EN0/EN1: ocp_sel + patch_done + rst_gphy=0xF */
+
+	/*
+	 * ★fix#141b (2026-08-19): the CTRL1 PWRUP(0xF) + EN1 rst_gphy[7:4]=0xF
+	 * above are the whole NON-DESTRUCTIVE job here — they un-poison the
+	 * DIGITAL cores of banks 1..3 (regs.h:361) so cal_save/ID reads succeed
+	 * for all four; the decoupled bring-up (cortina_ni_rx_link_up ->
+	 * gphy_patch_and_resume + gphy_intf_establish, at link-up) then patches
+	 * and links every port exactly as image 210 does.
+	 *
+	 * ★ REMOVED (was the physical-LINK regression): the per-port
+	 * CA_NI_HV_INTF_RST_GPHY(p) teardown loop.  Pulsing INTF_RST on port 0 —
+	 * the port U-Boot had already CALIBRATED and TFTP'd over — tore down its
+	 * live ANALOG/PCS page (0xbxx) into 0xbad0 poison.  Two probe-order facts
+	 * then made it permanent: cortina_ni_rx_gphy_cal_save() (run right after
+	 * this, in rx_probe) snapshotted the POISONED cal, and the probe-time
+	 * patch_and_resume below consumed the gphy_patched[] one-shot so link-up's
+	 * clean patch never re-ran — so gphy_intf_establish restored 0xbad0 back
+	 * into port 0's analog cal and the line side never linked (peer carrier=0).
+	 * The digital ID read on OCP page 0xa4x still ACK'd (=VALID), which masked
+	 * it.  Not resetting the analog domain here keeps port 0's U-Boot cal (fault
+	 * 0x0000), which is what makes all four jacks link.
+	 */
+
+	/*
+	 * DIAGNOSTIC (fix#141): the reset-release effect BEFORE the firmware
+	 * patch and BEFORE any link-up wrap re-establish.  Demoted to dev_info
+	 * now that the 4-GPHY bring-up is proven (all cores read VALID).
+	 */
+	if (wrap) {
+		dev_info(ni->dev, "FIX141 after reset-release: CTRL13=0x%08x\n",
+			readl(wrap + CA_NI_GPHY_WRAP_EN1));
+		for (p = CA_NI_GPHY_FIRST;
+		     p < CA_NI_GPHY_FIRST + CA_NI_GPHY_COUNT; p++) {
+			int id1 = cortina_ni_gphy_read(ni, p, 2);
+			int id2 = cortina_ni_gphy_read(ni, p, 3);
+
+			dev_info(ni->dev, "FIX141 PHY%d ID=0x%04x:0x%04x %s\n",
+				p, id1, id2,
+				(id1 == 0x001c) ? "VALID" : "POISON");
+		}
+	}
+
+	/* ★fix#141b: do NOT patch_and_resume() here — that consumes the
+	 * gphy_patched[] one-shot so the link-up decoupled path (which snapshots
+	 * cal, holds the uC, streams SRAM fresh and establishes the interface)
+	 * would no-op.  Likewise do NOT force BMCR power-up here.  Both now run at
+	 * link-up (cortina_ni_rx_link_up), AFTER cortina_ni_rx_gphy_cal_save() has
+	 * captured port 0's intact U-Boot analog cal — so the analog domain relocks
+	 * and the line side links. */
+	dev_info(ni->dev, "FIX141b internal-PHY cores powered (patch/BMCR/link deferred to link-up)\n");
 }
 
 static int cortina_ni_map_windows(struct cortina_ni *ni)
@@ -657,7 +489,7 @@ static int cortina_ni_mdio_init(struct cortina_ni *ni)
 }
 
 /* ------------------------------------------------------------------ */
-/* the arbitrary-window register peek, read-only (debugfs .../cortina-ni/peek) */
+/* /proc/cortina_ni_peek: dump ARBITRARY window registers, read-only.  */
 /* Decisive good-vs-bad-boot diff tool - every RX-subset register reads */
 /* identical on a working and a broken boot, so the deciding bit lives  */
 /* in a register the fixed spy does not print.  Bounded, plain readl,   */
@@ -695,101 +527,13 @@ static void __iomem *cortina_ni_peek_base(struct cortina_ni *ni, u8 win,
 	return ni->win[win];
 }
 
-/*
- * ★★ THE BOUND THAT WAS MISSING: A MAPPED WINDOW IS NOT A READABLE WINDOW.
- *
- * The peek already refused an offset past the mapped SIZE, and that is the
- * bound people think of - but it is not the one that takes the board down.
- * Inside these windows are UNMAPPED HOLES, and touching one is not an error
- * return: it is a synchronous external abort or an async SError, i.e. the box
- * is gone and the operator has learned nothing.  Three are recorded in this
- * tree, each paid for with a crash:
- *   - the L3 special-packet block (SPKTP / SPB) - a write hangs the CPU;
- *   - the L3FE HS_LIGHT tail, RE'd from the wrong chip's tree - a write
- *     async-SErrored on the first flow install (the t=58.5 s panic);
- *   - the per-port MAC block tail - a plain readl faults, which is why the
- *     register dump in cortina-ni-rx.c stops at +0x6c and says "never widen".
- * Only ONE of the three was guarded, only against writes, only for two of the
- * four offsets, and only on the /proc path.
- *
- * So the refusals are DECLARED DATA, applied to every caller, and each one
- * says which access it refuses and WHY - a bare -EPERM from a debug tool is
- * indistinguishable from the tool being broken.
- *
- * @read_faults separates the two classes honestly: for the special-packet and
- * HS_LIGHT holes what is MEASURED is that a WRITE kills the board, so reads
- * stay allowed rather than being refused on a guess; for the per-port tail the
- * measured fault is the READ itself.
- */
-static const struct cortina_ni_peek_hole cortina_ni_peek_holes[] = {
-	{ CA_NI_WIN_NI, 0x333c, 0x3340, false,
-	  "L3 special-packet detect (SPKTP): unmapped on this silicon, a write hangs the CPU" },
-	{ CA_NI_WIN_NI, 0x3440, 0x3444, false,
-	  "L3 special-packet buffer (SPB): unmapped on this silicon, a write hangs the CPU" },
-	{ CA_NI_WIN_NI, 0x3dc4, 0x3dcc, false,
-	  "L3FE HS_LIGHT tail: absent on this die (the window ends at ~0x3c8c), a write async-SErrors" },
-	/*
-	 * The per-port MAC block tail, +0x74..+0x8c of each port's 0x90 stride.
-	 * MEASURED on port 0 (0xa634..0xa64c); the other ports are refused by
-	 * the stride, which is a deliberate fail-closed extension - the blocks
-	 * are identical by construction, and refusing seven words of a debug
-	 * peek costs nothing next to aborting the CPU.  Nothing in this driver
-	 * reads that range on any port.  Narrow it if it ever hides a real
-	 * register, and say which port proved it.
-	 */
-	{ CA_NI_WIN_NI, CA_NI_PORT_STATIC_CFG(0) + 0x74,
-	  CA_NI_PORT_STATIC_CFG(0) + 0x8c, true,
-	  "per-port MAC block tail: unmapped, readl faults (synchronous external abort)" },
-	{ CA_NI_WIN_NI, CA_NI_PORT_STATIC_CFG(1) + 0x74,
-	  CA_NI_PORT_STATIC_CFG(1) + 0x8c, true,
-	  "per-port MAC block tail: unmapped, readl faults (synchronous external abort)" },
-	{ CA_NI_WIN_NI, CA_NI_PORT_STATIC_CFG(2) + 0x74,
-	  CA_NI_PORT_STATIC_CFG(2) + 0x8c, true,
-	  "per-port MAC block tail: unmapped, readl faults (synchronous external abort)" },
-	{ CA_NI_WIN_NI, CA_NI_PORT_STATIC_CFG(3) + 0x74,
-	  CA_NI_PORT_STATIC_CFG(3) + 0x8c, true,
-	  "per-port MAC block tail: unmapped, readl faults (synchronous external abort)" },
-	{ CA_NI_WIN_NI, CA_NI_PORT_STATIC_CFG(4) + 0x74,
-	  CA_NI_PORT_STATIC_CFG(4) + 0x8c, true,
-	  "per-port MAC block tail: unmapped, readl faults (synchronous external abort)" },
-	{ CA_NI_WIN_NI, CA_NI_PORT_STATIC_CFG(5) + 0x74,
-	  CA_NI_PORT_STATIC_CFG(5) + 0x8c, true,
-	  "per-port MAC block tail: unmapped, readl faults (synchronous external abort)" },
-	{ CA_NI_WIN_NI, CA_NI_PORT_STATIC_CFG(6) + 0x74,
-	  CA_NI_PORT_STATIC_CFG(6) + 0x8c, true,
-	  "per-port MAC block tail: unmapped, readl faults (synchronous external abort)" },
-};
-/* The port rows above are written out one per port so each is greppable at its
- * literal offset.  If the port count ever changes, this fails the BUILD rather
- * than silently leaving the new port's hole open. */
-static_assert(CA_NI_PORT_COUNT == 7,
-	      "add/remove a cortina_ni_peek_holes row per NI port");
-
-bool cortina_ni_peek_access_ok(u8 win, u32 off, bool write, const char **why)
+static int cortina_ni_peek_show(struct seq_file *m, void *v)
 {
-	unsigned int i;
-
-	for (i = 0; i < ARRAY_SIZE(cortina_ni_peek_holes); i++) {
-		const struct cortina_ni_peek_hole *h = &cortina_ni_peek_holes[i];
-
-		if (h->win != win || off < h->first || off > h->last)
-			continue;
-		if (!write && !h->read_faults)
-			continue;	/* only the write is known to fault */
-		*why = h->why;
-		return false;
-	}
-	*why = NULL;
-	return true;
-}
-
-void cortina_ni_peek_render(struct seq_file *m, struct cortina_ni *ni)
-{
+	struct cortina_ni *ni = m->private;
 	struct cortina_ni_peek q = ni->peek;	/* snapshot */
-	const char *name = "?";
-	const char *why;
 	void __iomem *base;
 	size_t size;
+	const char *name = "?";
 	u32 i;
 
 	for (i = 0; i < ARRAY_SIZE(cortina_ni_peek_wins); i++)
@@ -799,17 +543,15 @@ void cortina_ni_peek_render(struct seq_file *m, struct cortina_ni *ni)
 	base = cortina_ni_peek_base(ni, q.win, &size);
 	if (!base) {
 		seq_printf(m, "%s: window unavailable\n", name);
-		return;
+		return 0;
 	}
 	if (!q.count) {
 		seq_puts(m,
-			 "usage: echo '[win] <hex_off> [count]' > this file\n"
+			 "usage: echo '[win] <hex_off> [count]' > /proc/cortina_ni_peek\n"
 			 "  win = ni|dma|glb|gphy|wrap|reo|mdio|intr|sgmii|peri (default ni)\n"
 			 "  gphy off is raw in the 1M window (port p bank = p*0x40000)\n"
-			 "  poke: echo 'poke [win] <hex_off> <hex_val>'\n"
-			 "  offsets past the mapped size, and the declared unmapped holes,\n"
-			 "  are REFUSED with the reason - see cortina_ni_peek_holes\n");
-		return;
+			 "  poke: echo 'poke [win] <hex_off> <hex_val>' (SPB/SPKTP holes refused)\n");
+		return 0;
 	}
 
 	for (i = 0; i < q.count; i++) {
@@ -820,41 +562,40 @@ void cortina_ni_peek_render(struct seq_file *m, struct cortina_ni *ni)
 				   name, off, size);
 			break;
 		}
-		/* A refusal NAMES ITSELF and the scan CONTINUES: skipping a
-		 * hole silently would make a dump look complete when a word of
-		 * it was never taken, and aborting would make one bad word cost
-		 * the whole range. */
-		if (!cortina_ni_peek_access_ok(q.win, off, false, &why)) {
-			seq_printf(m, "%s+0x%05x = <REFUSED: %s>\n",
-				   name, off, why);
-			continue;
-		}
 		seq_printf(m, "%s+0x%05x = 0x%08x\n", name, off,
 			   readl(base + off));
 	}
+	return 0;
 }
 
-/*
- * Parse and apply one peek/poke command.  @buf is modified in place and must
- * be NUL-terminated.  Shared by the /proc node and by debugfs, so the bounds
- * cannot be present on one path and missing on the other.
- */
-int cortina_ni_peek_command(struct cortina_ni *ni, char *buf)
+static int cortina_ni_peek_open(struct inode *inode, struct file *file)
 {
+	return single_open(file, cortina_ni_peek_show, pde_data(inode));
+}
+
+static ssize_t cortina_ni_peek_write(struct file *file, const char __user *ubuf,
+				     size_t len, loff_t *ppos)
+{
+	struct cortina_ni *ni = pde_data(file_inode(file));
+	char buf[64], *p, *tok;
 	u8 win = CA_NI_WIN_NI;
-	const char *why;
-	char *p, *tok;
 	u32 off, count = 1;
 	int i;
 
+	if (len == 0 || len >= sizeof(buf))
+		return -EINVAL;
+	if (copy_from_user(buf, ubuf, len))
+		return -EFAULT;
+	buf[len] = '\0';
 	p = strim(buf);
+
 	tok = strsep(&p, " \t");
 	if (!tok || !*tok)
 		return -EINVAL;
 
 	/* 'poke' verb: WRITE a register for fast live RE iteration (a boot is
 	 * ~200s; a poke is instant).  usage:
-	 *   echo 'poke [win] <hex_off> <hex_val>'
+	 *   echo 'poke [win] <hex_off> <hex_val>' > /proc/cortina_ni_peek
 	 * The read-back is armed to the poked reg, so a follow-up cat shows it.
 	 * (project rule: dump/spy/poke stays a first-class, always-on feature.) */
 	if (!strcmp(tok, "poke")) {
@@ -878,11 +619,14 @@ int cortina_ni_peek_command(struct cortina_ni *ni, char *buf)
 			return -EINVAL;
 		if (off & 3)
 			return -EINVAL;			/* 32-bit aligned only */
-		if (!cortina_ni_peek_access_ok(win, off, true, &why)) {
-			pr_warn("%s: peek: refusing poke of window %u +0x%05x: %s\n",
-				CA_NI_DRV_NAME, win, off, why);
+		/* crash-hole guard: the L3 special-packet block (SPKTP 0x333c/40,
+		 * SPB 0x3440/44) is UNMAPPED on RTL9607F silicon - a write there
+		 * hangs the CPU and async-SErrors the board (proven on live stock).
+		 * Refuse those four; every other 0x32xx-0x33xx reg is real.  */
+		if (win == CA_NI_WIN_NI &&
+		    (off == 0x333c || off == 0x3340 ||
+		     off == 0x3440 || off == 0x3444))
 			return -EPERM;
-		}
 		base = cortina_ni_peek_base(ni, win, &size);
 		if (!base)
 			return -ENODEV;
@@ -892,7 +636,7 @@ int cortina_ni_peek_command(struct cortina_ni *ni, char *buf)
 		ni->peek.win = win;
 		ni->peek.off = off;
 		ni->peek.count = 1;
-		return 0;
+		return len;
 	}
 
 	/* optional leading window name (non-hex first token) */
@@ -918,16 +662,22 @@ int cortina_ni_peek_command(struct cortina_ni *ni, char *buf)
 	ni->peek.win = win;
 	ni->peek.off = off;
 	ni->peek.count = count;
-	return 0;
+	return len;
 }
 
+static const struct proc_ops cortina_ni_peek_pops = {
+	.proc_open	= cortina_ni_peek_open,
+	.proc_read	= seq_read,
+	.proc_lseek	= seq_lseek,
+	.proc_release	= single_release,
+	.proc_write	= cortina_ni_peek_write,
+};
+
 /* ------------------------------------------------------------------ */
-/* the internal-GPHY uC SRAM reader (ours-vs-stock firmware diff),      */
-/* read-only.  Same access the operator used on stock: OCP 0xa436=addr, */
-/* read OCP 0xa438=data.  The uC is best-effort held around the dump    */
-/* (stock reads fine while held).  debugfs .../cortina-ni/gsram; it was */
-/* /proc/cortina_ni_gsram and it has no test consumer, by design - it   */
-/* is a bring-up tool for a human, not a measurement source.            */
+/* /proc/cortina_ni_gsram: read the internal-GPHY uC SRAM (0x8xxx words) */
+/* for the ours-vs-stock firmware diff, read-only.  Same access the      */
+/* operator used on stock: OCP 0xa436=addr, read OCP 0xa438=data.  The uC */
+/* is best-effort held around the dump (stock reads fine while held).     */
 /* ------------------------------------------------------------------ */
 static int cortina_ni_gsram_show(struct seq_file *m, void *v)
 {
@@ -943,8 +693,7 @@ static int cortina_ni_gsram_show(struct seq_file *m, void *v)
 	}
 	if (!q.count) {
 		seq_puts(m,
-			 "usage: echo '<bank> <hex_start> <count>' > "
-			 "/sys/kernel/debug/cortina-ni/gsram\n"
+			 "usage: echo '<bank> <hex_start> <count>' > /proc/cortina_ni_gsram\n"
 			 "  bank 0..3, start = SRAM word addr (hex, e.g. 8000), count 1..1024\n");
 		return 0;
 	}
@@ -974,13 +723,13 @@ static int cortina_ni_gsram_show(struct seq_file *m, void *v)
 
 static int cortina_ni_gsram_open(struct inode *inode, struct file *file)
 {
-	return single_open(file, cortina_ni_gsram_show, inode->i_private);
+	return single_open(file, cortina_ni_gsram_show, pde_data(inode));
 }
 
 static ssize_t cortina_ni_gsram_write(struct file *file, const char __user *ubuf,
 				      size_t len, loff_t *ppos)
 {
-	struct cortina_ni *ni = ((struct seq_file *)file->private_data)->private;
+	struct cortina_ni *ni = pde_data(file_inode(file));
 	char buf[64], *p, *tok;
 	u32 bank, start, count;
 
@@ -1011,209 +760,13 @@ static ssize_t cortina_ni_gsram_write(struct file *file, const char __user *ubuf
 	return len;
 }
 
-static const struct file_operations cortina_ni_dbgfs_gsram_fops = {
-	.owner		= THIS_MODULE,
-	.open		= cortina_ni_gsram_open,
-	.read		= seq_read,
-	.write		= cortina_ni_gsram_write,
-	.llseek		= seq_lseek,
-	.release	= single_release,
+static const struct proc_ops cortina_ni_gsram_pops = {
+	.proc_open	= cortina_ni_gsram_open,
+	.proc_read	= seq_read,
+	.proc_lseek	= seq_lseek,
+	.proc_release	= single_release,
+	.proc_write	= cortina_ni_gsram_write,
 };
-
-/* ------------------------------------------------------------------ */
-/* debugfs: the peek's supported home, and the ethtool -d decode map    */
-/* ------------------------------------------------------------------ */
-
-/*
- * WHY debugfs and not /proc.
- *
- * The counters moved to `ethtool -S` because a test must be able to ask the
- * SAME question of the vendor firmware and of ours, and a /proc node named
- * after this driver can only ever BLOCK on stock.  The peek is the opposite
- * case and it is worth being explicit about: it is an arbitrary-MMIO RE tool
- * with no vendor counterpart by construction, so it is NOT a comparison
- * instrument and no case may derive a stock-vs-ours verdict from it.  What it
- * needs is a home that is unambiguously a debug surface, mountable or not at
- * the integrator's choice, and that is debugfs.
- *
- * ★ RETIRED 2026-08-08.  There are no driver-named /proc nodes left: the peek,
- * the GPHY-SRAM reader and the rx/tx/l3fe narratives are all published here,
- * and every countable VALUE moved to `ethtool -S` / `ethtool -d`, which the
- * VENDOR firmware's kernel serves too - that is what makes a stock-vs-ours
- * comparison possible at all, and it never was through a node of ours.
- */
-static int cortina_ni_dbgfs_peek_show(struct seq_file *m, void *v)
-{
-	cortina_ni_peek_render(m, m->private);
-	return 0;
-}
-
-static int cortina_ni_dbgfs_peek_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, cortina_ni_dbgfs_peek_show, inode->i_private);
-}
-
-static ssize_t cortina_ni_dbgfs_peek_write(struct file *file,
-					   const char __user *ubuf,
-					   size_t len, loff_t *ppos)
-{
-	struct seq_file *m = file->private_data;
-	char buf[64];
-	int ret;
-
-	if (len == 0 || len >= sizeof(buf))
-		return -EINVAL;
-	if (copy_from_user(buf, ubuf, len))
-		return -EFAULT;
-	buf[len] = '\0';
-
-	ret = cortina_ni_peek_command(m->private, buf);
-	return ret ? ret : len;
-}
-
-static const struct file_operations cortina_ni_dbgfs_peek_fops = {
-	.owner		= THIS_MODULE,
-	.open		= cortina_ni_dbgfs_peek_open,
-	.read		= seq_read,
-	.write		= cortina_ni_dbgfs_peek_write,
-	.llseek		= seq_lseek,
-	.release	= single_release,
-};
-
-/*
- * The decode key for `ethtool -d`.  That blob is a flat u32 array and no
- * userspace tool knows how to name its words, so the map is published beside
- * it: one line per word, index -> name -> NI-window offset, generated from the
- * same table the dump is taken from.  Without this the register snapshot is
- * only diffable against itself; with it, a word that differs can be named.
- */
-static int cortina_ni_dbgfs_regmap_show(struct seq_file *m, void *v)
-{
-	unsigned int i, n = cortina_ni_regdump_len();
-
-	seq_printf(m, "# ethtool -d words: %u (u32 each, NI window)\n", n);
-	seq_puts(m, "# index name offset\n");
-	for (i = 0; i < n; i++) {
-		const char *name;
-		u32 off;
-
-		cortina_ni_regdump_entry(i, &name, &off);
-		seq_printf(m, "%u %s 0x%04x\n", i, name, off);
-	}
-	return 0;
-}
-DEFINE_SHOW_ATTRIBUTE(cortina_ni_dbgfs_regmap);
-
-static void cortina_ni_debugfs_release(void *data)
-{
-	debugfs_remove_recursive(data);
-}
-
-/*
- * The narrative dumps live in rx.c / tx.c / flowoffload.c beside the state they
- * print; only their PUBLICATION is here, so there is one place that answers
- * "what hand-debugging surface does this driver expose".
- */
-static int cortina_ni_dbgfs_rx_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, cortina_ni_rx_debug_show, inode->i_private);
-}
-
-static const struct file_operations cortina_ni_dbgfs_rx_fops = {
-	.owner		= THIS_MODULE,
-	.open		= cortina_ni_dbgfs_rx_open,
-	.read		= seq_read,
-	.llseek		= seq_lseek,
-	.release	= single_release,
-};
-
-static int cortina_ni_dbgfs_tx_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, cortina_ni_tx_debug_show, inode->i_private);
-}
-
-static const struct file_operations cortina_ni_dbgfs_tx_fops = {
-	.owner		= THIS_MODULE,
-	.open		= cortina_ni_dbgfs_tx_open,
-	.read		= seq_read,
-	.llseek		= seq_lseek,
-	.release	= single_release,
-};
-
-#if IS_ENABLED(CONFIG_CORTINA_NI_FLOWOFFLOAD)
-static int cortina_ni_dbgfs_l3fe_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, cortina_ni_l3fe_debug_show, inode->i_private);
-}
-
-static const struct file_operations cortina_ni_dbgfs_l3fe_fops = {
-	.owner		= THIS_MODULE,
-	.open		= cortina_ni_dbgfs_l3fe_open,
-	.read		= seq_read,
-	.llseek		= seq_lseek,
-	.release	= single_release,
-};
-
-/* The CONTROL is its own file and 0200 (write-only) on purpose: a bring-up
- * write is not a measurement, and a reader who lands on it by accident must not
- * come away with something that looks like one. */
-static const struct file_operations cortina_ni_dbgfs_l3fe_ctl_fops = {
-	.owner		= THIS_MODULE,
-	.open		= cortina_ni_dbgfs_l3fe_open,
-	.write		= cortina_ni_l3fe_debug_write,
-	.llseek		= seq_lseek,
-	.release	= single_release,
-};
-#endif
-
-void cortina_ni_debugfs_init(struct cortina_ni *ni)
-{
-	struct dentry *d;
-#if IS_ENABLED(CONFIG_CORTINA_NI_FLOWOFFLOAD)
-	struct dentry *l;
-#endif
-
-	/* A stub when debugfs is off: debugfs_create_dir() then returns an
-	 * ERR_PTR that every later call swallows, so nothing here has to be
-	 * conditional - but an ERR_PTR must not be handed to devm as a pointer
-	 * to free. */
-	d = debugfs_create_dir(CA_NI_DRV_NAME, NULL);
-	if (IS_ERR_OR_NULL(d))
-		return;
-	ni->dbgfs = d;
-
-	/* teardown is tied to the device: this driver has no .remove, and a
-	 * dentry left behind by a module unload would collide with the next
-	 * probe's create */
-	if (devm_add_action_or_reset(ni->dev, cortina_ni_debugfs_release, d)) {
-		ni->dbgfs = NULL;
-		return;
-	}
-
-	debugfs_create_file("peek", 0644, d, ni, &cortina_ni_dbgfs_peek_fops);
-	debugfs_create_file("regdump_map", 0444, d, ni,
-			    &cortina_ni_dbgfs_regmap_fops);
-	debugfs_create_file("gsram", 0644, d, ni, &cortina_ni_dbgfs_gsram_fops);
-	debugfs_create_file("rx_state", 0444, d, ni, &cortina_ni_dbgfs_rx_fops);
-	debugfs_create_file("tx_state", 0444, d, ni, &cortina_ni_dbgfs_tx_fops);
-
-#if IS_ENABLED(CONFIG_CORTINA_NI_FLOWOFFLOAD)
-	/* The offload engine gets its OWN directory, matching how it is declared
-	 * to the test rig: .../cortina-l3fe/{state,control}.  Two files, not one,
-	 * because a READ and a bring-up WRITE are different things and merging
-	 * them is how a control ends up looking like a measurement source. */
-	l = debugfs_create_dir("cortina-l3fe", NULL);
-	if (!IS_ERR_OR_NULL(l)) {
-		if (devm_add_action_or_reset(ni->dev,
-					     cortina_ni_debugfs_release, l))
-			return;
-		debugfs_create_file("state", 0444, l, ni,
-				    &cortina_ni_dbgfs_l3fe_fops);
-		debugfs_create_file("control", 0200, l, ni,
-				    &cortina_ni_dbgfs_l3fe_ctl_fops);
-	}
-#endif
-}
 
 /* Pulse one NE block reset: assert (set bit) -> 1ms -> deassert (clear bit),
  * stock ca_ni_global_reset order.  Returns the register value read back WHILE
@@ -1273,6 +826,7 @@ static void __maybe_unused cortina_ni_qm_reset(struct cortina_ni *ni)
 		 h_ni, h_tqm, readl(rst));
 }
 
+
 static int cortina_ni_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -1284,19 +838,10 @@ static int cortina_ni_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	ni->dev = dev;
 	/* guards the ONE reader of the read-and-clear NI_HV counters; must be
-	 * live before anything can sample them (the rx/l3fe /proc nodes and
+	 * live before anything can sample them (the rx and l3fe /proc nodes and
 	 * `ethtool -S` all go through it) */
 	spin_lock_init(&ni->nihv_lock);
 	platform_set_drvdata(pdev, ni);
-
-	/*
-	 * Front-panel per-RJ45 link lamps: publish the per-port LED triggers
-	 * before any of the bring-up below.  Early on purpose - an LED that is
-	 * already registered binds immediately, and no early `return ret` on the
-	 * way down can skip it.  Software only: it touches no hardware, returns
-	 * void, and cannot fail the probe (cortina-ni-leds.c).
-	 */
-	cortina_ni_leds_probe(ni);
 
 	ret = cortina_ni_map_windows(ni);
 	if (ret)
@@ -1328,7 +873,10 @@ static int cortina_ni_probe(struct platform_device *pdev)
 		u32 was = readl(glb + CA_NI_GLB_BLOCK_RESET);
 		int j;
 
-		writel(CA_NI_GLB_BLOCK_RESET_VAL, glb + CA_NI_GLB_BLOCK_RESET);
+		/* ★ fix #14: the DPHY sub-block release goes to DPHY_RESET (0x0a0),
+		 * the per-block sequence below to BLOCK_RESET (0x098) -- two
+		 * different registers on this silicon (see cortina-ni-regs.h). */
+		writel(CA_NI_GLB_BLOCK_RESET_VAL, glb + CA_NI_GLB_DPHY_RESET);
 		for (j = 0; j < ARRAY_SIZE(order); j++) {
 			u32 v = readl(glb + CA_NI_GLB_BLOCK_RESET);
 
@@ -1360,11 +908,39 @@ static int cortina_ni_probe(struct platform_device *pdev)
 
 	cortina_ni_log_reserved_mem(ni);
 
-	ret = cortina_ni_mdio_init(ni);
-	if (ret)
-		return ret;
+	/*
+	 * ★ 2026-08-08 AOT5221ZY bisect switch: skip the MDIO bus + internal-PHY
+	 * scan entirely.  The `Asynchronous SError 0xbe000011` on idle CPU1 lands
+	 * ~9 ms after the LAST MDIO PHY-id read, boot after boot, and does not move
+	 * when unrelated register maps or the block-reset target change (fixes #13
+	 * and #14 both left it at 1.3298/1.3301 s).  This board's GPON WAN datapath
+	 * (the US OMCI TX ring) does not need the LAN PHYs at all, so this is both
+	 * the isolation test and, if it holds, a usable bring-up path.
+	 * Boot with cortina_ni.skip_mdio=1.
+	 */
+	if (skip_mdio) {
+		dev_info(dev, "skip_mdio=1: MDIO bus + internal-PHY scan SKIPPED\n");
+		/*
+		 * ★fix#137: the MDIO-BUS SCAN (devm_of_mdiobus_register probing
+		 * phy@1..4) is what SErrors on this AOT-5221Zy revision - NOT the
+		 * memory-mapped GPHY path.  So we STILL bring up the internal quad-
+		 * GPHY for all 4 LAN jacks via the mmio path the vendor uses
+		 * (aal_mdio_global_init + aal_internal_phy_init), which never
+		 * touches the MDIO bus: force the GPHY wrapper EN0/EN1 (EN1 bit12
+		 * patch_phy_done = the GPHY->port-MAC datapath for every port), then
+		 * stream the SRAM firmware patch to all banks.  Without this, only
+		 * the port U-Boot happened to leave enabled passes traffic; with it
+		 * all four jacks come up with hardware auto-neg/link.  Both calls are
+		 * mmio-only and one-shot-guarded, so they are safe here at probe.
+		 */
+		cortina_ni_internal_phy_init(ni);
+	} else {
+		ret = cortina_ni_mdio_init(ni);
+		if (ret)
+			return ret;
 
-	cortina_ni_scan_phys(ni);
+		cortina_ni_scan_phys(ni);
+	}
 
 	ret = cortina_ni_tx_probe(ni);
 	if (ret)
@@ -1374,6 +950,16 @@ static int cortina_ni_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
+	/* ★DSA (lan1..lan4): register the switch now that the conduit netdev
+	 * (eth0) and the MDIO bus are up.  Non-fatal — on any non-defer error we
+	 * keep the working single-netdev datapath so the board still comes up. */
+	ret = cortina_ni_dsa_register(ni);
+	if (ret == -EPROBE_DEFER)
+		return ret;
+	if (ret)
+		dev_warn(dev, "DSA lan1..lan4 not registered (%d); eth0 only\n",
+			 ret);
+
 	/* L3FE flow-engine arm + verify (nf_flow_table HW offload, phase 1).
 	 * Non-fatal: on any error the offload stays disabled and the normal
 	 * datapath is untouched. */
@@ -1381,15 +967,24 @@ static int cortina_ni_probe(struct platform_device *pdev)
 	if (ret)
 		dev_warn(dev, "L3FE flow offload disabled (%d)\n", ret);
 
-	/* ★ EVERY hand-debugging dump this driver has, in ONE generic place.
-	 * There are no driver-named /proc nodes any more: what a TEST reads is
-	 * `ethtool -S` / `-d` (which stock's kernel serves too, so a comparison
-	 * exists at all), and what a HUMAN reads is here.  Runs last in probe so
-	 * rx/tx/l3fe are already up and every dump has something to show. */
+	/* arbitrary-register peek (good-vs-bad-boot diff tool) */
+	proc_create_data("cortina_ni_peek", 0644, NULL, &cortina_ni_peek_pops,
+			 ni);
+	/* internal-GPHY uC SRAM reader (ours-vs-stock firmware diff) */
+	proc_create_data("cortina_ni_gsram", 0644, NULL, &cortina_ni_gsram_pops,
+			 ni);
+	/* the `ethtool -d` decode map (cortina-ni/regdump_map) */
 	cortina_ni_debugfs_init(ni);
 
 	dev_info(dev, "M2c probe complete\n");
 	return 0;
+}
+
+static void cortina_ni_remove(struct platform_device *pdev)
+{
+	struct cortina_ni *ni = platform_get_drvdata(pdev);
+
+	cortina_ni_dsa_unregister(ni);
 }
 
 static const struct of_device_id cortina_ni_of_match[] = {
@@ -1400,6 +995,7 @@ MODULE_DEVICE_TABLE(of, cortina_ni_of_match);
 
 static struct platform_driver cortina_ni_driver = {
 	.probe = cortina_ni_probe,
+	.remove = cortina_ni_remove,
 	.driver = {
 		.name = CA_NI_DRV_NAME,
 		.of_match_table = cortina_ni_of_match,
@@ -1441,9 +1037,41 @@ static struct phy_driver cortina_ni_gphy_driver[] = { {
 	.read_status	= genphy_read_status,
 } };
 
+/* ★fix#127: stop the Cortina per-CPU hardware watchdog (block base 0xf432901c, CTRL@+0x00).
+ * U-Boot's cortina_wdt arms this HW watchdog (EN|RSTEN) before booting the OS.  Stock's 5.10
+ * kernel wires a wdt driver that pets it; this clean-room 6.18 kernel wires none, so nothing
+ * kicks it and the SoC SILENTLY hard-resets a few minutes in -- no kernel panic on the console,
+ * then U-Boot boots NAND stock.  Writing 0 to CTRL is exactly cortina_wdt_stop() (writel(0,base):
+ * clears EN|RSTEN|CLK_SEL).  Done at module_init, which for this built-in driver runs a few
+ * seconds into boot -- far ahead of the multi-minute timeout.  Petting (a real wdt driver +
+ * procd /dev/watchdog) is the proper follow-up; stopping keeps this bring-up image alive. */
+#define CA_WDT_CTRL_PA	0xf432901cUL
+static bool wdt_disable = true;
+module_param(wdt_disable, bool, 0444);
+MODULE_PARM_DESC(wdt_disable, "fix#127: stop the U-Boot-armed Cortina HW watchdog (write 0 to CTRL 0xf432901c) so this wdt-driver-less 6.18 kernel is not silently reset ~minutes in (=0 to A/B)");
+
+static void cortina_ni_wdt_stop(void)
+{
+	void __iomem *ctrl;
+
+	if (!wdt_disable)
+		return;
+	ctrl = ioremap(CA_WDT_CTRL_PA, 4);
+	if (!ctrl) {
+		pr_warn("cortina-ni: fix#127 wdt ioremap(0x%lx) failed; HW watchdog left armed\n",
+			CA_WDT_CTRL_PA);
+		return;
+	}
+	writel(0, ctrl);
+	iounmap(ctrl);
+	pr_info("cortina-ni: fix#127 HW watchdog stopped (CTRL 0x%lx <- 0)\n", CA_WDT_CTRL_PA);
+}
+
 static int __init cortina_ni_module_init(void)
 {
 	int ret;
+
+	cortina_ni_wdt_stop();
 
 	/* register the GPHY driver FIRST so it binds the internal PHYs at MDIO
 	 * scan time (during the platform probe), overriding genphy + its aneg */
@@ -1459,7 +1087,21 @@ static int __init cortina_ni_module_init(void)
 				       ARRAY_SIZE(cortina_ni_gphy_driver));
 	return ret;
 }
+#ifdef MODULE
 module_init(cortina_ni_module_init);
+#else
+/* ★ late_initcall (NOT device_initcall) when built-in: the NI driver registers a
+ * DSA switch (cortina-ni-dsa.c) whose tagger, net/dsa/tag_cortina, registers at
+ * device_initcall.  drivers/ links before net/, so a device_initcall probe runs
+ * BEFORE the tagger -> dsa_register_switch() returns -EPROBE_DEFER (dsa.c:1194,
+ * -ENOPROTOOPT) -> the deferred_probe core RE-RUNS this probe, which is NOT
+ * idempotent (re-proc_create() WARNs, a stale recovery_work UAF-panics, the GPHY
+ * reset-release re-runs and poisons a core).  Registering at late_initcall runs
+ * this after ALL device_initcalls, so the tagger is present and DSA registers
+ * cleanly on the FIRST probe.  The fix#127 wdt-stop still runs seconds into boot,
+ * far ahead of its multi-minute timeout. */
+late_initcall(cortina_ni_module_init);
+#endif
 
 static void __exit cortina_ni_module_exit(void)
 {

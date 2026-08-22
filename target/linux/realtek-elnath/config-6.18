@@ -47,8 +47,9 @@ CONFIG_COMPACT_UNEVICTABLE_DEFAULT=1
 CONFIG_CONTEXT_TRACKING=y
 CONFIG_CONTEXT_TRACKING_IDLE=y
 CONFIG_CORTINA_GPON=y
+CONFIG_CORTINA_GPON_OMCI_BRIDGE=y
 CONFIG_CORTINA_NI=y
-CONFIG_CORTINA_NI_FLOWOFFLOAD=y
+# CONFIG_CORTINA_NI_FLOWOFFLOAD is not set
 CONFIG_CPU_LITTLE_ENDIAN=y
 CONFIG_CPU_MITIGATIONS=y
 CONFIG_CPU_RMAP=y
@@ -114,7 +115,6 @@ CONFIG_GENERIC_STRNLEN_USER=y
 CONFIG_GENERIC_TIME_VSYSCALL=y
 CONFIG_GPIO_CDEV=y
 # Front panel.  The SoC's peripheral GPIO controller (gpio-cortina-ca77xx) is
-# what the ten panel LEDs and the reset/WPS buttons hang off; LEDS_GPIO turns
 # the DT leds node into /sys/class/leds entries.  Nothing else is needed here:
 # GPIOLIB, NEW_LEDS, LEDS_CLASS, LEDS_TRIGGERS and LEDS_TRIGGER_NETDEV already
 # come from the generic config, and the buttons are handled in userspace by the
@@ -217,89 +217,22 @@ CONFIG_VDSO_GETRANDOM=y
 CONFIG_VMAP_STACK=y
 CONFIG_XPS=y
 CONFIG_ZONE_DMA32=y
-CONFIG_WIRELESS=y
-CONFIG_CFG80211=y
-CONFIG_CFG80211_CRDA_SUPPORT=y
-CONFIG_CFG80211_DEFAULT_PS=y
-CONFIG_CFG80211_HEADERS=y
-# CONFIG_NL80211_TESTMODE is not set
-# CONFIG_CFG80211_DEVELOPER_WARNINGS is not set
-# CONFIG_CFG80211_CERTIFICATION_ONUS is not set
-# CFG80211_REQUIRE_SIGNED_REGDB + USE_KERNEL_REGDB_KEYS are PROMPTLESS
-# "default y" symbols unless CFG80211_CERTIFICATION_ONUS is on, so a "not set"
-# here CANNOT disable them - the built-in cfg80211 always demands a regdb
-# SIGNATURE. The wireless-regdb package therefore ships the pristine
 # maintainer-signed regulatory.db + regulatory.db.p7s pair (see the package
 # Makefile) so the country (US, from config_hs.xml) actually loads; without
-# it every 5 GHz channel stays world-regdomain no-IR and the 5 GHz AP cannot
 # beacon.
-CONFIG_CFG80211_REQUIRE_SIGNED_REGDB=y
-CONFIG_CFG80211_DEBUGFS=y
-# CONFIG_MAC80211_DEBUGFS is not set
-# CONFIG_CFG80211_WEXT is not set
-CONFIG_CFG80211_USE_KERNEL_REGDB_KEYS=y
-CONFIG_MAC80211=y
-# CONFIG_MAC80211_MESH is not set
-# Needed by the panel's 2.4G/5G LEDs: mac80211's throughput LED trigger is what
 # holds each radio's LED on while that radio is up and blinks it on traffic.
-# Adds triggers only -- the LED devices themselves come from RTW89_LEDS below.
-CONFIG_MAC80211_LEDS=y
-# CONFIG_MAC80211_DEBUG_MENU is not set
-# CONFIG_MAC80211_HWSIM is not set
-CONFIG_MAC80211_HAS_RC=y
-CONFIG_MAC80211_RC_MINSTREL=y
-CONFIG_MAC80211_RC_DEFAULT_MINSTREL=y
-CONFIG_MAC80211_RC_DEFAULT="minstrel_ht"
-CONFIG_MAC80211_STA_HASH_MAX_SIZE=0
-CONFIG_WLAN=y
-CONFIG_WLAN_VENDOR_REALTEK=y
-# rtlwifi/rtl8192fe DROPPED 2026-07-17: [10ec:0192] is an RTL8192XB (rtw89 g6
-# generation), NOT an RTL8192F; the rtl8192fe driver was the wrong match and
-# caused the ~half-boots SoC hang @26s on the 2.4G path. RTL_CARDS is default-y,
 # so keep it explicitly off.
-# CONFIG_RTL_CARDS is not set
-# 5 GHz RTW8852CE [10ec:c852] behind pcie0 -- mainline rtw89, built-in like the
-# rest of the WLAN stack.  Firmware embedded via EXTRA_FIRMWARE (the OpenWrt
 # rtl8852ce-firmware package needs the linux-firmware tarball, absent from dl/).
-CONFIG_RTW89=y
-CONFIG_RTW89_CORE=y
-CONFIG_RTW89_PCI=y
-CONFIG_RTW89_8852C=y
-CONFIG_RTW89_8852CE=y
-# 2.4 GHz RTL8192XB [10ec:0192] behind pcie2 -- new rtw89 chip (MAC twin of
 # the 8852C, HW chip id 0x53), clean-room files-6.18 rtw8192xb* overlay.
 # STAGED, NOT YET WIRED (2026-07-17): the rtw8192xb* source is present in the
 # overlay but kept OFF here so the shared kernel tree keeps building the working
-# 5 GHz/GPON/eth image during the parallel GPON board session. Turn ON during a
 # later integration pass (also add rtw8192xb_{table,rfk,rfk_table}.o to the
-# rtw89_8192xb-objs Makefile line, else the link fails on missing table/rfk syms).
-# WIRED ON 2026-07-17 (board bring-up): enum RTL8192XB + the 55 chip_id==RTL8852C
 # core ADD-sites (core/mac/pci/debug/coex) applied via files-6.18 overlay; fw blob
-# rtw89/rtw8192xb_fw-2.bin embedded below.  The 8852C/GPON/eth objects are untouched.
-CONFIG_RTW89_8192XB=y
-CONFIG_RTW89_8192XBE=y
-# CONFIG_RTW89_USB is not set
-# CONFIG_RTW89_8851BE is not set
-# CONFIG_RTW89_8852AE is not set
-# CONFIG_RTW89_8852BE is not set
-# CONFIG_RTW89_8852BTE is not set
-# CONFIG_RTW89_8922AE is not set
-# Panel 2.4G/5G LEDs.  Both radios drive their indicator off the WiFi MAC's own
 # LED pad (MAC GPIO 8) rather than a SoC GPIO, so they cannot be gpio-leds DT
-# children like the other ten -- rtw89 has to register them itself.  The prefix
 # makes the sysfs names line up with the DT-provided ones:
 # x400axf:green:2.4g and x400axf:green:5g.
-CONFIG_RTW89_LEDS=y
-CONFIG_RTW89_LED_NAME_PREFIX="x400axf"
-CONFIG_RTW89_DEBUGMSG=y
-CONFIG_RTW89_DEBUG=y
-CONFIG_RTW89_DEBUGFS=y
-# RTW89_CORE selects WANT_DEV_COREDUMP -> DEV_COREDUMP goes default-y (closure)
 CONFIG_WANT_DEV_COREDUMP=y
 CONFIG_DEV_COREDUMP=y
-CONFIG_EXTRA_FIRMWARE="rtw89/rtw8852c_fw-2.bin rtw89/rtw8192xb_fw-2.bin"
-CONFIG_EXTRA_FIRMWARE_DIR="firmware"
-# CONFIG_MAC80211_MESSAGE_TRACING is not set
 # --- PCI/PCIe closure (auto-added: enabling PCIE_DW/CORTINA exposes these NEW kernel symbols) ---
 CONFIG_PCI_SYSCALL=y
 # CONFIG_PCIEAER is not set
@@ -342,17 +275,12 @@ CONFIG_PCIE_BUS_DEFAULT=y
 # CONFIG_PCI_SW_SWITCHTEC is not set
 # CONFIG_PCI_PWRCTRL_SLOT is not set
 # CONFIG_PCI_ENDPOINT_TEST is not set
-# --- Realtek WLAN driver-family closure (RTL_CARDS exposes sibling drivers as NEW) ---
 # CONFIG_RTL8306_PHY is not set
 # CONFIG_RTL8366_SMI is not set
 # CONFIG_RTL8180 is not set
-# CONFIG_RTL8192CE is not set
-# CONFIG_RTL8192SE is not set
-# CONFIG_RTL8192DE is not set
 # CONFIG_RTL8723AE is not set
 # CONFIG_RTL8723BE is not set
 # CONFIG_RTL8188EE is not set
-# CONFIG_RTL8192EE is not set
 # CONFIG_RTL8821AE is not set
 # CONFIG_RTW88 is not set
 # --- remaining NEW-symbol closure (kernel Kconfig symbols not emitted by config-6.18) ---
@@ -667,46 +595,10 @@ CONFIG_UBIFS_FS_ZSTD=y
 # RTL9607F dev: /dev/mem for live register spy/poke (project keeps dump-the-protocol tooling first-class)
 CONFIG_DEVMEM=y
 
-# --- HARDWARE watchdog ------------------------------------------------------ #
-# cortina,wdt @0xf432902c -- drivers/watchdog/cortina-wdt.c, wired in the DTS.
-# This is the ONLY thing that recovers a hard lockup: every software detector
-# below is driven by a kernel timer and a kernel thread, so a CPU spinning with
-# interrupts off, a dead clocksource or a wedged panic path stops the detector
-# and the box with it.  The two nets are complementary, not redundant -- the
-# software half catches a hung task or a crashed service while the kernel is
-# still healthy, which the hardware half (fed from userspace) never will.
-#
-# HANDLE_BOOT_ENABLED: if a bootloader ever hands over an already-running
-# watchdog, the core keeps it fed until userspace opens /dev/watchdog, instead
-# of the board resetting part-way through a ~200 s boot forever.  The driver
-# additionally REPROGRAMS an adopted watchdog to its own window rather than
-# inheriting a countdown already part-way through, because the core derives its
-# keepalive from that window and would otherwise feed it too slowly.
-# ★ MEASURED on this board 2026-08-10, on BOTH reset paths and not just the
-# easy one: PER_WDT is found STOPPED at kernel entry after a power cycle AND
-# after a warm `reboot` (PSCI SYSTEM_RESET) -- at the U-Boot prompt it reads
-# CTRL=0 with a count that does not move, identically in both cases.  So an
-# armed window cannot reach into the next boot on this SoC, which is why the
-# driver deliberately does NOT ask for CONFIG_WATCHDOG_STOP_ON_REBOOT: staying
-# armed costs nothing here and covers a shutdown that hangs.  The driver prints
-# which state it found on every boot rather than assuming.
-# SYSFS: exposes timeout/timeleft/state/identity/bootstatus as standard
-# interfaces, so the test suite reads them the same way on any board.  The
-# vendor firmware ships without it (a per-vendor tool is the only route there).
-CONFIG_WATCHDOG=y
-CONFIG_WATCHDOG_CORE=y
-CONFIG_WATCHDOG_SYSFS=y
-CONFIG_WATCHDOG_HANDLE_BOOT_ENABLED=y
-# CONFIG_WATCHDOG_NOWAYOUT is not set
-CONFIG_CORTINA_WDT=y
-# The kernel's own no-hardware fallback is deliberately OFF: it is a software
-# timer, so it recovers nothing the detectors below do not already cover, and a
-# /dev/watchdog served by it would look exactly like the real one.
-# CONFIG_SOFT_WATCHDOG is not set
-
-# --- Software self-recovery net (complements the hardware watchdog above) --- #
+# --- Software self-recovery net (no HW-watchdog dependency) ---------------- #
 # An unattended GPON ONU ships online for months; a SILENT kernel hang/lockup
-# must reboot the box on its own (there is no operator to power-cycle it).
+# must reboot the box on its own (there is no operator to power-cycle it, and
+# no HW watchdog driver wired yet -- cortina,wdt @0xf432902c is a follow-up).
 # Enable the two software detectors and make each PANIC, reusing the inherited
 # panic->reboot path (generic: CONFIG_PANIC_TIMEOUT=1, CONFIG_PANIC_ON_OOPS=y).
 # Dependencies are generic defaults: CONFIG_DEBUG_KERNEL=y, CONFIG_BUG=y,
@@ -733,3 +625,10 @@ CONFIG_LOCKUP_DETECTOR=y
 CONFIG_SOFTLOCKUP_DETECTOR=y
 CONFIG_BOOTPARAM_SOFTLOCKUP_PANIC=y
 # CONFIG_CORTINA_NI_REG_GUARD is not set
+CONFIG_NET_DSA=y
+CONFIG_NET_DSA_TAG_CORTINA=y
+CONFIG_CORTINA_NI_DSA=y
+CONFIG_GRO_CELLS=y
+CONFIG_PHYLINK=y
+CONFIG_NET_DEVLINK=y
+CONFIG_VLAN_8021Q=y
