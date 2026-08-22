@@ -1,0 +1,3 @@
+# rtl9607f subtarget kernel config overrides.
+# Empty for M1 (all boot-critical options live in the target config-6.18);
+# per-SoC datapath/GPON/WiFi options are added here as those drivers land.

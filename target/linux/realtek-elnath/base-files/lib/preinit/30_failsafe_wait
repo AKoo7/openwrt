@@ -1,0 +1,9 @@
+# Overridden for the headless GPON ONU rig: the stock 30_failsafe_wait polls
+# ttyS0 for an 'f' key, and this rig's serial line trips it spuriously, dropping
+# the box into failsafe (no netifd, degraded LAN).  Register a no-op so the boot
+# ALWAYS proceeds to normal init.  (No operator console on a deployed ONU.)
+failsafe_wait() {
+	FAILSAFE=
+	export FAILSAFE
+}
+boot_hook_add preinit_main failsafe_wait

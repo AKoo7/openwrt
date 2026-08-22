@@ -1,0 +1,4 @@
+# Headless GPON ONU on a serial rig: ttyS0 line-noise spuriously trips the
+# failsafe 'f'-key detector, dropping the box into failsafe (no netifd, degraded
+# LAN datapath).  Disable the interactive failsafe wait; the box always boots normal.
+pi_preinit_no_failsafe=y

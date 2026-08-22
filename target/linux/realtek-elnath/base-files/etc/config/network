@@ -1,0 +1,47 @@
+config interface 'loopback'
+	option device 'lo'
+	option proto 'static'
+	option ipaddr '127.0.0.1'
+	option netmask '255.0.0.0'
+
+# ★DSA (lan1..lan4): br-lan bridges the four DSA user ports, NOT the conduit
+# 'eth0'.  Under DSA every LAN frame is delivered on lan1..lan4 (its jack's
+# netdev); eth0 is the CPU/conduit and carries no LAN traffic, so bridging eth0
+# would black-hole the LAN.  The bridge software-forwards LAN<->LAN through the
+# CPU (this switch traps LAN ingress to the CPU; it does not forward in HW yet).
+config device 'lan_br'
+	option name 'br-lan'
+	option type 'bridge'
+	list ports 'lan1'
+	list ports 'lan2'
+	list ports 'lan3'
+	list ports 'lan4'
+
+config interface 'lan'
+	option device 'br-lan'
+	option proto 'static'
+	option ipaddr '192.168.1.1'
+	option netmask '255.255.255.0'
+
+# ★ WAN = GPON PPPoE on VLAN102 (2026-08-19c merge of the gponAOT189/190 internet
+# recipe into the DSA build).  gpon0 is a STANDALONE WAN netdev: the driver demuxes
+# DS-RX by HEADER_A.lspid (PON 0x07 / L3_WAN 0x18) straight to gpon0
+# (cortina_ni_rx_wan_dest, rx.c) BEFORE the DSA branch, and US-TX egresses only via
+# gpon0's xmit (cortina_ni_pon_data_tx, pon_data_pol_en=1 -> data GEM 225/T-CONT1).
+# So NO eth0<->gpon0 bridge is needed (eth0 is the DSA conduit and must NOT be a
+# bridge member).  WAN is L3-routed+NAT against br-lan (see firewall).
+config device
+	option name 'gpon0.102'
+	option type '8021q'
+	option ifname 'gpon0'
+	option vid '102'
+
+config interface 'wan'
+	option device 'gpon0.102'
+	option proto 'pppoe'
+	# ★ Set your ISP's PPPoE credentials here (and the VLAN id in the gpon0.102
+	# device above) before use.  Placeholders only — do NOT commit real creds.
+	option username 'CHANGEME'
+	option password 'CHANGEME'
+	option ipv6 'auto'
+	option keepalive '5 20'

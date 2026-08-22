@@ -1,0 +1,48 @@
+--- add DSA_TAG_PROTO_CORTINA (value 32), its Kconfig/Makefile hooks so the
+    RTL9607F cortina NI can register as a DSA switch (tag_cortina soft shim).
+
+--- a/include/net/dsa.h	2026-08-19 12:36:37.813261162 +0530
++++ b/include/net/dsa.h	2026-08-19 12:36:37.829879534 +0530
+@@ -57,6 +57,7 @@
+ #define DSA_TAG_PROTO_BRCM_LEGACY_FCS_VALUE	29
+ #define DSA_TAG_PROTO_MXL862_VALUE		30
+ #define DSA_TAG_PROTO_MXL862_8021Q_VALUE	31
++#define DSA_TAG_PROTO_CORTINA_VALUE		32
+ 
+ enum dsa_tag_protocol {
+ 	DSA_TAG_PROTO_NONE		= DSA_TAG_PROTO_NONE_VALUE,
+@@ -91,6 +92,7 @@
+ 	DSA_TAG_PROTO_VSC73XX_8021Q	= DSA_TAG_PROTO_VSC73XX_8021Q_VALUE,
+ 	DSA_TAG_PROTO_MXL862		= DSA_TAG_PROTO_MXL862_VALUE,
+ 	DSA_TAG_PROTO_MXL862_8021Q	= DSA_TAG_PROTO_MXL862_8021Q_VALUE,
++	DSA_TAG_PROTO_CORTINA		= DSA_TAG_PROTO_CORTINA_VALUE,
+ };
+ 
+ struct dsa_switch;
+--- a/net/dsa/Kconfig	2026-08-19 12:36:37.814198838 +0530
++++ b/net/dsa/Kconfig	2026-08-19 12:36:37.829998582 +0530
+@@ -69,6 +69,14 @@
+ 	  Broadcom switches which places the tag before the Ethernet header
+ 	  (prepended).
+ 
++config NET_DSA_TAG_CORTINA
++	tristate "Tag driver for Cortina/Realtek RTL9607F (Taurus) NI switch"
++	help
++	  Say Y or M if you want to enable support for tagging frames for the
++	  Cortina CA8277C (RTL9607F "Elnath") built-in NI switch.  The per-jack
++	  port selector is carried in DMA metadata between the cortina Ethernet
++	  driver and this tagger, not on the wire.
++
+ config NET_DSA_TAG_HELLCREEK
+ 	tristate "Tag driver for Hirschmann Hellcreek TSN switches"
+ 	help
+--- a/net/dsa/Makefile	2026-08-19 12:36:37.815082849 +0530
++++ b/net/dsa/Makefile	2026-08-19 12:36:37.830070536 +0530
+@@ -22,6 +22,7 @@
+ # tagging formats
+ obj-$(CONFIG_NET_DSA_TAG_AR9331) += tag_ar9331.o
+ obj-$(CONFIG_NET_DSA_TAG_BRCM_COMMON) += tag_brcm.o
++obj-$(CONFIG_NET_DSA_TAG_CORTINA) += tag_cortina.o
+ obj-$(CONFIG_NET_DSA_TAG_DSA_COMMON) += tag_dsa.o
+ obj-$(CONFIG_NET_DSA_TAG_GSWIP) += tag_gswip.o
+ obj-$(CONFIG_NET_DSA_TAG_HELLCREEK) += tag_hellcreek.o
