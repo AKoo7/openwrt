@@ -36,8 +36,10 @@ notices.
 
 ## Build
 
-Standard OpenWrt: select the `realtek-elnath` target / AOT5221ZY profile, then
-`make -j$(nproc)`.
+See **`BUILDING.md`** for full, reproducible build steps (host prerequisites,
+feeds, target/subtarget/profile selection, and how to RAM-boot the result).
+In short: `make menuconfig` -> Target `Realtek Elnath GPON ONU` / Subtarget
+`Realtek RTL9607F Cortex-A55` / Profile `Zyxel AOT5221ZY`, then `make -j$(nproc)`.
 
 ## Configuration notes
 
